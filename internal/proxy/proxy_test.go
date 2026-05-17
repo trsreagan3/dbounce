@@ -302,18 +302,28 @@ func TestParseDefaultPolicy(t *testing.T) {
 }
 
 func TestParseDialect_RejectsUnknown(t *testing.T) {
-	// D-Slice 5: postgres + mysql accepted; snowflake / bigquery / etc.
-	// remain rejected until D-Slice 6.
+	// D-Slice 6: postgres + mysql + snowflake + bigquery accepted.
+	// snowflake/bigquery ship via the JDBC-driver-shim (no wire-protocol
+	// proxy); the CLI's `dbounce run --dialect snowflake|bigquery` is
+	// guarded separately. Other dialects remain rejected.
 	d, err := ParseDialect("postgres")
 	require.NoError(t, err)
 	assert.Equal(t, DialectPostgres, d)
 	d, err = ParseDialect("mysql")
 	require.NoError(t, err)
 	assert.Equal(t, DialectMySQL, d)
-	// Unknown dialects still rejected — the error names both accepted
-	// values so the operator knows the menu.
-	_, err = ParseDialect("snowflake")
+	d, err = ParseDialect("snowflake")
+	require.NoError(t, err)
+	assert.Equal(t, DialectSnowflake, d)
+	d, err = ParseDialect("bigquery")
+	require.NoError(t, err)
+	assert.Equal(t, DialectBigQuery, d)
+	// Unknown dialects still rejected — the error names all four
+	// accepted values so the operator knows the menu.
+	_, err = ParseDialect("teradata-fake")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "postgres")
 	assert.Contains(t, err.Error(), "mysql")
+	assert.Contains(t, err.Error(), "snowflake")
+	assert.Contains(t, err.Error(), "bigquery")
 }
