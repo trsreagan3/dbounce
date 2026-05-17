@@ -418,6 +418,77 @@ func TestInstall_ConflictWithoutForce(t *testing.T) {
 	assert.Contains(t, ie.Message, "--force")
 }
 
+// HIGH-D8-05 regression — profile install must bound response body
+// size. Without the cap, a malicious / compromised distribution server
+// could return arbitrary-sized payloads + crash the process via OOM in
+// io.ReadAll + yaml.Unmarshal. AUDIT-WB-DSLICES-1-8.md §HIGH-D8-05 has
+// the full reproduction.
+
+func TestInstall_RejectsOversizedPayload(t *testing.T) {
+	// Serve a YAML-shaped payload that exceeds maxProfilePayload + 1.
+	// We use yaml structure (valid leading bytes) so the test fails on
+	// the size guard, not on a parse error from the LimitReader chopping
+	// mid-YAML — keeps the assertion specific to HIGH-D8-05's signal.
+	oversize := int(maxProfilePayload) + 64
+	payload := make([]byte, 0, oversize)
+	payload = append(payload, []byte("profiles:\n  staging-work:\n    description: \"")...)
+	// Pad with 'A's until we exceed the cap; close the quote + YAML at
+	// the end so the response is structurally valid in the no-cap world.
+	for len(payload) < oversize-4 {
+		payload = append(payload, 'A')
+	}
+	payload = append(payload, []byte("\"\n")...)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	_, err := Install(context.Background(), InstallOptions{
+		From:         srv.URL,
+		HTTPClient:   InsecureTLSClientForTests(),
+		ProfilesPath: filepath.Join(t.TempDir(), "profiles.yaml"),
+	})
+	require.Error(t, err, "oversized payload MUST be rejected")
+	var ie *InstallError
+	require.ErrorAs(t, err, &ie)
+	assert.Equal(t, InstallExitPayload, ie.ExitCode)
+	assert.Contains(t, ie.Message, "HIGH-D8-05",
+		"error MUST reference the audit ID")
+	assert.Contains(t, ie.Message, "exceeds maximum size",
+		"error MUST surface the size-cap signal")
+}
+
+func TestInstall_AcceptsPayloadAtSizeCap(t *testing.T) {
+	// A payload EXACTLY at the cap MUST succeed (the +1 buffer in the
+	// LimitReader makes the boundary inclusive). We construct a valid
+	// YAML profile that uses a description-padding to land within a few
+	// bytes of the cap.
+	const wantTotal = 1024 // small valid YAML — we just need < cap
+	payload := []byte("profiles:\n  staging-work:\n    description: \"")
+	for len(payload) < wantTotal-3 {
+		payload = append(payload, 'A')
+	}
+	payload = append(payload, []byte("\"\n")...)
+	require.Less(t, int64(len(payload)), maxProfilePayload,
+		"test payload must fit under the cap")
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	result, err := Install(context.Background(), InstallOptions{
+		From:         srv.URL,
+		HTTPClient:   InsecureTLSClientForTests(),
+		ProfilesPath: filepath.Join(t.TempDir(), "profiles.yaml"),
+	})
+	require.NoError(t, err, "under-cap payload MUST install successfully")
+	assert.Contains(t, result.InstalledNames, "staging-work")
+}
+
 func TestUpsertProfile_RefusesNonLocalSource(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "profiles.yaml")

@@ -135,13 +135,40 @@ func Install(ctx context.Context, opts InstallOptions) (*InstallResult, error) {
 		return nil, installErr(InstallExitPayload,
 			fmt.Sprintf("fetch failed: HTTP %d", resp.StatusCode))
 	}
-	payload, err := io.ReadAll(resp.Body)
+	// HIGH-D8-05 (AUDIT-WB-DSLICES-1-8.md) closure: bound the response
+	// body so a malicious / compromised distribution server can't push
+	// an arbitrarily-large payload into memory + yaml.Unmarshal. 1 MiB
+	// is generous for YAML profiles (the bundled defaults are < 16 KiB);
+	// operators with a real need for larger payloads should split into
+	// multiple installs (the schema supports it cleanly). Defense-in-
+	// depth pairing with the existing Timeout — Timeout bounds wall-
+	// clock, this bounds memory. We use io.LimitReader with a +1 buffer
+	// so a payload that's EXACTLY maxProfilePayload bytes succeeds while
+	// anything strictly larger trips the size check.
+	limited := io.LimitReader(resp.Body, maxProfilePayload+1)
+	payload, err := io.ReadAll(limited)
 	if err != nil {
 		return nil, installErrWrap(InstallExitPayload,
 			fmt.Sprintf("fetch failed: read body: %v", err), err)
 	}
+	if int64(len(payload)) > maxProfilePayload {
+		return nil, installErr(InstallExitPayload,
+			fmt.Sprintf("fetch failed: payload exceeds maximum size of %d bytes "+
+				"(HIGH-D8-05 from AUDIT-WB-DSLICES-1-8.md): a profile YAML this "+
+				"large is almost certainly a misconfigured / hostile distribution "+
+				"server. Split into multiple smaller profiles + install each, or "+
+				"verify the URL.", maxProfilePayload))
+	}
 	return InstallFromBytes(payload, opts)
 }
+
+// maxProfilePayload caps `profile install --from URL` response bodies.
+// 1 MiB is much larger than any legitimate profile YAML (bundled
+// defaults are < 16 KiB) but small enough that an attacker can't exhaust
+// memory in a single fetch. The cap is a hard size limit, not a soft
+// threshold — exceeding it is treated as a payload-class error so the
+// operator gets a clear "this is too large to be legitimate" message.
+const maxProfilePayload = int64(1 << 20)
 
 // InstallFromBytes is the half of Install that operates on already-
 // fetched bytes.
