@@ -190,6 +190,15 @@ type Config struct {
 	MgmtTLSCertFile string
 	MgmtTLSKeyFile  string
 
+	// PromptOnDeny — when true, transparent-mode DENY decisions enqueue
+	// a row in pending_prompts BEFORE applying enforcement, so the
+	// operator can review + answer asynchronously without blocking the
+	// SQL wire-protocol call (which times out long before the human
+	// can react). D-Slice 8 wires the enqueue; the answer side lives
+	// in `dbounce prompts answer`. Default false to preserve the
+	// D-Slice 3 transparent-mode behavior.
+	PromptOnDeny bool
+
 	// WireListener and MgmtListener let tests hand pre-bound listeners
 	// to Serve so the test process can reserve an ephemeral port (via
 	// net.Listen "127.0.0.1:0") and pass it through WITHOUT a
@@ -480,9 +489,56 @@ func (s *Server) serveConn(conn net.Conn) {
 // statement_type, tables, functions, decision_verdict, decision_source,
 // matched_rule_id, task_id + the parser's flag bag so the recommender
 // + the live-action-tail UI can compose against rows already on disk.
+//
+// D-Slice 8 wires two cross-cutting hooks on top of decide():
+//
+//  1. Pause window (per [[safety-mode-lean-permissive]] escape hatch):
+//     when IsPaused() returns true, a transparent-mode DENY DEMOTES to
+//     ALLOW + Enforced=false; the audit row records pause_id so post-
+//     incident review can answer "what would have been blocked had the
+//     pause not been active?" The DecisionReason preserves the original
+//     rule-engine intent so reviewers see why the pause mattered.
+//
+//  2. Prompt-on-deny: when PromptOnDeny + transparent + DENY and NOT
+//     paused, enqueue a pending_prompts row. The wire-protocol call
+//     still gets the DENY (we can't keep the SQL client waiting on a
+//     human); the prompt is an out-of-band review channel for the
+//     operator to flip the rule shape via `dbounce prompts answer`.
 func (s *Server) evaluateAndAudit(sql, source string) {
 	ps := parser.Parse(string(s.cfg.Dialect), sql)
 	d := s.decide(ps)
+
+	// D-Slice 8 pause-window demote. Consult IsPaused() up-front so the
+	// audit row reflects pause-window decisions consistently regardless
+	// of which downstream path consumes them.
+	var pauseID *int64
+	enforced := s.cfg.Mode == ModeTransparent && d.Verdict == VerdictDeny
+	pauseDemoted := false
+	if s.store != nil {
+		if paused, pid, perr := s.store.IsPaused(); perr != nil {
+			BumpLookupErrors()
+			log.Warn().Err(perr).Msg("dbounce: IsPaused lookup failed")
+		} else if paused {
+			id := pid
+			pauseID = &id
+			if d.Verdict == VerdictDeny && s.cfg.Mode == ModeTransparent {
+				// Demote: the rule engine wanted DENY but the pause
+				// window says "let it pass with the audit record."
+				enforced = false
+				pauseDemoted = true
+			}
+		}
+	}
+
+	verdictForRow := d.Verdict
+	reasonForRow := d.Reason
+	if pauseDemoted {
+		verdictForRow = VerdictAllow
+		reasonForRow = fmt.Sprintf(
+			"pause-window demoted (pause_id=%d): rule engine wanted DENY (%s)",
+			*pauseID, d.Reason)
+	}
+
 	row := store.DecisionRow{
 		At:               time.Now().UTC(),
 		Dialect:          ps.Dialect,
@@ -498,22 +554,50 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 		IsExplainAnalyze: ps.IsExplainAnalyze,
 		ImpersonatedRole: ps.ImpersonatedRole,
 		ParseErrors:      ps.ParseErrors,
-		DecisionVerdict:  string(d.Verdict),
-		DecisionReason:   d.Reason,
+		DecisionVerdict:  string(verdictForRow),
+		DecisionReason:   reasonForRow,
 		ModeAtDecision:   string(s.cfg.Mode),
 		// Enforcement requires (a) transparent mode AND (b) a DENY
-		// verdict AND (c) D-Slice 2's forwarding wired. D-Slice 3 sets
+		// verdict AND (c) D-Slice 2's forwarding wired AND (d) no
+		// active pause window demoting the DENY. D-Slice 3 sets
 		// (a)+(b); D-Slice 2's forwarding handler honors it.
-		Enforced:       s.cfg.Mode == ModeTransparent && d.Verdict == VerdictDeny,
+		Enforced:       enforced,
 		ProfileName:    s.cfg.ActiveProfileName,
 		DecisionSource: d.Source,
 		MatchedRuleID:  d.MatchedRuleID,
 		TaskID:         d.TaskID,
+		PauseID:        pauseID,
 	}
-	if _, err := s.store.RecordDecision(row); err != nil {
+	decisionID, err := s.store.RecordDecision(row)
+	if err != nil {
 		BumpLookupErrors()
 		log.Warn().Err(err).Str("source", source).
 			Msg("dbounce: record decision failed")
+		return
+	}
+
+	// D-Slice 8 prompt-on-deny enqueue. We only enqueue when:
+	//   - prompt-on-deny is enabled
+	//   - the decision was a DENY
+	//   - we're in transparent mode (cooperative DENYs are advisory; an
+	//     async prompt for an advisory verdict would be noise)
+	//   - the pause window did NOT demote (a demoted DENY is "the
+	//     operator already said let it through; no prompt needed")
+	if s.cfg.PromptOnDeny && d.Verdict == VerdictDeny &&
+		s.cfg.Mode == ModeTransparent && !pauseDemoted && s.store != nil {
+		_, perr := s.store.AddPendingPrompt(store.PendingPrompt{
+			DecisionID:      decisionID,
+			StatementType:   ps.StatementType,
+			TablesTouched:   ps.TablesTouched,
+			FunctionsCalled: ps.FunctionsCalled,
+			DenyReason:      d.Reason,
+		})
+		if perr != nil {
+			BumpLookupErrors()
+			log.Warn().Err(perr).
+				Int64("decision_id", decisionID).
+				Msg("dbounce: enqueue pending prompt failed")
+		}
 	}
 }
 

@@ -103,11 +103,16 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newAuditCmd())
 	root.AddCommand(newInitTLSCmd())
 	// D-Slice 7: environment profile + MCP server subcommand trees.
-	// Both ONLY add to the command tree; they don't modify existing
-	// entries so the parallel D-Slice 8 work (pause / prompts /
-	// presets / recommend) merges without conflict.
 	root.AddCommand(newProfileCmd())
 	root.AddCommand(newMCPCmd())
+	// D-Slice 8: pause + prompts + presets + rules subcommands.
+	// ProfileWriter wiring (D-Slice 7 profile package → D-Slice 8
+	// CLI interface) is tracked separately; passing nil yields the
+	// in-package stub which surfaces a clear error on --kind profile.
+	root.AddCommand(newPauseCmd())
+	root.AddCommand(newPromptsCmd(nil))
+	root.AddCommand(newPresetsCmd(nil))
+	root.AddCommand(newRulesCmd(nil))
 	return root
 }
 
@@ -161,6 +166,10 @@ func newRunCmd() *cobra.Command {
 		// D-Slice 7: environment profile + profiles.yaml path.
 		profileName  string
 		profilesPath string
+		// D-Slice 8: async deny-prompt UX. When true, transparent DENY
+		// decisions enqueue a pending_prompts row for `dbounce prompts
+		// answer` to drain. Default false preserves D-Slice 3 behavior.
+		promptOnDeny bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -316,6 +325,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				MgmtTLSKeyFile:    mgmtTLSKey,
 				ActiveProfile:     activeProfile,
 				ActiveProfileName: activeProfile.Name,
+				PromptOnDeny:      promptOnDeny,
 			}.Normalize()
 			_ = profileFromFlag // reserved for the not-selected banner in newer slices
 
@@ -493,6 +503,14 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.dbounce/profiles.yaml). "+
 			"Honors DBOUNCE_PROFILES_PATH env var if --profiles-path unset.")
+	// D-Slice 8: async deny-prompt UX.
+	cmd.Flags().BoolVar(&promptOnDeny, "prompt-on-deny", false,
+		"When in transparent mode, every DENY enqueues a row in "+
+			"pending_prompts. Drain the queue with `dbounce prompts list` "+
+			"+ `dbounce prompts answer ID --kind {ignore|always|profile}`. "+
+			"Has no effect in cooperative mode (advisory verdicts aren't "+
+			"prompted) or during an active pause window (operator already "+
+			"said allow).")
 	return cmd
 }
 

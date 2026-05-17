@@ -1,0 +1,97 @@
+# dbounce built-in preset library (D-Slice 8 tier-1 per
+# [[evolving-preset-library]]).
+#
+# These presets ship in the binary via go:embed. They're a starter set
+# the operator can install with one command (`dbounce presets apply
+# NAME`) when they don't yet know exactly what rule set their workload
+# needs. Tier-2 (org-curated) and tier-3 (personal-recurring auto-
+# evolved) presets come post-launch; the tier-1 set is intentionally
+# small (5 entries) so the operator can read it end-to-end in one sit.
+#
+# Each preset becomes a NEW profile when applied — the operator is
+# expected to read the rules, edit if needed, then activate. Per
+# [[creates-never-mutates]] no preset ever mutates an existing rule
+# row; `presets apply` always creates fresh.
+#
+# Rule shape mirrors internal/rules/rules.go ProxyRule:
+#   pattern        — statement_type:table_glob (required)
+#   effect         — allow | deny (required)
+#   schema_scope   — glob matched against schema half of touched tables
+#   table_scope    — glob matched against full schema-qualified id
+#   function_scope — glob matched against called functions
+#   note           — operator-readable description
+
+presets:
+  - id: analytics-engineer
+    title: Analytics engineer (SELECT-only on warehouse / mart / dbt schemas)
+    description: |
+      Day-to-day analytics workload: SELECT-only across warehouse_*,
+      mart_*, and dbt_* schemas. No writes. Anything outside those
+      schemas falls through to the default policy (typically deny) so
+      a misconfigured tool can't accidentally hit prod app tables.
+    allow_rules:
+      - { pattern: "SELECT:warehouse_*.*", effect: allow, note: "warehouse reads" }
+      - { pattern: "SELECT:mart_*.*",      effect: allow, note: "mart reads" }
+      - { pattern: "SELECT:dbt_*.*",       effect: allow, note: "dbt-managed schemas" }
+      - { pattern: "EXPLAIN:warehouse_*.*", effect: allow, note: "EXPLAIN over warehouse" }
+      - { pattern: "EXPLAIN:mart_*.*",     effect: allow, note: "EXPLAIN over mart" }
+    deny_rules:
+      - { pattern: "MUTATING:*", effect: deny, note: "no writes ever (mutating includes CTE-hidden)" }
+
+  - id: dba-investigation
+    title: DBA investigation (full read; deny secrets; deny audit-log mutations)
+    description: |
+      Read-everything posture for incident response / capacity analysis,
+      with explicit denies on (a) reads against tables that look like
+      secret stores, (b) any mutation of audit_log* tables. The
+      explicit denies fire BEFORE the broad SELECT allow.
+    deny_rules:
+      - { pattern: "*:*secret*",     effect: deny, note: "any statement touching a secrets-ish table" }
+      - { pattern: "*:*credential*", effect: deny, note: "any statement touching a credentials-ish table" }
+      - { pattern: "MUTATING:audit_log*", effect: deny, note: "audit log is append-only; no mutations" }
+    allow_rules:
+      - { pattern: "READ:*",   effect: allow, note: "broad read for investigation" }
+      - { pattern: "EXPLAIN:*", effect: allow, note: "EXPLAIN anywhere for plan inspection" }
+
+  - id: migration-runner
+    title: Migration runner (full SQL incl DDL on migration_staging_*; deny on prod schemas)
+    description: |
+      For workloads that apply schema migrations against a staging
+      schema before promotion. Full DDL + DML access to
+      migration_staging_*; explicit deny on prod_* and public.users-
+      shaped tables so a misrouted migration can't touch live data.
+    deny_rules:
+      - { pattern: "MUTATING:prod_*.*", effect: deny, note: "prod schemas off-limits" }
+      - { pattern: "DDL:public.*",      effect: deny, note: "no DDL on public schema" }
+    allow_rules:
+      - { pattern: "*:migration_staging_*.*", effect: allow, note: "any statement on the migration staging schemas" }
+      - { pattern: "READ:*", effect: allow, note: "read anywhere for migration validation" }
+
+  - id: incident-readonly
+    title: Incident-response read-only (SELECT-only; deny ALL writes)
+    description: |
+      Maximum-safety posture for on-call investigations: SELECT and
+      EXPLAIN everywhere, every mutation explicitly denied including
+      CTE-hidden writes. Pair with --mode transparent to actually
+      enforce. Equivalent to the [[read-only-default]] floor.
+    deny_rules:
+      - { pattern: "MUTATING:*", effect: deny, note: "no writes during incident" }
+      - { pattern: "DDL:*",      effect: deny, note: "no schema changes during incident" }
+      - { pattern: "EXPLAIN-ANALYZE:*", effect: deny, note: "EXPLAIN ANALYZE actually executes; disallow" }
+    allow_rules:
+      - { pattern: "SELECT:*",   effect: allow, note: "broad SELECT for investigation" }
+      - { pattern: "EXPLAIN:*",  effect: allow, note: "EXPLAIN (no ANALYZE) for plan inspection" }
+
+  - id: schema-survey
+    title: Schema survey (information_schema only; no app data)
+    description: |
+      Cataloging / discovery posture: information_schema + pg_catalog
+      reads only. Useful when an agent is bootstrapping its view of a
+      database before being given task-scoped data access.
+    allow_rules:
+      - { pattern: "SELECT:information_schema.*", effect: allow, note: "ANSI catalog" }
+      - { pattern: "SELECT:pg_catalog.*",          effect: allow, note: "PG-specific catalog" }
+      - { pattern: "SHOW:*",                       effect: allow, note: "SHOW TABLES / SHOW VARIABLES" }
+    deny_rules:
+      - { pattern: "MUTATING:*", effect: deny, note: "discovery posture; never write" }
+      - { pattern: "DDL:*",      effect: deny, note: "discovery posture; never schema-change" }
