@@ -50,6 +50,97 @@ func TestRunCmd_Help(t *testing.T) {
 	assert.Contains(t, help, "--i-know-this-binds-externally")
 	assert.Contains(t, help, "--dialect")
 	assert.Contains(t, help, "--mgmt-port")
+	// D-Slice 4 flags
+	assert.Contains(t, help, "--listener-tls-cert")
+	assert.Contains(t, help, "--listener-tls-key")
+	assert.Contains(t, help, "--require-client-cert")
+	assert.Contains(t, help, "--management-tls-cert")
+	assert.Contains(t, help, "--management-tls-key")
+}
+
+func TestRootCmd_HasInitTLSSubcommand(t *testing.T) {
+	cmd := newRootCmd()
+	names := map[string]bool{}
+	for _, c := range cmd.Commands() {
+		names[c.Name()] = true
+	}
+	assert.True(t, names["init-tls"], "init-tls subcommand must be wired")
+}
+
+func TestInitTLSCmd_WritesCertMaterial(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "tls")
+
+	cmd := newInitTLSCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--out", out})
+	require.NoError(t, cmd.Execute())
+
+	for _, name := range []string{"ca.crt", "server.crt", "server.key"} {
+		p := filepath.Join(out, name)
+		_, err := os.Stat(p)
+		require.NoError(t, err, "init-tls must write %s", name)
+	}
+	text := buf.String()
+	assert.Contains(t, text, "ca.crt")
+	assert.Contains(t, text, "server.crt")
+	assert.Contains(t, text, "server.key")
+}
+
+func TestInitTLSCmd_WithClientCertWritesClientPair(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "tls")
+
+	cmd := newInitTLSCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--out", out, "--with-client-cert"})
+	require.NoError(t, cmd.Execute())
+
+	for _, name := range []string{"ca.crt", "server.crt", "server.key", "client.crt", "client.key"} {
+		p := filepath.Join(out, name)
+		_, err := os.Stat(p)
+		require.NoError(t, err, "init-tls --with-client-cert must write %s", name)
+	}
+}
+
+func TestInitTLSCmd_RefusesOverwriteWithoutForce(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "tls")
+
+	cmd := newInitTLSCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--out", out})
+	require.NoError(t, cmd.Execute())
+
+	cmd2 := newInitTLSCmd()
+	cmd2.SetOut(&bytes.Buffer{})
+	cmd2.SetErr(&bytes.Buffer{})
+	cmd2.SetArgs([]string{"--out", out})
+	err := cmd2.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to overwrite")
+}
+
+func TestInitTLSCmd_ForceAllowsOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "tls")
+
+	cmd := newInitTLSCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--out", out})
+	require.NoError(t, cmd.Execute())
+
+	cmd2 := newInitTLSCmd()
+	cmd2.SetOut(&bytes.Buffer{})
+	cmd2.SetErr(&bytes.Buffer{})
+	cmd2.SetArgs([]string{"--out", out, "--force"})
+	require.NoError(t, cmd2.Execute())
 }
 
 func TestAuditTail_EmptyStore(t *testing.T) {

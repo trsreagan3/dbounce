@@ -113,6 +113,17 @@ func (f *Forwarder) run() error {
 }
 
 // negotiateSSL handles the optional SSL handshake.
+//
+// D-Slice 4 layering: listener-side TLS is handled HERE, before the
+// outbound dial. When the client sends SSLRequest + we have a
+// listenerTLS, we reply 'S' + perform the inbound TLS handshake + wrap
+// f.in in *tls.Conn. After the upgrade we read a FRESH 8-byte preamble
+// (the StartupMessage) off the now-TLS conn + dial upstream + negotiate
+// outbound TLS independently.
+//
+// Independence invariant: listener TLS and outbound TLS are decoupled.
+// The proxy may speak TLS in + plaintext out (or vice versa) —
+// operators who want end-to-end TLS configure both sides.
 func (f *Forwarder) negotiateSSL() error {
 	_ = f.in.SetDeadline(time.Now().Add(f.srv.cfg.IdleTimeout))
 	hdr := make([]byte, 8)
@@ -120,6 +131,22 @@ func (f *Forwarder) negotiateSSL() error {
 		return fmt.Errorf("read inbound startup header: %w", err)
 	}
 	magic := binary.BigEndian.Uint32(hdr[4:8])
+
+	// D-Slice 4: listener-side TLS upgrade.
+	if magic == 80877103 && f.srv.cfg.ListenerTLS != nil {
+		upgraded, err := upgradeListenerTLS(f.in, hdr, f.srv.cfg.ListenerTLS)
+		if err != nil {
+			return fmt.Errorf("listener TLS upgrade: %w", err)
+		}
+		f.in = upgraded
+		hdr = make([]byte, 8)
+		if _, err := io.ReadFull(f.in, hdr); err != nil {
+			return fmt.Errorf("read post-tls inbound startup: %w", err)
+		}
+		magic = binary.BigEndian.Uint32(hdr[4:8])
+		// Fall through into the upstream-SSL branches below with the
+		// fresh preamble.
+	}
 
 	if magic != 80877103 {
 		f.startupBytes = hdr

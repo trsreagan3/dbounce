@@ -146,6 +146,22 @@ type Config struct {
 	IdleTimeout   time.Duration
 	// ActiveProfileName is filled by D-Slice 7. Stays empty through D-Slice 6.
 	ActiveProfileName string
+
+	// ListenerTLS is D-Slice 4's listener-side TLS state. Nil = plaintext
+	// listener (the D-Slice 1 + 2 default). Non-nil = SSLRequest gets
+	// 'S' + a TLS handshake before the StartupMessage parser fires. Per
+	// the audit-cadence note: listener TLS and outbound (upstream) TLS
+	// are INDEPENDENT — the proxy may speak TLS to the client + plaintext
+	// to the upstream, or vice versa.
+	ListenerTLS *listenerTLS
+
+	// MgmtTLSCertFile + MgmtTLSKeyFile, when both non-empty, switch the
+	// management HTTP listener from HTTP to HTTPS. Empty (default)
+	// preserves D-Slice 1's plaintext /healthz on loopback. Stored as
+	// paths (not a *tls.Config) so the http.Server's own ServeTLS path
+	// owns the loading.
+	MgmtTLSCertFile string
+	MgmtTLSKeyFile  string
 }
 
 // Normalize fills in zero-valued fields with sensible defaults.
@@ -234,8 +250,17 @@ func (s *Server) Serve() error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// D-Slice 4: /healthz over HTTPS when both --management-tls-cert
+	// and --management-tls-key are set. Default is HTTP for backward
+	// compat with D-Slice 1's loopback-only liveness check.
 	go func() {
-		if err := s.mgmtSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if s.cfg.MgmtTLSCertFile != "" && s.cfg.MgmtTLSKeyFile != "" {
+			err = s.mgmtSrv.ListenAndServeTLS(s.cfg.MgmtTLSCertFile, s.cfg.MgmtTLSKeyFile)
+		} else {
+			err = s.mgmtSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Warn().Err(err).Str("addr", mgmtAddr).Msg("dbounce: management server stopped")
 		}
 	}()
@@ -276,19 +301,46 @@ func (s *Server) serveConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
 
 	// D-Slice 2: when an upstream is configured, dispatch to the
-	// forwarding handler. The observation-only handshake remains for
-	// the no-upstream case so `dbounce run` keeps working as a
-	// parse-only audit-tap without a real database.
+	// forwarding handler. D-Slice 4's listener-side TLS upgrade lives
+	// INSIDE the forwarder's negotiateSSL because it already owns the
+	// SSLRequest preamble.
 	if s.upstreamForwardingActive() {
 		s.serveConnWithUpstream(conn)
 		return
 	}
 
-	if err := pgHandshake(conn); err != nil {
+	// D-Slice 4: observation-only path. Read the 8-byte preamble + branch
+	// on SSLRequest vs StartupMessage. The TLS upgrade swaps the conn
+	// substrate before pgHandshake parses the StartupMessage proper.
+	preamble, err := readPGSSLPreamble(conn)
+	if err != nil {
+		log.Debug().Err(err).Str("remote", conn.RemoteAddr().String()).
+			Msg("dbounce: read preamble failed")
+		return
+	}
+	working := conn
+	consumed := preamble
+	if looksLikeSSLRequest(preamble) {
+		upgraded, uerr := upgradeListenerTLS(conn, preamble, s.cfg.ListenerTLS)
+		if uerr != nil {
+			log.Debug().Err(uerr).Str("remote", conn.RemoteAddr().String()).
+				Msg("dbounce: listener TLS upgrade failed")
+			return
+		}
+		if upgraded != nil {
+			working = upgraded
+		}
+		// Whether upgraded or 'N' was sent, the next bytes from the
+		// client are a fresh StartupMessage preamble.
+		consumed = nil
+	}
+
+	if err := pgHandshakeWithPreamble(working, consumed); err != nil {
 		log.Debug().Err(err).Str("remote", conn.RemoteAddr().String()).
 			Msg("dbounce: handshake failed")
 		return
 	}
+	conn = working
 
 	for {
 		_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
@@ -679,10 +731,19 @@ const (
 	msgTerminate byte = 'X'
 )
 
-func pgHandshake(conn net.Conn) error {
-	hdr := make([]byte, 8)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return fmt.Errorf("read startup header: %w", err)
+// pgHandshakeWithPreamble runs the post-SSL plaintext PG handshake.
+// preamble, when non-nil + 8 bytes, is a pre-read startup header (used
+// after D-Slice 4's TLS upgrade path has already consumed bytes from
+// the wire). Nil = read fresh.
+func pgHandshakeWithPreamble(conn net.Conn, preamble []byte) error {
+	hdr := preamble
+	if hdr == nil {
+		hdr = make([]byte, 8)
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return fmt.Errorf("read startup header: %w", err)
+		}
+	} else if len(hdr) != 8 {
+		return fmt.Errorf("preamble must be 8 bytes (got %d)", len(hdr))
 	}
 	length := binary.BigEndian.Uint32(hdr[0:4])
 	magic := binary.BigEndian.Uint32(hdr[4:8])
@@ -691,6 +752,7 @@ func pgHandshake(conn net.Conn) error {
 		if _, err := conn.Write([]byte{'N'}); err != nil {
 			return fmt.Errorf("write SSL-no: %w", err)
 		}
+		hdr = make([]byte, 8)
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return fmt.Errorf("read second startup header: %w", err)
 		}
@@ -702,6 +764,7 @@ func pgHandshake(conn net.Conn) error {
 		if _, err := conn.Write([]byte{'N'}); err != nil {
 			return fmt.Errorf("write GSS-no: %w", err)
 		}
+		hdr = make([]byte, 8)
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return fmt.Errorf("read third startup header: %w", err)
 		}
@@ -734,6 +797,13 @@ func pgHandshake(conn net.Conn) error {
 		return err
 	}
 	return nil
+}
+
+// pgHandshake is the legacy entry point preserved for compatibility
+// with existing tests. New paths should call pgHandshakeWithPreamble
+// directly.
+func pgHandshake(conn net.Conn) error {
+	return pgHandshakeWithPreamble(conn, nil)
 }
 
 func readPGMessage(conn net.Conn) (byte, []byte, error) {

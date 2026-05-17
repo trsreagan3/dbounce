@@ -93,6 +93,7 @@ func newRootCmd() *cobra.Command {
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newAuditCmd())
+	root.AddCommand(newInitTLSCmd())
 	return root
 }
 
@@ -135,6 +136,14 @@ func newRunCmd() *cobra.Command {
 		upstreamTLSStr    string
 		dbPath            string
 		forceExternalBind bool
+		// D-Slice 4: TLS flags. All optional; empty preserves D-Slice
+		// 1+2's plaintext behavior.
+		listenerTLSCert     string
+		listenerTLSKey      string
+		listenerTLSClientCA string
+		requireClientCert   bool
+		mgmtTLSCert         string
+		mgmtTLSKey          string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -206,16 +215,42 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			}
 			defer st.Close()
 
+			// D-Slice 4: optional listener-side TLS. When both
+			// --listener-tls-cert + --listener-tls-key are set, the
+			// listener answers SSLRequest with 'S' + performs the TLS
+			// handshake before the StartupMessage parser fires.
+			var listenerTLSCfg *proxy.ListenerTLS
+			if listenerTLSCert != "" || listenerTLSKey != "" || requireClientCert {
+				lcfg, err := proxy.LoadListenerTLS(
+					listenerTLSCert, listenerTLSKey, listenerTLSClientCA, requireClientCert)
+				if err != nil {
+					return err
+				}
+				listenerTLSCfg = lcfg
+			}
+
+			// D-Slice 4: /healthz over HTTPS sanity check. Either both
+			// management-tls flags are set, or neither. A half-set pair
+			// is an operator typo we should surface loudly.
+			if (mgmtTLSCert == "") != (mgmtTLSKey == "") {
+				return fmt.Errorf(
+					"dbounce: --management-tls-cert and --management-tls-key " +
+						"must both be set or both empty")
+			}
+
 			cfg := proxy.Config{
-				Host:          host,
-				Port:          port,
-				MgmtHost:      mgmtHost,
-				MgmtPort:      mgmtPort,
-				Mode:          mode,
-				DefaultPolicy: defaultPol,
-				Dialect:       dialect,
-				UpstreamURL:   upstreamURL,
-				Upstream:      resolvedUpstream,
+				Host:            host,
+				Port:            port,
+				MgmtHost:        mgmtHost,
+				MgmtPort:        mgmtPort,
+				Mode:            mode,
+				DefaultPolicy:   defaultPol,
+				Dialect:         dialect,
+				UpstreamURL:     upstreamURL,
+				Upstream:        resolvedUpstream,
+				ListenerTLS:     listenerTLSCfg,
+				MgmtTLSCertFile: mgmtTLSCert,
+				MgmtTLSKeyFile:  mgmtTLSKey,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
@@ -223,12 +258,23 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			// Banner per the agent-parity requirement + the read-write
 			// framing the safe-default profile (D-Slice 7) will hook
 			// into. Goes to stderr so stdout stays clean.
+			wireProto := "tcp"
+			if cfg.ListenerTLS != nil {
+				wireProto = "tcp+tls"
+				if cfg.ListenerTLS.RequireClientCert {
+					wireProto += "+mtls"
+				}
+			}
 			fmt.Fprintf(os.Stderr,
-				"dbounce wire listener  : %s:%d  (dialect=%s, mode=%s, default-policy=%s)\n",
-				cfg.Host, cfg.Port, cfg.Dialect, cfg.Mode, cfg.DefaultPolicy)
+				"dbounce wire listener  : %s:%d  (dialect=%s, mode=%s, default-policy=%s, transport=%s)\n",
+				cfg.Host, cfg.Port, cfg.Dialect, cfg.Mode, cfg.DefaultPolicy, wireProto)
+			mgmtScheme := "http"
+			if cfg.MgmtTLSCertFile != "" {
+				mgmtScheme = "https"
+			}
 			fmt.Fprintf(os.Stderr,
-				"dbounce mgmt /healthz : http://%s:%d/healthz\n",
-				cfg.MgmtHost, cfg.MgmtPort)
+				"dbounce mgmt /healthz : %s://%s:%d/healthz\n",
+				mgmtScheme, cfg.MgmtHost, cfg.MgmtPort)
 			fmt.Fprintf(os.Stderr, "audit db              : %s\n", st.Path())
 			if resolvedUpstream != nil {
 				fmt.Fprintf(os.Stderr,
@@ -334,6 +380,29 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"/ ::1 / localhost. Binding externally exposes dbounce's "+
 			"credential-handling surface (once D-Slice 2 lands SCRAM "+
 			"pass-through). Don't pass without a specific reason.")
+
+	// D-Slice 4: listener-side TLS for the SQL wire-protocol port.
+	cmd.Flags().StringVar(&listenerTLSCert, "listener-tls-cert", "",
+		"PEM cert for the SQL wire-protocol listener. Pair with "+
+			"--listener-tls-key. When both are set, dbounce answers PG SSLRequest "+
+			"with 'S' + performs the TLS handshake before the StartupMessage "+
+			"parser fires. Generate via `dbounce init-tls`.")
+	cmd.Flags().StringVar(&listenerTLSKey, "listener-tls-key", "",
+		"PEM private key for the SQL wire-protocol listener (matches --listener-tls-cert).")
+	cmd.Flags().StringVar(&listenerTLSClientCA, "listener-tls-client-ca", "",
+		"PEM CA bundle clients' certs are verified against when "+
+			"--require-client-cert is set. Required for mTLS.")
+	cmd.Flags().BoolVar(&requireClientCert, "require-client-cert", false,
+		"Reject TLS clients that don't present a cert signed by --listener-tls-client-ca. "+
+			"Opt-in mTLS. Has no effect when --listener-tls-cert is unset.")
+
+	// D-Slice 4: management-listener TLS for /healthz.
+	cmd.Flags().StringVar(&mgmtTLSCert, "management-tls-cert", "",
+		"PEM cert for the management HTTP listener. Pair with "+
+			"--management-tls-key. When both are set, /healthz is served over HTTPS. "+
+			"Generate via `dbounce init-tls`.")
+	cmd.Flags().StringVar(&mgmtTLSKey, "management-tls-key", "",
+		"PEM private key for the management HTTP listener (matches --management-tls-cert).")
 	return cmd
 }
 
