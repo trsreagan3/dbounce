@@ -428,3 +428,164 @@ func TestUpsertProfile_RefusesNonLocalSource(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read-only")
 }
+
+// AddLocalProfile tests. The method is the public append-write surface
+// the D-Slice 8 CLI's profileWriterAdapter calls into to create
+// profiles from prompts / presets / recommender output. Per the
+// [[creates-never-mutates]] invariant the method must NEVER overwrite
+// an existing profile — collision returns ErrProfileExists.
+
+func TestAddLocalProfile_AppendsToFreshFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	ps, err := LoadProfiles(path)
+	require.NoError(t, err)
+	// LoadProfiles on a missing file falls back to embedded defaults,
+	// so the in-memory map has full-user but the on-disk file does
+	// not exist yet. AddLocalProfile must create it.
+	newProf := &Profile{
+		Name:        "from-prompt-42",
+		Description: "test: profile created from a prompt",
+		AllowRules: []ProfileAllowRule{
+			{Pattern: "SELECT:public.users", Note: "from prompt 42"},
+		},
+	}
+	require.NoError(t, ps.AddLocalProfile(path, newProf))
+
+	// File now exists on disk; re-load + assert the new entry is there.
+	reloaded, err := LoadProfiles(path)
+	require.NoError(t, err)
+	got, ok := reloaded.All["from-prompt-42"]
+	require.True(t, ok, "new profile must be readable after re-load")
+	assert.Equal(t, "local", got.Source, "AddLocalProfile must force source=local")
+	assert.Equal(t, "test: profile created from a prompt", got.Description)
+	require.Len(t, got.AllowRules, 1)
+	assert.Equal(t, "SELECT:public.users", got.AllowRules[0].Pattern)
+	// In-memory receiver should also see it for the caller's convenience.
+	_, present := ps.All["from-prompt-42"]
+	assert.True(t, present, "Profiles receiver must reflect the new entry")
+}
+
+func TestAddLocalProfile_ReturnsErrProfileExistsOnCollision(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(
+		"profiles:\n  prior-profile:\n    description: was here first\n",
+	), 0o600))
+	ps, err := LoadProfiles(path)
+	require.NoError(t, err)
+
+	err = ps.AddLocalProfile(path, &Profile{
+		Name:        "prior-profile",
+		Description: "tried to overwrite",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrProfileExists,
+		"must wrap ErrProfileExists for ErrorIs identification")
+	assert.Contains(t, err.Error(), "prior-profile")
+
+	// Confirm the existing profile was NOT modified.
+	reloaded, err := LoadProfiles(path)
+	require.NoError(t, err)
+	assert.Equal(t, "was here first",
+		reloaded.All["prior-profile"].Description,
+		"AddLocalProfile must not mutate the existing profile on collision")
+}
+
+func TestAddLocalProfile_RejectsInvalidProfile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	ps, err := LoadProfiles(path)
+	require.NoError(t, err)
+
+	// keyword_match = "garbage" fails Profile.validate(). Must surface
+	// BEFORE the disk write so the YAML never lands in an invalid state.
+	err = ps.AddLocalProfile(path, &Profile{
+		Name:         "invalid",
+		KeywordMatch: "garbage",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidProfile)
+
+	// File must NOT exist (or if it does exist, must not contain
+	// "invalid"). LoadProfiles on a missing file is fine.
+	if _, statErr := os.Stat(path); statErr == nil {
+		reloaded, lerr := LoadProfiles(path)
+		require.NoError(t, lerr)
+		_, present := reloaded.All["invalid"]
+		assert.False(t, present, "invalid profile must never land on disk")
+	}
+}
+
+func TestAddLocalProfile_RejectsEmptyName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	ps, err := LoadProfiles(path)
+	require.NoError(t, err)
+	err = ps.AddLocalProfile(path, &Profile{Name: ""})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Name is required")
+	err = ps.AddLocalProfile(path, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Name is required")
+}
+
+func TestAddLocalProfile_ForcesSourceLocalEvenIfCallerSetURL(t *testing.T) {
+	// A caller that tries to set Source to a URL would otherwise produce
+	// a profile that subsequent UpsertProfile calls refuse as read-only.
+	// AddLocalProfile's docstring promises it overwrites Source to
+	// "local" so the operator-authored profile remains editable.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	ps, err := LoadProfiles(path)
+	require.NoError(t, err)
+	require.NoError(t, ps.AddLocalProfile(path, &Profile{
+		Name:        "sneaky",
+		Description: "tried to set source to a URL",
+		Source:      "https://malicious.example/p.yaml",
+	}))
+	reloaded, err := LoadProfiles(path)
+	require.NoError(t, err)
+	got := reloaded.All["sneaky"]
+	require.NotNil(t, got)
+	assert.Equal(t, "local", got.Source,
+		"AddLocalProfile must overwrite Source regardless of caller intent")
+	assert.True(t, got.IsLocalSource(),
+		"the resulting profile must remain editable at the CLI surface")
+}
+
+func TestAddLocalProfile_RoundTripDetectsConcurrentEdit(t *testing.T) {
+	// Atomicity / re-read resilience: load profiles, then EXTERNALLY
+	// edit the YAML to add a NEW profile, then call AddLocalProfile with
+	// a DIFFERENT name. The re-read on append must pick up the external
+	// edit so it survives. Mirrors what would happen if a sibling
+	// `dbounce` CLI invocation ran between LoadProfiles + AddLocalProfile.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(
+		"profiles:\n  original:\n    description: original\n",
+	), 0o600))
+	ps, err := LoadProfiles(path)
+	require.NoError(t, err)
+
+	// External edit: another writer added "external-edit" while we held
+	// the loaded snapshot.
+	require.NoError(t, os.WriteFile(path, []byte(
+		"profiles:\n"+
+			"  original:\n    description: original\n"+
+			"  external-edit:\n    description: added by another writer\n",
+	), 0o600))
+
+	require.NoError(t, ps.AddLocalProfile(path, &Profile{
+		Name:        "my-new-profile",
+		Description: "added by this writer",
+	}))
+
+	reloaded, err := LoadProfiles(path)
+	require.NoError(t, err)
+	for _, want := range []string{"original", "external-edit", "my-new-profile"} {
+		_, present := reloaded.All[want]
+		assert.True(t, present,
+			"AddLocalProfile re-read must preserve %q across the append", want)
+	}
+}

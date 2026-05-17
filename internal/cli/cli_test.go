@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/store"
 )
 
@@ -299,6 +301,198 @@ func TestAuditCmd_RequiresSubcommand(t *testing.T) {
 		subs[c.Name()] = true
 	}
 	assert.True(t, subs["tail"], "audit tail must be wired")
+}
+
+// withProfilesPath sets DBOUNCE_PROFILES_PATH to a tempdir-local
+// profiles.yaml for the duration of the test + returns the path. Used
+// by the e2e tests below so the profileWriterAdapter inside
+// newRootCmd() writes to a controlled location rather than the
+// developer's real ~/.dbounce/profiles.yaml.
+func withProfilesPath(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "profiles.yaml")
+	prev := os.Getenv("DBOUNCE_PROFILES_PATH")
+	require.NoError(t, os.Setenv("DBOUNCE_PROFILES_PATH", p))
+	t.Cleanup(func() {
+		if prev == "" {
+			_ = os.Unsetenv("DBOUNCE_PROFILES_PATH")
+		} else {
+			_ = os.Setenv("DBOUNCE_PROFILES_PATH", prev)
+		}
+	})
+	return p
+}
+
+// TestRootCmd_ProfileWriterWired_PromptsAnswerProfile drives the
+// `dbounce prompts answer ID --kind profile --target NAME` flow end-
+// to-end via newRootCmd() so the profileWriterAdapter wiring is what
+// gets exercised — not the prompts-answer-with-test-double pattern
+// used by prompts_test.go. Confirms the merge-time TODO from
+// commit 3396bd1 is closed.
+func TestRootCmd_ProfileWriterWired_PromptsAnswerProfile(t *testing.T) {
+	profilesPath := withProfilesPath(t)
+	dbPath := dbAt(t)
+	// DBOUNCE_DB is set by the package's TestMain; override for this
+	// test so each subcommand opens the same tempdir-scoped store.
+	prevDB := os.Getenv("DBOUNCE_DB")
+	require.NoError(t, os.Setenv("DBOUNCE_DB", dbPath))
+	t.Cleanup(func() { _ = os.Setenv("DBOUNCE_DB", prevDB) })
+
+	id := enqueueTestPrompt(t, dbPath)
+	target := "e2e-prompt-profile"
+
+	root := newRootCmd()
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(out)
+	root.SetArgs([]string{
+		"prompts", "answer", fmt.Sprintf("%d", id),
+		"--kind", "profile",
+		"--target=" + target,
+		"--db", dbPath,
+		"--actor", "e2e-test",
+	})
+	require.NoError(t, root.Execute(), "root execute failed: %s", out.String())
+	assert.Contains(t, out.String(), target,
+		"output must mention the created profile name")
+
+	// Verify the profile landed in the on-disk YAML.
+	ps, err := profile.LoadProfiles(profilesPath)
+	require.NoError(t, err)
+	got, present := ps.All[target]
+	require.True(t, present, "profile %q must exist in %s", target, profilesPath)
+	assert.Equal(t, "local", got.Source,
+		"adapter must force source=local on operator-created profiles")
+	require.NotEmpty(t, got.AllowRules,
+		"prompt-derived profile must carry at least one allow_rule")
+	assert.Contains(t, got.AllowRules[0].Pattern, "SELECT",
+		"allow_rule pattern must reflect the prompt's statement_type")
+}
+
+// TestRootCmd_ProfileWriterWired_PresetsApply drives the
+// `dbounce presets apply NAME --target NAME` flow end-to-end via
+// newRootCmd() — confirms that presets apply now creates profiles
+// instead of erroring with the stub message.
+func TestRootCmd_ProfileWriterWired_PresetsApply(t *testing.T) {
+	profilesPath := withProfilesPath(t)
+	target := "e2e-preset-profile"
+
+	root := newRootCmd()
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(out)
+	root.SetArgs([]string{
+		"presets", "apply", "analytics-engineer",
+		"--target=" + target,
+	})
+	require.NoError(t, root.Execute(), "root execute failed: %s", out.String())
+	text := out.String()
+	assert.Contains(t, text, target)
+	assert.Contains(t, text, "analytics-engineer",
+		"output must reference the source preset id")
+
+	ps, err := profile.LoadProfiles(profilesPath)
+	require.NoError(t, err)
+	got, present := ps.All[target]
+	require.True(t, present, "preset-derived profile must land in %s", profilesPath)
+	assert.NotEmpty(t, got.AllowRules,
+		"analytics-engineer carries allow_rules that must round-trip")
+	assert.NotEmpty(t, got.DenyActions,
+		"analytics-engineer carries deny_rules (MUTATING:*) — adapter "+
+			"must extract the statement_type into DenyActions")
+}
+
+// TestRootCmd_ProfileWriterWired_RulesRecommendSaveAsProfile drives
+// the `dbounce rules recommend --save-as-profile NAME` flow end-to-
+// end. Seeds the audit log with enough repeat decisions for the
+// recommender to surface a pattern, then verifies the resulting
+// profile lands in the YAML.
+func TestRootCmd_ProfileWriterWired_RulesRecommendSaveAsProfile(t *testing.T) {
+	profilesPath := withProfilesPath(t)
+	dbPath := dbAt(t)
+	prevDB := os.Getenv("DBOUNCE_DB")
+	require.NoError(t, os.Setenv("DBOUNCE_DB", dbPath))
+	t.Cleanup(func() { _ = os.Setenv("DBOUNCE_DB", prevDB) })
+
+	// Seed enough decisions so the recommender surfaces a pattern.
+	// Default --min-count is 3 so we record 5 identical SELECT rows.
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		_, err := st.RecordDecision(store.DecisionRow{
+			Dialect:         "postgres",
+			Statement:       "SELECT * FROM public.metrics",
+			StatementType:   "SELECT",
+			TablesTouched:   []string{"public.metrics"},
+			DecisionVerdict: "ALLOW",
+			DecisionReason:  "observation-only",
+			ModeAtDecision:  "cooperative",
+		})
+		require.NoError(t, err)
+	}
+	require.NoError(t, st.Close())
+
+	target := "e2e-recommend-profile"
+	root := newRootCmd()
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(out)
+	root.SetArgs([]string{
+		"rules", "recommend",
+		"--db", dbPath,
+		"--save-as-profile=" + target,
+	})
+	require.NoError(t, root.Execute(), "root execute failed: %s", out.String())
+	assert.Contains(t, out.String(), target)
+
+	ps, err := profile.LoadProfiles(profilesPath)
+	require.NoError(t, err)
+	got, present := ps.All[target]
+	require.True(t, present,
+		"recommender-derived profile must land in %s", profilesPath)
+	require.NotEmpty(t, got.AllowRules,
+		"rules recommend --save-as-profile must produce allow_rules")
+	// The recommender pattern is "SELECT:<table-glob>" — assert the
+	// allow_rule round-tripped the statement type.
+	assert.True(t,
+		strings.HasPrefix(got.AllowRules[0].Pattern, "SELECT:"),
+		"recommended allow_rule must carry SELECT: prefix, got %q",
+		got.AllowRules[0].Pattern)
+}
+
+// TestProfileWriterAdapter_CollisionReturnsErrProfileExists exercises
+// the adapter directly (rather than via a CLI subcommand) to confirm
+// the ErrProfileExists backstop fires. The CLI subcommands use
+// naming.AvoidCollision to auto-bump duplicate names BEFORE calling
+// CreateProfile, so the adapter's ErrProfileExists is a defense-in-
+// depth check that fires only on a TOCTOU race or a caller that
+// bypasses AvoidCollision. Per [[creates-never-mutates]] the adapter
+// must NEVER overwrite an existing profile.
+func TestProfileWriterAdapter_CollisionReturnsErrProfileExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(
+		"profiles:\n  collision-target:\n    description: pre-existing\n",
+	), 0o600))
+
+	adapter := newCLIProfileWriter(path)
+	err := adapter.CreateProfile(
+		"collision-target", "tried to overwrite",
+		nil, nil)
+	require.Error(t, err, "adapter must surface collision as an error")
+	assert.ErrorIs(t, err, profile.ErrProfileExists,
+		"must wrap profile.ErrProfileExists for ErrorIs identification")
+	assert.Contains(t, err.Error(), path,
+		"adapter's wrap should name the profiles file the operator edits")
+
+	// Confirm the existing profile was NOT modified.
+	ps, err := profile.LoadProfiles(path)
+	require.NoError(t, err)
+	got, present := ps.All["collision-target"]
+	require.True(t, present)
+	assert.Equal(t, "pre-existing", got.Description,
+		"adapter must never overwrite an existing profile (creates-never-mutates)")
 }
 
 func TestMain(m *testing.M) {

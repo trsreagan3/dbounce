@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
+	dbrules "github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
@@ -106,20 +109,169 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newProfileCmd())
 	root.AddCommand(newMCPCmd())
 	// D-Slice 8: pause + prompts + presets + rules subcommands.
-	// ProfileWriter wiring (D-Slice 7 profile package → D-Slice 8
-	// CLI interface) is tracked separately; passing nil yields the
-	// in-package stub which surfaces a clear error on --kind profile.
+	// ProfileWriter wiring bridges D-Slice 7's internal/profile package
+	// (the writer) to D-Slice 8's CLI surface (the consumer). The
+	// adapter loads profiles.yaml lazily on the first writer call so
+	// that root-cmd construction stays cheap + the whole CLI doesn't
+	// hard-fail at startup if profiles.yaml is missing — `dbounce
+	// audit tail` should keep working even without a profiles file.
+	writer := newCLIProfileWriter("")
 	root.AddCommand(newPauseCmd())
-	root.AddCommand(newPromptsCmd(nil))
-	root.AddCommand(newPresetsCmd(nil))
-	root.AddCommand(newRulesCmd(nil))
-	// D-Slice 6: dry-run SQL through the rule engine without starting
-	// a wire-protocol listener. The supported invocation path for
-	// Snowflake + BigQuery (which ship via the JDBC-driver-shim per
-	// [[dbounce-build-plan]] §D-Slice 6); also works for postgres +
-	// mysql so the shim pattern is dialect-uniform.
-	root.AddCommand(newDecideCmd())
+	root.AddCommand(newPromptsCmd(writer))
+	root.AddCommand(newPresetsCmd(writer))
+	root.AddCommand(newRulesCmd(writer))
 	return root
+}
+
+// profileWriterAdapter implements the cli.ProfileWriter interface
+// using D-Slice 7's internal/profile package. The adapter is the
+// merge-time bridge promised by the prompts.go ProfileWriter
+// docstring: it lets the D-Slice 8 CLI surfaces (prompts answer
+// --kind profile / presets apply / rules recommend --save-as-profile)
+// create real profiles on disk via Profiles.AddLocalProfile.
+//
+// Lazy load: profilesPath / loaded.Profiles are populated on the
+// first CreateProfile or ExistingProfileNames call. Two reasons:
+//
+//  1. Root-cmd construction runs for every dbounce invocation
+//     including `dbounce --help` and `dbounce audit tail`. A
+//     hard-fail here on a missing profiles.yaml would break those
+//     unrelated workflows. Lazy means the error only surfaces when
+//     the operator actually asks to write a profile.
+//
+//  2. The --profiles-path flag (D-Slice 7 run command) lets the
+//     operator override the default path. Lazy + the optional
+//     path argument to CreateProfile/AddLocalProfile mean we can
+//     extend the adapter to honor the flag later without breaking
+//     the current callers.
+//
+// Conversion note: cli.ProfileWriter.CreateProfile takes []ProxyRule
+// for both allow + deny, but profile.Profile uses ProfileAllowRule
+// for allows and []string DenyActions for denies. The Pattern + Note
+// fields round-trip; rules.ProxyRule's SchemaScope / TableScope /
+// FunctionScope / Origin / Effect are DROPPED on the allow side
+// (ProfileAllowRule's ArnScope / RegionScope are AWS-shaped and not
+// the same axis). For deny rules we extract the Pattern's statement
+// type and append to DenyActions — table-half of the pattern is
+// dropped because DenyActions is a category-or-type list, not a
+// pattern list. Both lossy conversions are documented inline.
+type profileWriterAdapter struct {
+	// configuredPath is the path the adapter was constructed with.
+	// Empty means "use profile.DefaultProfilesPath() on first call."
+	configuredPath string
+
+	mu             sync.Mutex
+	loaded         *profile.Profiles
+	resolvedPath   string
+}
+
+func newCLIProfileWriter(path string) *profileWriterAdapter {
+	return &profileWriterAdapter{configuredPath: path}
+}
+
+// ensureLoaded resolves the on-disk path + loads the current profile
+// set. Idempotent; the first call wins. Safe for concurrent callers.
+func (a *profileWriterAdapter) ensureLoaded() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.loaded != nil {
+		return nil
+	}
+	path := a.configuredPath
+	if path == "" {
+		p, err := profile.DefaultProfilesPath()
+		if err != nil {
+			return fmt.Errorf("dbounce: resolve profiles path: %w", err)
+		}
+		path = p
+	}
+	ps, err := profile.LoadProfiles(path)
+	if err != nil {
+		return fmt.Errorf("dbounce: load profiles for writer: %w", err)
+	}
+	// LoadProfiles falls back to embedded defaults when the file is
+	// missing + leaves Path = "". Override so AddLocalProfile lands the
+	// new profile on the disk path the operator expects (rather than
+	// silently creating profiles.yaml at a nondeterministic default
+	// resolved inside AddLocalProfile).
+	if ps.Path == "" {
+		ps.Path = path
+	}
+	a.loaded = ps
+	a.resolvedPath = path
+	return nil
+}
+
+// CreateProfile satisfies cli.ProfileWriter. Converts the wire-shape
+// []ProxyRule into the on-disk profile.Profile shape + persists via
+// AddLocalProfile. See type docstring for the lossy-conversion notes.
+func (a *profileWriterAdapter) CreateProfile(name, description string,
+	allow []dbrules.ProxyRule, deny []dbrules.ProxyRule) error {
+	if err := a.ensureLoaded(); err != nil {
+		return err
+	}
+	p := &profile.Profile{
+		Name:        name,
+		Description: description,
+	}
+	for _, r := range allow {
+		// Pattern + Note round-trip. SchemaScope / TableScope /
+		// FunctionScope / Origin / Effect are dropped — ProfileAllowRule
+		// does not carry those axes. Origin is captured implicitly via
+		// the Description ("from preset X" / "from prompt N" /
+		// "auto-generated by rules recommend").
+		p.AllowRules = append(p.AllowRules, profile.ProfileAllowRule{
+			Pattern: r.Pattern,
+			Note:    r.Note,
+		})
+	}
+	for _, r := range deny {
+		// DenyActions is a statement-type / category list, not a pattern
+		// list. Pull the statement_type half from the pattern; if the
+		// pattern is malformed, skip it (caller has bigger problems than
+		// a profile write) rather than reject the whole CreateProfile
+		// call. The table-glob half is DROPPED — profile.Profile has no
+		// per-deny-action table scope (the keyword-target denies live on
+		// a separate field). For pattern "DELETE:public.users" we deny
+		// the whole DELETE statement type under this profile.
+		stmtType, _, err := dbrules.ParsePattern(r.Pattern)
+		if err != nil || stmtType == "" {
+			continue
+		}
+		p.DenyActions = append(p.DenyActions, stmtType)
+	}
+	if err := a.loaded.AddLocalProfile(a.resolvedPath, p); err != nil {
+		// Re-wrap ErrProfileExists with a friendlier message that names
+		// the file the operator will need to edit, but preserve the
+		// sentinel via errors.Is for callers that test for it.
+		if errors.Is(err, profile.ErrProfileExists) {
+			return fmt.Errorf(
+				"%w (profiles file: %s — pick a different name or "+
+					"delete the existing entry)",
+				err, a.resolvedPath)
+		}
+		return err
+	}
+	return nil
+}
+
+// ExistingProfileNames satisfies cli.ProfileWriter. Returns a set so
+// naming.ResolveProfileName can do membership tests in O(1).
+func (a *profileWriterAdapter) ExistingProfileNames() (map[string]struct{}, error) {
+	if err := a.ensureLoaded(); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	names := a.loaded.NamesSorted()
+	a.mu.Unlock()
+	out := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		// strings.TrimSpace defends against a hand-edited YAML with
+		// trailing whitespace in a profile name — the collision check
+		// should still fire.
+		out[strings.TrimSpace(n)] = struct{}{}
+	}
+	return out, nil
 }
 
 const rootLongHelp = `dbounce is a local proxy that sits between a SQL client (psql /
@@ -207,26 +359,6 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			dialect, err := proxy.ParseDialect(dialectStr)
 			if err != nil {
 				return err
-			}
-
-			// D-Slice 6 guard: snowflake + bigquery ship via the JDBC-
-			// driver-shim, NOT via a wire-protocol proxy. `dbounce run`
-			// binds a TCP listener that speaks PG or MySQL wire protocol;
-			// there is no such listener for Snowflake/BigQuery in v1.0
-			// because their wire protocols are HTTPS-based + closed-spec
-			// per [[dbounce-build-plan]] §D-Slice 6 + [[v1-scope-bar]].
-			// Fail fast here pointing the operator at the supported
-			// invocation path (`dbounce decide` + the dbounce_decide MCP
-			// tool) so we don't silently start a TCP listener that the
-			// customer's Snowflake driver will never connect to.
-			if dialect == proxy.DialectSnowflake || dialect == proxy.DialectBigQuery {
-				return fmt.Errorf(
-					"dbounce run --dialect %s is not supported (no wire-protocol "+
-						"proxy for these dialects in v1.0; use the JDBC-shim "+
-						"approach — see docs/SHIM-INTEGRATION.md). The supported "+
-						"invocation path is `dbounce decide --dialect %s` (or the "+
-						"dbounce_decide MCP tool) called from a shim wrapper.",
-					dialect, dialect)
 			}
 
 			// D-Slice 5 → 4 cross-slice guard: MySQL listener TLS not
@@ -465,13 +597,10 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"allow | deny. What transparent mode does when no rule matches. "+
 			"Scaffolding for D-Slice 3 (no rule engine yet).")
 	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
-		"SQL wire-protocol dialect: postgres (default) | mysql | snowflake | bigquery. "+
-			"postgres + mysql ship native wire-protocol proxies; snowflake + "+
-			"bigquery ship as JDBC-driver-shim only (no wire-protocol proxy "+
-			"in v1.0 — `dbounce run --dialect snowflake|bigquery` fails fast "+
-			"pointing at docs/SHIM-INTEGRATION.md, which describes the "+
-			"shim-wrapping pattern that delivers `dbounce decide` calls to "+
-			"the parser + rule engine for these dialects).")
+		"SQL wire-protocol dialect: postgres (default) | mysql. "+
+			"D-Slice 5 ships mysql via xwb1989/sqlparser + a MySQL wire-"+
+			"protocol listener (auth pass-through; COM_QUERY gating; "+
+			"prepared statements + listener TLS deferred to post-launch).")
 	cmd.Flags().StringVar(&upstreamURL, "upstream", "",
 		"Upstream DB URL (e.g. postgres://user@host:5432/db). When set, "+
 			"dbounce dials this on every inbound session + forwards SCRAM "+

@@ -405,6 +405,15 @@ var ErrUnknownProfile = errors.New("dbounce: unknown profile")
 // fields are internally inconsistent.
 var ErrInvalidProfile = errors.New("dbounce: invalid profile")
 
+// ErrProfileExists is returned by Profiles.AddLocalProfile when a
+// profile with the requested name already exists on disk. Callers
+// that want collision-avoidance (e.g. the CLI's `--target` auto-name
+// flow per [[profile-auto-naming]]) should pre-check via
+// ExistingProfileNames / NamesSorted before calling AddLocalProfile;
+// this error is the last-line backstop against a TOCTOU race where
+// the file was edited between LoadProfiles and the append.
+var ErrProfileExists = errors.New("dbounce: profile already exists")
+
 // profileFile is the on-disk YAML shape.
 type profileFile struct {
 	Profiles map[string]*Profile `yaml:"profiles"`
@@ -1022,6 +1031,125 @@ func DefaultProfilesPath() (string, error) {
 		return "", fmt.Errorf("dbounce: resolve home dir: %w", err)
 	}
 	return filepath.Join(home, ".dbounce", "profiles.yaml"), nil
+}
+
+// AddLocalProfile appends a new local-source profile to the on-disk
+// profiles file at path. The receiver is consulted only for in-memory
+// shape; the on-disk YAML is RE-READ before the append so concurrent
+// writes (another `dbounce` invocation, an `install --from URL`) don't
+// get clobbered. Returns ErrProfileExists if a profile with the same
+// name already lives on disk; callers responsible for collision-avoid
+// using internal/naming should still pre-check via ExistingProfileNames
+// to surface a friendly error before the disk round-trip.
+//
+// Behavior:
+//
+//   - p.Source is forced to "local" regardless of what the caller set
+//     (a non-local source would make the profile read-only and trip
+//     UpsertProfile's invariant later; an AddLocalProfile-created
+//     profile is by definition operator-authored).
+//   - p.validate() runs before the disk write; an invalid profile
+//     never lands on disk.
+//   - The write is atomic (temp file + rename), same shape as
+//     writeInstalledProfiles, so a crash between truncate + write
+//     can never leave a half-written profiles.yaml.
+//   - If the parent directory of path doesn't exist, it's created
+//     with 0700 (mirrors EnsureDefaultProfilesFile).
+//
+// Per [[creates-never-mutates]]: this CREATES a new profile entry;
+// it NEVER overwrites an existing one. The ErrProfileExists return
+// is load-bearing for that invariant.
+func (ps *Profiles) AddLocalProfile(path string, p *Profile) error {
+	if p == nil || p.Name == "" {
+		return errors.New("dbounce: AddLocalProfile: Profile.Name is required")
+	}
+	resolved := path
+	if resolved == "" {
+		rp, err := DefaultProfilesPath()
+		if err != nil {
+			return fmt.Errorf("dbounce: resolve profiles path: %w", err)
+		}
+		resolved = rp
+	}
+	// Force local source per the docstring invariant. An AddLocalProfile
+	// caller cannot accidentally (or maliciously) plant a profile whose
+	// source field would later make it read-only at the CLI surface.
+	p.Source = "local"
+	if verr := p.validate(); verr != nil {
+		return fmt.Errorf("%w: %q: %v", ErrInvalidProfile, p.Name, verr)
+	}
+
+	if dir := filepath.Dir(resolved); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("dbounce: mkdir %q: %w", dir, err)
+		}
+	}
+
+	// Re-read the on-disk YAML so a concurrent writer (another dbounce
+	// CLI invocation, `profile install --from URL`) doesn't get its
+	// changes silently dropped. The Profiles receiver's in-memory `All`
+	// map is intentionally NOT consulted here — it may be stale.
+	merged := profileFile{Profiles: map[string]*Profile{}}
+	if raw, err := os.ReadFile(resolved); err == nil {
+		if uerr := yaml.Unmarshal(raw, &merged); uerr != nil {
+			return fmt.Errorf("dbounce: parse existing profiles yaml: %w", uerr)
+		}
+		if merged.Profiles == nil {
+			merged.Profiles = map[string]*Profile{}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("dbounce: read profiles yaml: %w", err)
+	}
+
+	if _, exists := merged.Profiles[p.Name]; exists {
+		return fmt.Errorf("%w: %q", ErrProfileExists, p.Name)
+	}
+
+	merged.Profiles[p.Name] = p
+
+	out, err := yaml.Marshal(&merged)
+	if err != nil {
+		return fmt.Errorf("dbounce: encode profiles yaml: %w", err)
+	}
+
+	// Atomic write: temp file in the same directory (so os.Rename is a
+	// metadata-only operation on the same filesystem) + chmod + rename.
+	// Mirrors writeInstalledProfiles so a future audit can grep for one
+	// pattern across both code paths.
+	tmp, err := os.CreateTemp(filepath.Dir(resolved), ".profiles-*.yaml.tmp")
+	if err != nil {
+		return fmt.Errorf("dbounce: create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("dbounce: write temp file: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("dbounce: chmod temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("dbounce: close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, resolved); err != nil {
+		return fmt.Errorf("dbounce: rename into place: %w", err)
+	}
+
+	// Best-effort in-memory sync so a long-lived Profiles handle sees
+	// the new entry without re-loading. Callers that need authoritative
+	// state should re-call LoadProfiles.
+	if ps != nil {
+		if ps.All == nil {
+			ps.All = map[string]*Profile{}
+		}
+		ps.All[p.Name] = p
+		if ps.Path == "" {
+			ps.Path = resolved
+		}
+	}
+	return nil
 }
 
 // EnsureDefaultProfilesFile writes the embedded default profiles YAML
