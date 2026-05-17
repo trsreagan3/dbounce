@@ -356,8 +356,10 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"allow | deny. What transparent mode does when no rule matches. "+
 			"Scaffolding for D-Slice 3 (no rule engine yet).")
 	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
-		"SQL wire-protocol dialect. D-Slice 1 supports: postgres. "+
-			"D-Slice 5 adds mysql; D-Slice 6 adds snowflake + bigquery.")
+		"SQL wire-protocol dialect: postgres (default) | mysql. "+
+			"D-Slice 5 ships mysql via xwb1989/sqlparser + a MySQL wire-"+
+			"protocol listener (auth pass-through; COM_QUERY gating; "+
+			"prepared statements + listener TLS deferred to post-launch).")
 	cmd.Flags().StringVar(&upstreamURL, "upstream", "",
 		"Upstream DB URL (e.g. postgres://user@host:5432/db). When set, "+
 			"dbounce dials this on every inbound session + forwards SCRAM "+

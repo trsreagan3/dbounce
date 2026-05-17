@@ -28,7 +28,7 @@ import (
 // product audit-log scraper has consistent shape across all rows.
 
 func TestParse_SimpleSelect(t *testing.T) {
-	ps := Parse("SELECT id, name FROM users WHERE id = 1")
+	ps := pgParse("SELECT id, name FROM users WHERE id = 1")
 	require.NotNil(t, ps)
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.Equal(t, []string{"users"}, ps.TablesTouched)
@@ -39,13 +39,13 @@ func TestParse_SimpleSelect(t *testing.T) {
 }
 
 func TestParse_SchemaQualifiedTable(t *testing.T) {
-	ps := Parse("SELECT * FROM public.orders")
+	ps := pgParse("SELECT * FROM public.orders")
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.Equal(t, []string{"public.orders"}, ps.TablesTouched)
 }
 
 func TestParse_SelectWithJoin(t *testing.T) {
-	ps := Parse(`SELECT u.id, o.total
+	ps := pgParse(`SELECT u.id, o.total
 	FROM users u
 	JOIN orders o ON o.user_id = u.id
 	WHERE u.id = 1`)
@@ -54,39 +54,39 @@ func TestParse_SelectWithJoin(t *testing.T) {
 }
 
 func TestParse_SelectSubquery(t *testing.T) {
-	ps := Parse(`SELECT * FROM users
+	ps := pgParse(`SELECT * FROM users
 	WHERE id IN (SELECT user_id FROM orders WHERE total > 100)`)
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.ElementsMatch(t, []string{"users", "orders"}, ps.TablesTouched)
 }
 
 func TestParse_SelectFromSubquery(t *testing.T) {
-	ps := Parse(`SELECT * FROM (SELECT id FROM users) sub`)
+	ps := pgParse(`SELECT * FROM (SELECT id FROM users) sub`)
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.Equal(t, []string{"users"}, ps.TablesTouched)
 }
 
 func TestParse_SelectUnion(t *testing.T) {
-	ps := Parse(`SELECT id FROM users UNION SELECT id FROM admins`)
+	ps := pgParse(`SELECT id FROM users UNION SELECT id FROM admins`)
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.ElementsMatch(t, []string{"users", "admins"}, ps.TablesTouched)
 }
 
 func TestParse_SelectVolatileFunction(t *testing.T) {
-	ps := Parse("SELECT pg_sleep(60)")
+	ps := pgParse("SELECT pg_sleep(60)")
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.Contains(t, ps.FunctionsCalled, "pg_sleep")
 }
 
 func TestParse_SelectAggregate(t *testing.T) {
-	ps := Parse("SELECT count(*), max(price) FROM products")
+	ps := pgParse("SELECT count(*), max(price) FROM products")
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.Contains(t, ps.FunctionsCalled, "count")
 	assert.Contains(t, ps.FunctionsCalled, "max")
 }
 
 func TestParse_Insert(t *testing.T) {
-	ps := Parse(`INSERT INTO users (id, name) VALUES (1, 'alice')`)
+	ps := pgParse(`INSERT INTO users (id, name) VALUES (1, 'alice')`)
 	assert.Equal(t, StmtInsert, ps.StatementType)
 	assert.Equal(t, []string{"users"}, ps.TablesTouched)
 	assert.True(t, ps.IsDML)
@@ -95,7 +95,7 @@ func TestParse_Insert(t *testing.T) {
 }
 
 func TestParse_InsertSelect(t *testing.T) {
-	ps := Parse(`INSERT INTO audit_log (event)
+	ps := pgParse(`INSERT INTO audit_log (event)
 	SELECT event FROM events WHERE created_at > '2026-01-01'`)
 	assert.Equal(t, StmtInsert, ps.StatementType)
 	assert.ElementsMatch(t, []string{"audit_log", "events"}, ps.TablesTouched)
@@ -104,7 +104,7 @@ func TestParse_InsertSelect(t *testing.T) {
 }
 
 func TestParse_InsertOnConflict(t *testing.T) {
-	ps := Parse(`INSERT INTO users (id, name) VALUES (1, 'alice')
+	ps := pgParse(`INSERT INTO users (id, name) VALUES (1, 'alice')
 	ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`)
 	assert.Equal(t, StmtInsert, ps.StatementType)
 	assert.Equal(t, []string{"users"}, ps.TablesTouched)
@@ -113,7 +113,7 @@ func TestParse_InsertOnConflict(t *testing.T) {
 }
 
 func TestParse_Update(t *testing.T) {
-	ps := Parse(`UPDATE users SET name = 'bob' WHERE id = 1`)
+	ps := pgParse(`UPDATE users SET name = 'bob' WHERE id = 1`)
 	assert.Equal(t, StmtUpdate, ps.StatementType)
 	assert.Equal(t, []string{"users"}, ps.TablesTouched)
 	assert.True(t, ps.IsDML)
@@ -122,14 +122,14 @@ func TestParse_Update(t *testing.T) {
 }
 
 func TestParse_UpdateFrom(t *testing.T) {
-	ps := Parse(`UPDATE orders SET status = 'paid'
+	ps := pgParse(`UPDATE orders SET status = 'paid'
 	FROM payments WHERE orders.id = payments.order_id`)
 	assert.Equal(t, StmtUpdate, ps.StatementType)
 	assert.ElementsMatch(t, []string{"orders", "payments"}, ps.TablesTouched)
 }
 
 func TestParse_Delete(t *testing.T) {
-	ps := Parse(`DELETE FROM sessions WHERE expired_at < now()`)
+	ps := pgParse(`DELETE FROM sessions WHERE expired_at < now()`)
 	assert.Equal(t, StmtDelete, ps.StatementType)
 	assert.Equal(t, []string{"sessions"}, ps.TablesTouched)
 	assert.True(t, ps.IsDML)
@@ -138,7 +138,7 @@ func TestParse_Delete(t *testing.T) {
 }
 
 func TestParse_Merge(t *testing.T) {
-	ps := Parse(`MERGE INTO accounts a
+	ps := pgParse(`MERGE INTO accounts a
 	USING ledger l ON a.id = l.account_id
 	WHEN MATCHED THEN UPDATE SET balance = l.balance
 	WHEN NOT MATCHED THEN INSERT (id, balance) VALUES (l.account_id, l.balance)`)
@@ -153,7 +153,7 @@ func TestParse_Merge(t *testing.T) {
 // SELECT; the AST walker MUST surface the UPDATE under the CTE and
 // reclassify as WITH-WRITE.
 func TestParse_CTEWrappedUpdate(t *testing.T) {
-	ps := Parse(`WITH archived AS (
+	ps := pgParse(`WITH archived AS (
 	  UPDATE orders SET archived = true
 	  WHERE created_at < '2024-01-01'
 	  RETURNING id
@@ -167,7 +167,7 @@ func TestParse_CTEWrappedUpdate(t *testing.T) {
 }
 
 func TestParse_CTEWrappedInsert(t *testing.T) {
-	ps := Parse(`WITH new_users AS (
+	ps := pgParse(`WITH new_users AS (
 	  INSERT INTO users (name) VALUES ('alice') RETURNING id
 	)
 	SELECT * FROM new_users`)
@@ -177,7 +177,7 @@ func TestParse_CTEWrappedInsert(t *testing.T) {
 }
 
 func TestParse_CTEWrappedDelete(t *testing.T) {
-	ps := Parse(`WITH gone AS (
+	ps := pgParse(`WITH gone AS (
 	  DELETE FROM sessions WHERE expired_at < now() RETURNING id
 	)
 	SELECT count(*) FROM gone`)
@@ -188,7 +188,7 @@ func TestParse_CTEWrappedDelete(t *testing.T) {
 
 func TestParse_CTEReadOnly(t *testing.T) {
 	// Read-only CTE: should NOT reclassify to WITH-WRITE.
-	ps := Parse(`WITH recent AS (
+	ps := pgParse(`WITH recent AS (
 	  SELECT id FROM users WHERE created_at > now() - interval '1 day'
 	)
 	SELECT count(*) FROM recent`)
@@ -199,39 +199,39 @@ func TestParse_CTEReadOnly(t *testing.T) {
 // DDL coverage.
 
 func TestParse_CreateTable(t *testing.T) {
-	ps := Parse(`CREATE TABLE foo (id INT)`)
+	ps := pgParse(`CREATE TABLE foo (id INT)`)
 	assert.Equal(t, StmtDDL, ps.StatementType)
 	assert.True(t, ps.IsDDL)
 }
 
 func TestParse_CreateRole(t *testing.T) {
-	ps := Parse(`CREATE ROLE service_acct LOGIN`)
+	ps := pgParse(`CREATE ROLE service_acct LOGIN`)
 	assert.Equal(t, StmtDDL, ps.StatementType)
 }
 
 func TestParse_CreateExtension(t *testing.T) {
-	ps := Parse(`CREATE EXTENSION pgcrypto`)
+	ps := pgParse(`CREATE EXTENSION pgcrypto`)
 	assert.Equal(t, StmtDDL, ps.StatementType)
 }
 
 func TestParse_AlterTable(t *testing.T) {
-	ps := Parse(`ALTER TABLE users ADD COLUMN email TEXT`)
+	ps := pgParse(`ALTER TABLE users ADD COLUMN email TEXT`)
 	assert.Equal(t, StmtDDL, ps.StatementType)
 }
 
 func TestParse_DropTable(t *testing.T) {
-	ps := Parse(`DROP TABLE users`)
+	ps := pgParse(`DROP TABLE users`)
 	assert.Equal(t, StmtDDL, ps.StatementType)
 }
 
 func TestParse_RenameTable(t *testing.T) {
-	ps := Parse(`ALTER TABLE users RENAME TO users_archive`)
+	ps := pgParse(`ALTER TABLE users RENAME TO users_archive`)
 	// AlterTableStmt is StmtDDL (RenameStmt is the standalone form).
 	assert.Equal(t, StmtDDL, ps.StatementType)
 }
 
 func TestParse_Truncate(t *testing.T) {
-	ps := Parse(`TRUNCATE TABLE audit_log`)
+	ps := pgParse(`TRUNCATE TABLE audit_log`)
 	assert.Equal(t, StmtTruncate, ps.StatementType)
 	assert.True(t, ps.HasMutatingNode)
 	assert.Equal(t, "TRUNCATE", ps.MutatingNodeType)
@@ -239,12 +239,12 @@ func TestParse_Truncate(t *testing.T) {
 }
 
 func TestParse_CreateIndex(t *testing.T) {
-	ps := Parse(`CREATE INDEX idx_users_email ON users(email)`)
+	ps := pgParse(`CREATE INDEX idx_users_email ON users(email)`)
 	assert.Equal(t, StmtDDL, ps.StatementType)
 }
 
 func TestParse_Comment(t *testing.T) {
-	ps := Parse(`COMMENT ON TABLE users IS 'application users'`)
+	ps := pgParse(`COMMENT ON TABLE users IS 'application users'`)
 	assert.Equal(t, StmtComment, ps.StatementType)
 	assert.True(t, ps.IsDDL)
 }
@@ -253,19 +253,19 @@ func TestParse_Comment(t *testing.T) {
 // them but does NOT recurse into procedure bodies.
 
 func TestParse_Call(t *testing.T) {
-	ps := Parse(`CALL refresh_materialized_views()`)
+	ps := pgParse(`CALL refresh_materialized_views()`)
 	assert.Equal(t, StmtCall, ps.StatementType)
 	assert.Contains(t, ps.FunctionsCalled, "refresh_materialized_views")
 }
 
 func TestParse_CallQualified(t *testing.T) {
-	ps := Parse(`CALL public.do_thing(1, 'hi')`)
+	ps := pgParse(`CALL public.do_thing(1, 'hi')`)
 	assert.Equal(t, StmtCall, ps.StatementType)
 	assert.Contains(t, ps.FunctionsCalled, "public.do_thing")
 }
 
 func TestParse_DoBlock(t *testing.T) {
-	ps := Parse(`DO $$
+	ps := pgParse(`DO $$
 	BEGIN
 	  UPDATE users SET active = false WHERE id = 99;
 	END
@@ -280,14 +280,14 @@ func TestParse_DoBlock(t *testing.T) {
 }
 
 func TestParse_Execute(t *testing.T) {
-	ps := Parse(`EXECUTE my_stmt(1, 2)`)
+	ps := pgParse(`EXECUTE my_stmt(1, 2)`)
 	assert.Equal(t, StmtExecute, ps.StatementType)
 	assert.True(t, ps.HasMutatingNode)
 	assert.Equal(t, "EXECUTE", ps.MutatingNodeType)
 }
 
 func TestParse_Prepare(t *testing.T) {
-	ps := Parse(`PREPARE my_stmt (int) AS SELECT * FROM users WHERE id = $1`)
+	ps := pgParse(`PREPARE my_stmt (int) AS SELECT * FROM users WHERE id = $1`)
 	// PREPARE is classified as StmtExecute (prepared-statement family);
 	// the underlying SELECT is walked so tables are surfaced.
 	assert.Equal(t, StmtExecute, ps.StatementType)
@@ -297,13 +297,13 @@ func TestParse_Prepare(t *testing.T) {
 // SET ROLE impersonation capture.
 
 func TestParse_SetRole(t *testing.T) {
-	ps := Parse(`SET ROLE 'admin'`)
+	ps := pgParse(`SET ROLE 'admin'`)
 	assert.Equal(t, StmtSet, ps.StatementType)
 	assert.Equal(t, "admin", ps.ImpersonatedRole)
 }
 
 func TestParse_SetNonRole(t *testing.T) {
-	ps := Parse(`SET TIME ZONE 'UTC'`)
+	ps := pgParse(`SET TIME ZONE 'UTC'`)
 	assert.Equal(t, StmtSet, ps.StatementType)
 	assert.Empty(t, ps.ImpersonatedRole)
 }
@@ -311,14 +311,14 @@ func TestParse_SetNonRole(t *testing.T) {
 // EXPLAIN vs EXPLAIN ANALYZE.
 
 func TestParse_Explain(t *testing.T) {
-	ps := Parse(`EXPLAIN SELECT * FROM users`)
+	ps := pgParse(`EXPLAIN SELECT * FROM users`)
 	assert.Equal(t, StmtExplain, ps.StatementType)
 	assert.True(t, ps.IsExplain)
 	assert.False(t, ps.IsExplainAnalyze)
 }
 
 func TestParse_ExplainAnalyze(t *testing.T) {
-	ps := Parse(`EXPLAIN ANALYZE UPDATE users SET active = false`)
+	ps := pgParse(`EXPLAIN ANALYZE UPDATE users SET active = false`)
 	assert.Equal(t, StmtExplainAnalyze, ps.StatementType)
 	assert.True(t, ps.IsExplainAnalyze)
 	// The inner UPDATE actually executes under EXPLAIN ANALYZE, so the
@@ -331,22 +331,22 @@ func TestParse_ExplainAnalyze(t *testing.T) {
 // Transactions / COPY / VACUUM.
 
 func TestParse_BeginTransaction(t *testing.T) {
-	ps := Parse(`BEGIN`)
+	ps := pgParse(`BEGIN`)
 	assert.Equal(t, StmtTransaction, ps.StatementType)
 }
 
 func TestParse_Commit(t *testing.T) {
-	ps := Parse(`COMMIT`)
+	ps := pgParse(`COMMIT`)
 	assert.Equal(t, StmtTransaction, ps.StatementType)
 }
 
 func TestParse_Copy(t *testing.T) {
-	ps := Parse(`COPY users (id, name) FROM STDIN`)
+	ps := pgParse(`COPY users (id, name) FROM STDIN`)
 	assert.Equal(t, StmtCopy, ps.StatementType)
 }
 
 func TestParse_Vacuum(t *testing.T) {
-	ps := Parse(`VACUUM users`)
+	ps := pgParse(`VACUUM users`)
 	assert.Equal(t, StmtVacuum, ps.StatementType)
 }
 
@@ -356,7 +356,7 @@ func TestParse_Vacuum(t *testing.T) {
 // surfaces the UPDATE for the audit row.
 
 func TestParse_MultiStatementBatch(t *testing.T) {
-	ps := Parse(`SELECT 1; UPDATE secrets SET val = 'oops'`)
+	ps := pgParse(`SELECT 1; UPDATE secrets SET val = 'oops'`)
 	// First statement is SELECT.
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	// But the walker MUST still have surfaced the UPDATE.
@@ -370,24 +370,24 @@ func TestParse_MultiStatementBatch(t *testing.T) {
 // ParseErrors populated, and we still get an audit row.
 
 func TestParse_Empty(t *testing.T) {
-	ps := Parse("")
+	ps := pgParse("")
 	require.NotNil(t, ps)
 	assert.Equal(t, StmtUnknown, ps.StatementType)
 }
 
 func TestParse_OnlyWhitespace(t *testing.T) {
-	ps := Parse("   \n\t  ")
+	ps := pgParse("   \n\t  ")
 	assert.Equal(t, StmtUnknown, ps.StatementType)
 }
 
 func TestParse_Garbage(t *testing.T) {
-	ps := Parse("zxcvbnm asdfghjkl !@#$%^&*()")
+	ps := pgParse("zxcvbnm asdfghjkl !@#$%^&*()")
 	assert.Equal(t, StmtUnparseable, ps.StatementType)
 	assert.NotEmpty(t, ps.ParseErrors)
 }
 
 func TestParse_PartialStatement(t *testing.T) {
-	ps := Parse("SELECT * FROM")
+	ps := pgParse("SELECT * FROM")
 	assert.Equal(t, StmtUnparseable, ps.StatementType)
 	assert.NotEmpty(t, ps.ParseErrors)
 }
@@ -404,7 +404,7 @@ func TestParse_VeryLongInput(t *testing.T) {
 		sb.WriteString(itoa(i))
 	}
 	sb.WriteString(" FROM big_table")
-	ps := Parse(sb.String())
+	ps := pgParse(sb.String())
 	assert.Equal(t, StmtSelect, ps.StatementType)
 	assert.Equal(t, []string{"big_table"}, ps.TablesTouched)
 }
@@ -413,20 +413,28 @@ func TestParse_RawPreserved(t *testing.T) {
 	// Raw text must round-trip verbatim so the audit log keeps the
 	// operator's exact bytes.
 	in := "  SELECT 1;  \n"
-	ps := Parse(in)
+	ps := pgParse(in)
 	assert.Equal(t, in, ps.Raw)
 }
 
 // Schema names normalized to lowercase. Matchers operate on the
 // lowercase form so case variation in the SQL doesn't bypass denies.
 func TestParse_SchemaNormalization(t *testing.T) {
-	ps := Parse(`SELECT * FROM Public.Users`)
+	ps := pgParse(`SELECT * FROM Public.Users`)
 	assert.Equal(t, []string{"public.users"}, ps.TablesTouched)
 }
 
 func TestParse_FunctionLowercase(t *testing.T) {
-	ps := Parse(`SELECT PG_SLEEP(60)`)
+	ps := pgParse(`SELECT PG_SLEEP(60)`)
 	assert.Contains(t, ps.FunctionsCalled, "pg_sleep")
+}
+
+// pgParse is the postgres-test-only helper. Routes raw SQL through the
+// shared dispatcher with the postgres dialect so the test file
+// exercises the same entry point production code uses + still reads
+// like `ps := pgParse("SELECT ...")`.
+func pgParse(raw string) *ParsedStatement {
+	return Parse(DialectPostgres, raw)
 }
 
 // Helper.

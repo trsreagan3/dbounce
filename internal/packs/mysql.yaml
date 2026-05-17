@@ -1,0 +1,139 @@
+# dbounce — MySQL rule pack (D-Slice 5)
+#
+# This pack is the MySQL counterpart of internal/packs/postgres.yaml
+# (D-Slice 3). It seeds the default rules a fresh `dbounce run
+# --dialect mysql` deployment starts with — narrow allows for the
+# common read shapes + denies for the canonical MySQL exfil + admin
+# verbs.
+#
+# Per [[bounce-default-profile-pattern]]: the pack starts conservative
+# but lean-permissive. Reads pass; common writes pass; the exfil +
+# admin-state-change shapes get hard denies because they're the
+# ones whose blast radius justifies the friction.
+#
+# Per [[scorer-is-ground-truth]]: the calibration corpus driving this
+# pack is smaller than postgres.yaml's — MySQL has less benchmark
+# coverage in the dbounce eval set. Hence the calibration_status =
+# provisional below: review every rule before declaring it production-
+# ready for a given customer.
+#
+# TODO (post-launch, tracked in dbounce-build-plan):
+#   - Prepared statements (COM_STMT_PREPARE / COM_STMT_EXECUTE) are
+#     rejected at the proxy boundary in v1.0; once supported, this
+#     pack needs PREPARE:* / EXECUTE:* shapes.
+#   - MySQL listener-side TLS is NOT in v1.0; the proxy refuses to
+#     accept SSL_REQUEST as a MySQL listener. Once shipped, no rule-
+#     pack changes are needed (TLS is transport, not policy).
+
+metadata:
+  dialect: mysql
+  version: 0.1.0
+  calibration_status: provisional
+  source: dbounce-internal
+  notes: |
+    First-pass MySQL rule pack. Verb coverage matches xwb1989/sqlparser's
+    AST shapes (D-Slice 5 parser substrate). LOAD DATA INFILE is gated
+    via the explicit StmtLoad classification the parser surfaces.
+
+rules:
+  # ---------- READS ----------
+
+  - pattern: "SELECT:*"
+    effect: allow
+    origin: preset
+    note: "Reads are the largest share of traffic; allow by default."
+
+  - pattern: "SHOW:*"
+    effect: allow
+    origin: preset
+    note: "SHOW TABLES / SHOW VARIABLES / SHOW STATUS are informational."
+
+  - pattern: "EXPLAIN:*"
+    effect: allow
+    origin: preset
+    note: "EXPLAIN alone does NOT execute. Allow."
+
+  - pattern: "USE:*"
+    effect: allow
+    origin: preset
+    note: "USE <db> is session-state only."
+
+  # ---------- TRANSACTIONS ----------
+
+  - pattern: "TRANSACTION:*"
+    effect: allow
+    origin: preset
+    note: "BEGIN / COMMIT / ROLLBACK — session-state, no blast radius alone."
+
+  # ---------- WRITES (allowed by default; narrow via task scope) ----------
+
+  - pattern: "INSERT:*"
+    effect: allow
+    origin: preset
+    note: "INSERT is the common write — allow. Per-task scope can narrow."
+
+  - pattern: "UPDATE:*"
+    effect: allow
+    origin: preset
+    note: "UPDATE allowed by default. Per-task scope or schema_scope narrows."
+
+  - pattern: "DELETE:*"
+    effect: allow
+    origin: preset
+    note: "DELETE allowed by default."
+
+  # ---------- HARD DENIES ----------
+
+  # LOAD DATA INFILE — the canonical MySQL exfil primitive. The parser
+  # classifies these as StmtLoad with MutatingNodeType=LOAD-DATA-INFILE.
+  # A DENY here fires regardless of any task-allow, per the composition
+  # order in proxy/proxy.go decide().
+  - pattern: "LOAD:*"
+    effect: deny
+    origin: preset
+    note: |
+      LOAD DATA INFILE / LOAD DATA LOCAL INFILE / LOAD XML is the
+      canonical MySQL exfil primitive (server reads arbitrary local
+      paths into a table; the LOCAL variant reads from the CLIENT
+      filesystem). Block by default; admins who genuinely need it
+      should add an explicit task-scoped allow.
+
+  # MUTATING:* catches CTE-hidden writes + any walker-flagged mutation.
+  # The pack DOES NOT enable this by default — it's commented as a
+  # reference for admins who want maximalist write blocking.
+  #
+  # - pattern: "MUTATING:mysql.*"
+  #   effect: deny
+  #   origin: preset
+  #   note: |
+  #     Block any mutation touching the mysql.* system schema —
+  #     prevents grant changes, user adds, plugin loads. Admins who
+  #     need to administer mysql.* should use a separate connection
+  #     that bypasses dbounce.
+
+  # ---------- DDL ----------
+
+  - pattern: "DDL:*"
+    effect: deny
+    origin: preset
+    note: |
+      CREATE / ALTER / DROP / RENAME / TRUNCATE by default require an
+      explicit task-scoped allow. DDL is rarely run from application
+      paths; when a migration tool needs it, the operator opens a task
+      with INSERT/UPDATE/DDL scoped to the migration's tables.
+
+  # ---------- ADMIN COMMANDS ----------
+
+  # SET GLOBAL changes server-wide state. Walker flags MutatingNodeType=
+  # SET-GLOBAL; pattern matches the StatementType=SET classification.
+  # The deny fires whenever the SET targets server scope regardless of
+  # the variable name; an admin who genuinely needs to change a global
+  # opens a task-scoped allow with a narrow function_scope.
+  - pattern: "SET:*"
+    effect: deny
+    origin: preset
+    note: |
+      SET GLOBAL changes server-wide MySQL state (max_connections,
+      sql_mode, etc.). Session-scoped SET (`SET sql_mode = 'X'`) is
+      ALSO matched by this pattern — refine with FunctionScope or use
+      a task-scoped allow for the common session-state shapes.

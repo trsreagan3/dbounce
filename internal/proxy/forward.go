@@ -326,7 +326,7 @@ func (f *Forwarder) commandLoop() error {
 }
 
 func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload []byte) error {
-	ps := parser.Parse(sql)
+	ps := parser.Parse(string(f.srv.cfg.Dialect), sql)
 	dec := f.srv.decide(ps)
 
 	row := store.DecisionRow{

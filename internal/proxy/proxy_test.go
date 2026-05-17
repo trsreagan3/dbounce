@@ -302,11 +302,18 @@ func TestParseDefaultPolicy(t *testing.T) {
 }
 
 func TestParseDialect_RejectsUnknown(t *testing.T) {
-	// D-Slice 1 supports only postgres.
-	_, err := ParseDialect("mysql")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "postgres")
+	// D-Slice 5: postgres + mysql accepted; snowflake / bigquery / etc.
+	// remain rejected until D-Slice 6.
 	d, err := ParseDialect("postgres")
 	require.NoError(t, err)
 	assert.Equal(t, DialectPostgres, d)
+	d, err = ParseDialect("mysql")
+	require.NoError(t, err)
+	assert.Equal(t, DialectMySQL, d)
+	// Unknown dialects still rejected — the error names both accepted
+	// values so the operator knows the menu.
+	_, err = ParseDialect("snowflake")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "postgres")
+	assert.Contains(t, err.Error(), "mysql")
 }

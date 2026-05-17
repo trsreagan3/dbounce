@@ -67,16 +67,22 @@ func (p DefaultPolicy) IsValid() bool {
 	return p == DefaultPolicyAllow || p == DefaultPolicyDeny
 }
 
-// Dialect names a SQL wire protocol. D-Slice 1 supports only postgres.
+// Dialect names a SQL wire protocol.
+//
+//   - postgres (D-Slice 1) — PG wire-protocol listener + libpg_query parser.
+//   - mysql    (D-Slice 5) — MySQL wire-protocol listener + xwb1989/sqlparser.
+//
+// D-Slice 6 adds snowflake + bigquery.
 type Dialect string
 
 const (
 	DialectPostgres Dialect = "postgres"
+	DialectMySQL    Dialect = "mysql"
 )
 
 // IsValid reports whether d is one of the recognized values.
 func (d Dialect) IsValid() bool {
-	return d == DialectPostgres
+	return d == DialectPostgres || d == DialectMySQL
 }
 
 // Verdict names dbounce's gating outcome on a single statement.
@@ -300,6 +306,17 @@ func (s *Server) serveConn(conn net.Conn) {
 	}()
 	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
 
+	// D-Slice 5: dialect dispatch. MySQL gets its own wire-protocol
+	// handler in mysql.go; the PG path below is unchanged. The dispatch
+	// branches BEFORE the upstream check because the MySQL handler
+	// owns its own observation-only vs forwarding decision (different
+	// auth + COM_QUERY semantics; no benefit in reusing the PG
+	// forwarder for MySQL bytes).
+	if s.cfg.Dialect == DialectMySQL {
+		s.serveMySQLConn(conn)
+		return
+	}
+
 	// D-Slice 2: when an upstream is configured, dispatch to the
 	// forwarding handler. D-Slice 4's listener-side TLS upgrade lives
 	// INSIDE the forwarder's negotiateSSL because it already owns the
@@ -411,7 +428,7 @@ func (s *Server) serveConn(conn net.Conn) {
 // matched_rule_id, task_id + the parser's flag bag so the recommender
 // + the live-action-tail UI can compose against rows already on disk.
 func (s *Server) evaluateAndAudit(sql, source string) {
-	ps := parser.Parse(sql)
+	ps := parser.Parse(string(s.cfg.Dialect), sql)
 	d := s.decide(ps)
 	row := store.DecisionRow{
 		At:               time.Now().UTC(),
@@ -712,7 +729,8 @@ func ParseDialect(s string) (Dialect, error) {
 	if d.IsValid() {
 		return d, nil
 	}
-	return "", fmt.Errorf("dbounce: unknown dialect %q (D-Slice 1 supports: postgres)", s)
+	return "", fmt.Errorf("dbounce: unknown dialect %q (want %q or %q)",
+		s, DialectPostgres, DialectMySQL)
 }
 
 // ---------------------------------------------------------------------------

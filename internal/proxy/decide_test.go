@@ -52,7 +52,7 @@ func newDecideTestServer(t *testing.T, defaultPol DefaultPolicy) (*Server, *stor
 
 func parse(t *testing.T, sql string) *parser.ParsedStatement {
 	t.Helper()
-	ps := parser.Parse(sql)
+	ps := parser.Parse(parser.DialectPostgres, sql)
 	require.NotNil(t, ps)
 	return ps
 }
