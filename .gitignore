@@ -1,0 +1,27 @@
+# Go build artifacts
+# Anchor to the repo root so the pattern matches the built binary at
+# ./dbounce WITHOUT also filtering cmd/dbounce/ (the source-tree dir
+# whose Go files MUST be tracked).
+/dbounce
+*.test
+*.out
+*.exe
+bin/
+dist/
+
+# SQLite state files (runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local environment / scratch
+.env
+.env.local
+scratch/
