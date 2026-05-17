@@ -1,0 +1,43 @@
+# Keep the Docker build context lean — only ship what the builder needs.
+
+# VCS metadata + GitHub config
+.git
+.github
+
+# Pre-built local binaries (the image builds its own)
+/dbounce
+bin/
+dist/
+*.exe
+*.test
+*.out
+
+# Runtime SQLite state — never bake into an image
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Tests + testdata — image only needs production code
+**/*_test.go
+**/testdata/
+
+# Docs / examples / community contributions — not runtime inputs
+docs/
+community-profiles/
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+*.md
+!README.md
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local environment / scratch
+.env
+.env.local
+scratch/

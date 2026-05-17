@@ -148,6 +148,47 @@ can flag degraded persistence without parsing logs.
 
 ---
 
+## Docker
+
+A multi-arch image is published to GitHub Container Registry on every
+push to `main` and on every `v*` tag.
+
+```sh
+# Pull + show help (no audit DB persisted between runs).
+docker run --rm ghcr.io/trsreagan3/dbounce:latest --help
+
+# Run with the audit DB persisted to ~/.dbounce on the host. The
+# distroless :nonroot user (uid 65532) needs to be able to write the
+# mounted directory, so create it first + chown if it doesn't exist
+# already.
+mkdir -p ~/.dbounce
+docker run --rm -it \
+  -v ~/.dbounce:/home/nonroot/.dbounce \
+  -p 127.0.0.1:5433:5433 \
+  -p 127.0.0.1:8768:8768 \
+  ghcr.io/trsreagan3/dbounce:latest \
+  run --upstream postgres://user:pass@host.docker.internal:5432/mydb
+```
+
+The image is a packaging convenience — the binary inside is the same
+one `go install github.com/trsreagan3/dbounce/cmd/dbounce@latest` would
+build, with the same no-telemetry stance. Persisting `~/.dbounce` via
+the bind-mount keeps the SQLite audit log, profiles, and rules across
+container restarts (the runtime image has no writable filesystem of
+its own).
+
+Tags:
+
+| Tag | Source |
+| --- | --- |
+| `:main` | latest push to `main` |
+| `:v1.2.3` / `:1.2.3` | git tag `v1.2.3` |
+| `:latest` | most recent `v*` tag |
+
+Architectures: `linux/amd64`, `linux/arm64`.
+
+---
+
 ## Test
 
 ```sh

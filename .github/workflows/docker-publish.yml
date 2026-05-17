@@ -1,0 +1,120 @@
+name: docker-publish
+
+# Publishes ghcr.io/trsreagan3/dbounce on:
+#   - push to main         → :main
+#   - push of a v* git tag → :vX.Y.Z + :latest
+#
+# Image is a packaging convenience (per [[ibounce-honest-positioning]]) —
+# same binary as `go install`. No telemetry. Multi-arch
+# (linux/amd64 + linux/arm64). Distroless static base.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # Allow manual rebuilds (useful when the base image rolls a CVE fix).
+  workflow_dispatch:
+
+# Least-privilege: only need to read the repo + write to GHCR.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: trsreagan3/dbounce
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Needed so `git describe --tags --always` can stamp the
+          # version into the binary via Docker build-args.
+          fetch-depth: 0
+
+      - name: Compute build metadata
+        id: meta-vars
+        run: |
+          VERSION="$(git describe --tags --always --dirty)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"   >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (for arm64 builds on amd64 runners)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags + OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Branch builds → :main
+            type=ref,event=branch
+            # Tag builds → :v1.2.3 and :1.2.3
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            # Tag builds also get :latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # ---- Smoke test (single-arch) before pushing multi-arch ----
+      # Build linux/amd64 locally and run --version + --help to confirm
+      # the entrypoint works under distroless (no shell). If this fails,
+      # the multi-arch push never happens.
+      - name: Smoke build (amd64, load to local daemon)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: dbounce:smoke
+          build-args: |
+            VERSION=${{ steps.meta-vars.outputs.version }}
+            COMMIT=${{ steps.meta-vars.outputs.commit }}
+            BUILD_TIME=${{ steps.meta-vars.outputs.build_time }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test — --version
+        run: docker run --rm dbounce:smoke --version
+
+      - name: Smoke test — --help
+        run: docker run --rm dbounce:smoke --help
+
+      - name: Smoke test — image size report
+        run: |
+          docker images dbounce:smoke --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+      # ---- Multi-arch build + push ----
+      - name: Build and push (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta-vars.outputs.version }}
+            COMMIT=${{ steps.meta-vars.outputs.commit }}
+            BUILD_TIME=${{ steps.meta-vars.outputs.build_time }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
