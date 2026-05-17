@@ -1,0 +1,49 @@
+# Local integration-test substrate for dbounce.
+#
+# Spins up the database engines dbounce sits in front of, so the build-
+# tagged `go test -tags=integration ./...` suite has real wire-protocol
+# servers to talk to without requiring a real cloud DB.
+#
+# Usage:
+#   docker compose -f compose.test.yaml up -d
+#   make test-integration
+#   docker compose -f compose.test.yaml down
+#
+# The Makefile's `make test-integration` target runs the full sequence
+# (up + test + down). The `pg-up` / `pg-down` / `mysql-up` / `mysql-down`
+# Makefile targets continue to work for single-engine iteration loops.
+#
+# Integration tests SKIP CLEANLY (not fail) when their target engine
+# isn't reachable, so this compose file is the substrate — not a hard
+# dependency for the build-tagged suite.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dbounce-test-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  mysql:
+    image: mysql:8.4
+    container_name: dbounce-test-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: test
+      MYSQL_DATABASE: dbounce_test
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -ptest --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
