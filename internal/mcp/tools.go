@@ -22,9 +22,10 @@ func ToolDescriptors() []map[string]any {
 			"name": "dbounce_active_mode",
 			"description": "Return dbounce's current operating mode " +
 				"(cooperative | transparent) plus the default-policy " +
-				"(allow | deny) and the SQL dialect (postgres | mysql). " +
-				"Read-only: agents introspect; they cannot flip the mode " +
-				"(that requires a proxy restart per [[agent-friendly-not-bypassable]]).",
+				"(allow | deny) and the SQL dialect (postgres | mysql | " +
+				"snowflake | bigquery). Read-only: agents introspect; " +
+				"they cannot flip the mode (that requires a proxy restart " +
+				"per [[agent-friendly-not-bypassable]]).",
 			"inputSchema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -141,7 +142,11 @@ func ToolDescriptors() []map[string]any {
 				"rule engine; return the verdict WITHOUT writing to the " +
 				"audit log or forwarding upstream. Useful for an agent to " +
 				"preview 'would this query be allowed?' before issuing it. " +
-				"Returns {verdict, decision_source, reason, statement_type}.",
+				"D-Slice 6: accepts dialect = postgres | mysql | snowflake | " +
+				"bigquery. snowflake + bigquery are the supported invocation " +
+				"path for those dialects (no wire-protocol proxy in v1.0); " +
+				"see docs/SHIM-INTEGRATION.md. Returns {verdict, " +
+				"decision_source, reason, statement_type}.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -151,8 +156,10 @@ func ToolDescriptors() []map[string]any {
 					},
 					"dialect": map[string]any{
 						"type":        "string",
-						"enum":        []string{"postgres", "mysql"},
-						"description": "Dialect to parse with. Defaults to the proxy's --dialect.",
+						"enum":        []string{"postgres", "mysql", "snowflake", "bigquery"},
+						"description": "Dialect to parse with. Defaults to the proxy's --dialect. " +
+							"snowflake + bigquery use the JDBC-driver-shim parser " +
+							"(experimental calibration per [[scorer-is-ground-truth]]).",
 					},
 				},
 				"required": []string{"statement"},

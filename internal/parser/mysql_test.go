@@ -304,13 +304,14 @@ func TestMySQL_FunctionLowercase(t *testing.T) {
 }
 
 // Dispatcher coverage — unknown dialect surfaces UNPARSEABLE with a
-// helpful error, no panic.
+// helpful error, no panic. Snowflake + BigQuery are recognized as of
+// D-Slice 6; use a clearly-fake dialect here.
 func TestParse_UnknownDialect(t *testing.T) {
-	ps := Parse("snowflake", "SELECT 1")
+	ps := Parse("teradata-fake", "SELECT 1")
 	require.NotNil(t, ps)
 	assert.Equal(t, StmtUnparseable, ps.StatementType)
 	assert.NotEmpty(t, ps.ParseErrors)
-	assert.Contains(t, ps.ParseErrors[0], "snowflake")
+	assert.Contains(t, ps.ParseErrors[0], "teradata-fake")
 }
 
 func TestParse_EmptyDialectDefaultsToPostgres(t *testing.T) {

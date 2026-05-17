@@ -43,6 +43,28 @@ Features explicitly deferred to later D-Slices:
 | D-Slice 7 | Profile YAML, `safe-default` profile, MCP server |
 | D-Slice 8 | Pause, prompts, presets, recommender |
 
+## Supported dialects
+
+| Dialect | Mode | Status |
+| --- | --- | --- |
+| PostgreSQL | Native wire-protocol proxy | Stable; full calibration |
+| MySQL | Native wire-protocol proxy | Provisional calibration |
+| Snowflake | JDBC-driver-shim only | Experimental calibration |
+| BigQuery | JDBC-driver-shim only | Experimental calibration |
+
+`postgres` and `mysql` ship a TCP listener (`dbounce run --dialect
+postgres|mysql`) that speaks the native wire protocol. The client
+points at dbounce; dbounce forwards to the upstream.
+
+`snowflake` and `bigquery` ship via the JDBC-driver-shim — the
+customer wraps their database driver so that every query passes
+through `dbounce decide` (or the `dbounce_decide` MCP tool) before
+hitting the real driver. `dbounce run --dialect snowflake|bigquery`
+fails fast with a clear error pointing at
+[`docs/SHIM-INTEGRATION.md`](docs/SHIM-INTEGRATION.md), which
+covers the integration pattern + honest trade-offs vs the native
+wire-protocol path.
+
 ---
 
 ## Quickstart

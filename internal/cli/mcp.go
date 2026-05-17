@@ -123,7 +123,10 @@ func newMCPCmd() *cobra.Command {
 		cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
 			"Default policy the running proxy is in (allow | deny).")
 		cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
-			"SQL dialect dbounce_decide parses with (postgres | mysql).")
+			"Default SQL dialect dbounce_decide parses with when the caller "+
+				"doesn't pass an explicit dialect arg. Accepts postgres | "+
+				"mysql | snowflake | bigquery. snowflake + bigquery ship via "+
+				"the JDBC-driver-shim (see docs/SHIM-INTEGRATION.md).")
 		cmd.Flags().StringVar(&owner, "owner", "",
 			"Task-owner slot. Empty = default-owner slot (single-laptop).")
 		cmd.Flags().StringVar(&actor, "actor", "",

@@ -1,0 +1,166 @@
+# dbounce — Snowflake rule pack (D-Slice 6)
+#
+# This pack seeds the default rules a dbounce deployment running with
+# the Snowflake JDBC-driver-shim starts with. Snowflake's wire protocol
+# is HTTPS-based + closed-spec, so dbounce does NOT ship a native
+# wire-protocol proxy in v1.0 — the customer wraps their Snowflake
+# driver/connector with a shim that calls `dbounce decide` (or the
+# dbounce_decide MCP tool) before each query. See
+# docs/SHIM-INTEGRATION.md for the integration shape.
+#
+# Per [[scorer-is-ground-truth]]: this pack ships
+# calibration_status: experimental — Snowflake doesn't have the same
+# eval-corpus depth as the PG/MySQL packs and the underlying parser
+# (xwb1989 + Snowflake keyword pre-checks) is best-effort. Operators
+# SHOULD review every rule before relying on this pack in transparent
+# mode. Cooperative-mode (advisory) deployment is the safe starting
+# point.
+#
+# Per [[v1-scope-bar]]: shipping Snowflake support at v1.0 closes the
+# founder-locked "4 dialects in v1.0" scope. The experimental
+# calibration mark is HONEST about where this pack stands relative to
+# postgres.yaml — it is NOT a hedge to defer real work.
+#
+# Per [[bounce-default-profile-pattern]]: the pack starts conservative
+# but lean-permissive on reads. The high-blast-radius shapes (COPY INTO
+# @stage, GET, GRANT, REVOKE, UNDROP, USE SECONDARY ROLES, WAREHOUSE
+# mutations) get hard denies; standard DML passes; admin operations
+# require a task-scoped allow.
+
+metadata:
+  dialect: snowflake
+  version: 0.1.0
+  calibration_status: experimental
+  source: dbounce-internal
+  notes: |
+    First-pass Snowflake rule pack. Verb coverage matches the
+    snowflake.go parser's pre-check labels (D-Slice 6) plus the
+    xwb1989 AST shapes shared with the MySQL parser. The COPY INTO
+    @stage / GET / UNDROP / USE SECONDARY ROLES denies are the
+    load-bearing protections; everything else is a sensible default
+    operators are expected to tune.
+
+rules:
+  # ---------- READS ----------
+
+  - pattern: "SELECT:*"
+    effect: allow
+    origin: preset
+    note: "Reads are the largest share of Snowflake traffic; allow by default."
+
+  - pattern: "SHOW:*"
+    effect: allow
+    origin: preset
+    note: "SHOW WAREHOUSES / SHOW TABLES / SHOW DATABASES are informational."
+
+  - pattern: "EXPLAIN:*"
+    effect: allow
+    origin: preset
+    note: "EXPLAIN alone does NOT execute; allow."
+
+  - pattern: "USE:*"
+    effect: allow
+    origin: preset
+    note: |
+      USE DATABASE / USE SCHEMA / USE WAREHOUSE — session-state only
+      for the standard shapes. USE SECONDARY ROLES is gated SEPARATELY
+      below because it's a privilege-escalation shape.
+
+  # ---------- TRANSACTIONS ----------
+
+  - pattern: "TRANSACTION:*"
+    effect: allow
+    origin: preset
+    note: "BEGIN / COMMIT / ROLLBACK — session-state, no blast radius alone."
+
+  # ---------- WRITES (allowed by default; narrow via task scope) ----------
+
+  - pattern: "INSERT:*"
+    effect: allow
+    origin: preset
+    note: "INSERT is the common write — allow. Per-task scope can narrow."
+
+  - pattern: "UPDATE:*"
+    effect: allow
+    origin: preset
+    note: "UPDATE allowed by default."
+
+  - pattern: "DELETE:*"
+    effect: allow
+    origin: preset
+    note: "DELETE allowed by default."
+
+  - pattern: "MERGE:*"
+    effect: allow
+    origin: preset
+    note: "MERGE allowed by default."
+
+  # ---------- HARD DENIES ----------
+
+  # COPY INTO @stage / PUT / GET — the canonical Snowflake exfil shapes.
+  # The parser surfaces COPY-INTO-STAGE / PUT / GET as MutatingNodeType
+  # values; the StatementType is COPY. We gate the whole COPY:* family
+  # because COPY INTO <table> from @stage is also high-blast-radius
+  # (arbitrary data lands in a table) and should require a task-scoped
+  # allow.
+  - pattern: "COPY:*"
+    effect: deny
+    origin: preset
+    note: |
+      Snowflake COPY INTO / PUT / GET are the canonical bulk-data
+      shapes. COPY INTO @stage is the EXPORT direction (the audit
+      pack's strongest exfil signal); PUT lands local files into a
+      stage; GET pulls stage contents to a local file. Block by
+      default; admins who genuinely need them open a task-scoped allow.
+
+  # UNDROP — time-travel restore. Mutating; the operator should be
+  # explicit about wanting to bring back a previously-dropped object.
+  - pattern: "UNDROP:*"
+    effect: deny
+    origin: preset
+    note: |
+      UNDROP TABLE / UNDROP SCHEMA / UNDROP DATABASE restores a
+      previously-dropped object via Snowflake's time-travel feature.
+      Mutating + can reintroduce sensitive data the team intentionally
+      removed. Require a task-scoped allow.
+
+  # SET TAG / UNSET TAG — Snowflake metadata mutation. Affects
+  # downstream tag-based policies.
+  - pattern: "SET:*"
+    effect: deny
+    origin: preset
+    note: |
+      SET TAG / UNSET TAG / SET SESSION-VARS are gated as a family;
+      session-scoped `SET <var>` (non-TAG) can be allowed via a
+      task-scoped allow. SET TAG specifically affects tag-based access
+      policies and should never be set ad-hoc.
+
+  # ---------- DDL ----------
+
+  - pattern: "DDL:*"
+    effect: deny
+    origin: preset
+    note: |
+      CREATE / ALTER / DROP / RENAME / GRANT / REVOKE require an
+      explicit task-scoped allow. The parser surfaces GRANT/REVOKE
+      under StmtDDL with MutatingNodeType=GRANT/REVOKE so a task can
+      narrow via FunctionScope or a more specific pattern. WAREHOUSE
+      mutations are billing-affecting + included in this deny.
+
+  # ---------- AUDIT-INFRA PROTECTION ----------
+
+  # SELECT FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY — Snowflake's
+  # audit log of every query against every object. Reading + exfiltrating
+  # the access history is an enumeration shape; we deny by default with
+  # a schema/table scope rather than blocking the verb wholesale. The
+  # rule engine evaluates schema_scope before falling through to
+  # SELECT:* above (deny-beats-allow per the composition order).
+  - pattern: "SELECT:*"
+    effect: deny
+    schema_scope: "snowflake"
+    table_scope: "account_usage.access_history"
+    origin: preset
+    note: |
+      Reading Snowflake's audit history (ACCESS_HISTORY) is an
+      enumeration shape adversaries use to map who-accessed-what.
+      Require a task-scoped allow with a narrow time-window predicate.
