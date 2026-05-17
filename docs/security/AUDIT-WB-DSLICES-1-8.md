@@ -856,3 +856,42 @@ Per [[audit-cadence-discipline]]: this audit found 2 CRITs + 3 HIGHs +
 none of these were caught by the 454-test unit + integration suite,
 which is itself the signal that focused-audit-after-multi-agent-
 landing is the right discipline.
+
+---
+
+## 6. Closures
+
+Mapping each finding to the commit that fixed it (per
+[[deliberate-feature-completion]]: a finding is "closed" only when
+code + regression tests + this entry all land). Pre-launch scope:
+all CRITs + all HIGHs + every MED that fit a small surgical fix.
+Larger MEDs deferred to v1.1 with rationale.
+
+| ID         | Status   | Commit  | Notes                                                                                         |
+| ---------- | -------- | ------- | --------------------------------------------------------------------------------------------- |
+| CRIT-D8-01 | CLOSED   | 77fd0ae | Shared `stripSQLComments` helper; comment-strip before keyword-prefix check in mysql.go.       |
+| CRIT-D8-02 | CLOSED   | 77fd0ae | Same helper + integration in snowflake.go + bigquery.go (same root cause).                    |
+| HIGH-D8-03 | CLOSED   | 6d58a93 | Path B: fail-fast on scoped allow rules at `CreateProfile` boundary. Path A (schema) → v1.1.   |
+| HIGH-D8-04 | CLOSED   | 4c63957 | `--mgmt-host` external-bind guard mirrors `--host` guard + parallel ack flag.                  |
+| HIGH-D8-05 | CLOSED   | 0abbcdb | `io.LimitReader` + size cap (1 MiB) on profile-install response body.                         |
+| MED-D8-06  | DEFERRED | —       | Upstream URL internal-IP allowlist. Needs `net.LookupHost` + per-range checks + opt-in flag + IPv4/IPv6 table-driven tests. Multi-file change; not a 5-10 line fix. v1.1 hardening slice. |
+| MED-D8-07  | CLOSED   | a6ba5b8 | `decisions` append-only via BEFORE UPDATE / BEFORE DELETE triggers.                           |
+| MED-D8-08  | CLOSED   | fcb737c | `pending_prompts.decision_id REFERENCES decisions(id)` + `_pragma=foreign_keys(1)`.            |
+| MED-D8-09  | DEFERRED | —       | Statement-body literal redaction (`--redact-literals`). Needs new flag, parser integration to swap literals for `?`, secret-pattern detection in audit-tail output. Large surface — v1.1 hardening slice. |
+| MED-D8-10  | DEFERRED | —       | `TaskReviewSummary` pause-demoted counter. `TaskReviewSummary` isn't yet wired into any CLI surface, so the misclassification doesn't reach operators today. Defer until the CLI consumer lands (then add the counter + display together). v1.1. |
+| MED-D8-11  | CLOSED   | a6ba5b8 | 16 KiB cap on `tools/call` params at MCP dispatch (applies uniformly to all 9 tools).         |
+| LOW-D8-12  | DEFERRED | —       | `tmp.Sync()` + parent-dir sync. Not exercised by current test surface; track with v1.1 hardening. |
+| LOW-D8-13  | DEFERRED | —       | MySQL observation-mode banner fingerprint. Cosmetic; v1.1.                                   |
+| INFO-D8-14 | DEFERRED | —       | Stub ProfileWriter error message. Maintainability note; v1.1.                                |
+
+Test-count delta: 454 (audit baseline) → 500 (post-closure) — 46 new
+regression tests added across stripcomments, mysql, snowflake, bigquery,
+cli, profile, store, mcp packages.
+
+Audit cadence note: each closure was paired with at least one regression
+test that fails BEFORE the fix lands + passes after. The literal-
+preservation case for the comment stripper (the most likely-to-be-buggy
+edge) is covered by TestStripSQLComments_StringLiteralPreserved +
+TestStripSQLComments_StringLiteralWithEscapedQuote +
+TestStripSQLComments_DoubleQuotedIdentifierPreserved + the per-dialect
+LiteralLooksLikeCommentNotStripped tests.
