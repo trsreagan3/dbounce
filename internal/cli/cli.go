@@ -29,6 +29,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	"github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/upstream"
@@ -47,6 +48,13 @@ var loopbackHosts = map[string]struct{}{
 	"ip6-localhost": {},
 	"ip6-loopback":  {},
 }
+
+// envProfileVar is the env-var name used to select the active profile
+// when --profile is not passed. The DBOUNCE_ prefix is preserved
+// (rather than DB_) so the three-product `*BOUNCE_PROFILE` env-var
+// pattern stays consistent across iam-jit-bouncer / kbouncer /
+// dbounce.
+const envProfileVar = "DBOUNCE_PROFILE"
 
 // version is overridden at build time via -ldflags
 // "-X github.com/trsreagan3/dbounce/internal/cli.version=...". Unstamped
@@ -94,6 +102,12 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newAuditCmd())
 	root.AddCommand(newInitTLSCmd())
+	// D-Slice 7: environment profile + MCP server subcommand trees.
+	// Both ONLY add to the command tree; they don't modify existing
+	// entries so the parallel D-Slice 8 work (pause / prompts /
+	// presets / recommend) merges without conflict.
+	root.AddCommand(newProfileCmd())
+	root.AddCommand(newMCPCmd())
 	return root
 }
 
@@ -144,6 +158,9 @@ func newRunCmd() *cobra.Command {
 		requireClientCert   bool
 		mgmtTLSCert         string
 		mgmtTLSKey          string
+		// D-Slice 7: environment profile + profiles.yaml path.
+		profileName  string
+		profilesPath string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -251,20 +268,56 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 						"must both be set or both empty")
 			}
 
+			// D-Slice 7: profile resolution. Precedence: --profile flag >
+			// DBOUNCE_PROFILE env var. Env-var fallback intentionally
+			// only fires when the flag is unset so a shell-wide default
+			// can be overridden per-invocation without unsetting the env
+			// var. profiles.yaml is auto-created from embedded defaults
+			// on first run; existing files are NEVER overwritten.
+			profileFromFlag := profileName != ""
+			if profileName == "" {
+				profileName = os.Getenv(envProfileVar)
+			}
+			resolvedProfilesPath := profilesPath
+			if resolvedProfilesPath == "" {
+				resolvedProfilesPath, err = profile.DefaultProfilesPath()
+				if err != nil {
+					return fmt.Errorf("resolve profiles path: %w", err)
+				}
+			}
+			if written, ferr := profile.EnsureDefaultProfilesFile(resolvedProfilesPath); ferr != nil {
+				log.Warn().Err(ferr).Str("path", resolvedProfilesPath).
+					Msg("dbounce: could not write default profiles.yaml; using embedded defaults")
+			} else if written {
+				fmt.Fprintf(os.Stderr,
+					"dbounce: wrote default profiles to %s\n", resolvedProfilesPath)
+			}
+			profiles, err := profile.LoadProfiles(resolvedProfilesPath)
+			if err != nil {
+				return fmt.Errorf("load profiles: %w", err)
+			}
+			activeProfile, err := profiles.Active(profileName)
+			if err != nil {
+				return fmt.Errorf("select profile: %w", err)
+			}
+
 			cfg := proxy.Config{
-				Host:            host,
-				Port:            port,
-				MgmtHost:        mgmtHost,
-				MgmtPort:        mgmtPort,
-				Mode:            mode,
-				DefaultPolicy:   defaultPol,
-				Dialect:         dialect,
-				UpstreamURL:     upstreamURL,
-				Upstream:        resolvedUpstream,
-				ListenerTLS:     listenerTLSCfg,
-				MgmtTLSCertFile: mgmtTLSCert,
-				MgmtTLSKeyFile:  mgmtTLSKey,
+				Host:              host,
+				Port:              port,
+				MgmtHost:          mgmtHost,
+				MgmtPort:          mgmtPort,
+				Mode:              mode,
+				DefaultPolicy:     defaultPol,
+				Dialect:           dialect,
+				UpstreamURL:       upstreamURL,
+				Upstream:          resolvedUpstream,
+				ListenerTLS:       listenerTLSCfg,
+				MgmtTLSCertFile:   mgmtTLSCert,
+				MgmtTLSKeyFile:    mgmtTLSKey,
+				ActiveProfile:     activeProfile,
+				ActiveProfileName: activeProfile.Name,
 			}.Normalize()
+			_ = profileFromFlag // reserved for the not-selected banner in newer slices
 
 			s := proxy.NewServer(cfg, st)
 
@@ -301,8 +354,15 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				fmt.Fprintln(os.Stderr,
 					"upstream              : <none> — observation-only mode (no forwarding)")
 			}
-			fmt.Fprintln(os.Stderr,
-				"profile               : no profile selected (safe-default profile ships in D-Slice 7).")
+			fmt.Fprintf(os.Stderr,
+				"profile               : %s (loaded from %s)\n",
+				activeProfile.Name, resolvedProfilesPath)
+			if !profileFromFlag && os.Getenv(envProfileVar) == "" {
+				fmt.Fprintln(os.Stderr,
+					"                        no --profile / "+envProfileVar+" set — running as 'full-user' "+
+						"(passthrough). To block writes by default, pass --profile safe-default OR "+
+						"export "+envProfileVar+"=safe-default.")
+			}
 			fmt.Fprintln(os.Stderr,
 				"mode                  : cooperative — every statement is parsed + audit-logged.")
 			fmt.Fprintln(os.Stderr,
@@ -418,6 +478,21 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"Generate via `dbounce init-tls`.")
 	cmd.Flags().StringVar(&mgmtTLSKey, "management-tls-key", "",
 		"PEM private key for the management HTTP listener (matches --management-tls-cert).")
+
+	// D-Slice 7: environment profile flags.
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"Active environment profile. Built-in: 'full-user' (passthrough, "+
+			"default) and 'safe-default' (sql_read_only baseline + "+
+			"AST-walk Layer 2 backstop for mutations). Community "+
+			"profiles install via `dbounce profile install --from URL`. "+
+			"Falls back to "+envProfileVar+" env var; defaults to "+
+			"'full-user' if neither is set. Profile denies are a HARD "+
+			"FLOOR — a permissive task scope CANNOT override them. "+
+			"Legacy aliases ('readonly', 'prod-readonly', 'none') "+
+			"resolve in v1.0 and are removed in v1.1.")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.dbounce/profiles.yaml). "+
+			"Honors DBOUNCE_PROFILES_PATH env var if --profiles-path unset.")
 	return cmd
 }
 

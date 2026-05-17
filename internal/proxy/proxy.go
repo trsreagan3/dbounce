@@ -32,6 +32,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/trsreagan3/dbounce/internal/parser"
+	"github.com/trsreagan3/dbounce/internal/profile"
 	dbrules "github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/tasks"
@@ -98,10 +99,17 @@ const (
 // SourceProfile / SourceTask / SourceGlobal / SourceDefault enum so
 // cross-product audit-log scrapers can JOIN on a consistent label set.
 const (
-	// SourceProfile is reserved for the D-Slice 7 environment-profile
-	// hard floor (keyword-deny / verb-deny / account-deny). D-Slice 3
-	// leaves the placeholder; D-Slice 7 wires it.
+	// SourceProfile tags verdicts fired by the D-Slice 7 environment
+	// profile's deny layer (deny_keywords / deny_actions / AST-walk
+	// Layer 2 backstop). Always the source label for profile-level
+	// denies regardless of which sub-rule fired.
 	SourceProfile = "profile"
+	// SourceProfileAllow tags verdicts fired by the profile's allow
+	// layer (allow_baseline classifier or allow_rules pattern match).
+	// Distinct from SourceGlobalAllow so reviewers can answer
+	// "what did safe-default's sql_read_only baseline pass?" without
+	// joining on the rule id.
+	SourceProfileAllow = "profile.allow"
 	// SourceTaskAllow / SourceTaskDeny tag verdicts fired by the active
 	// per-task scope. Distinct labels (allow vs deny) so reviewers can
 	// filter "what did this task explicitly block?" without joining on
@@ -150,8 +158,21 @@ type Config struct {
 	ReadTimeout   time.Duration
 	WriteTimeout  time.Duration
 	IdleTimeout   time.Duration
-	// ActiveProfileName is filled by D-Slice 7. Stays empty through D-Slice 6.
+	// ActiveProfileName is the name of the active profile (e.g.
+	// "safe-default"). Stamped onto every audit row. Populated by the
+	// CLI from the resolved *profile.Profile so the audit row + the
+	// MCP server's introspection tools see the same string.
 	ActiveProfileName string
+
+	// ActiveProfile is the D-Slice 7 environment profile wired into
+	// decide(). Nil = no profile (full-user equivalent). When non-nil
+	// + not the full-user sentinel, the profile's deny_keywords /
+	// deny_actions / allow_baseline + AST-walk backstop / allow_rules
+	// fire BEFORE task / global rules per the composition order on
+	// decide() below. Per [[bounce-default-profile-pattern]]: the
+	// proxy synthesizes full-user when none is selected so this field
+	// is always safe to dereference for name lookup.
+	ActiveProfile *profile.Profile
 
 	// ListenerTLS is D-Slice 4's listener-side TLS state. Nil = plaintext
 	// listener (the D-Slice 1 + 2 default). Non-nil = SSLRequest gets
@@ -533,10 +554,41 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 // update this comment + add a regression test that proves the new
 // order against the BB+WB scenarios in proxy_test.go.
 func (s *Server) decide(ps *parser.ParsedStatement) Decision {
-	// Step 1+2: profile gates. D-Slice 7 placeholder. When wired,
-	// profile-deny short-circuits with Source=SourceProfile (verdict
-	// DENY); profile-allow falls through. The placeholder is documented
-	// rather than wired so D-Slice 7's diff is purely additive.
+	// Step 1+2: profile gates. D-Slice 7 wires the safe-default
+	// environment profile + its AST-walk Layer 2 backstop. The profile
+	// evaluator runs deny_keywords → deny_actions → allow_baseline +
+	// deny_ast_mutating_nodes → allow_rules in that order. A profile
+	// deny short-circuits the whole composition order (HARD FLOOR);
+	// a profile allow short-circuits with Source=profile.allow so a
+	// permissive task scope can't lower the bar further. Abstain →
+	// fall through to the task / global rules below.
+	if s.cfg.ActiveProfile != nil && s.cfg.ActiveProfile.Name != profile.FullUserProfileName {
+		profileView := &profile.ParsedStatement{
+			StatementType:    ps.StatementType,
+			TablesTouched:    ps.TablesTouched,
+			FunctionsCalled:  ps.FunctionsCalled,
+			IsDML:            ps.IsDML,
+			IsDDL:            ps.IsDDL,
+			HasMutatingNode:  ps.HasMutatingNode,
+			IsExplain:        ps.IsExplain,
+			IsExplainAnalyze: ps.IsExplainAnalyze,
+		}
+		pv := s.cfg.ActiveProfile.Evaluate(profileView)
+		if pv.Denied {
+			return Decision{
+				Verdict: VerdictDeny,
+				Reason:  pv.Reason,
+				Source:  SourceProfile,
+			}
+		}
+		if pv.Allowed {
+			return Decision{
+				Verdict: VerdictAllow,
+				Reason:  pv.Reason,
+				Source:  pv.Source, // "profile.allow"
+			}
+		}
+	}
 
 	// Build the rules-package view of the statement. Symmetric to
 	// kbounce's ruleReq construction (kept distinct from

@@ -1,0 +1,71 @@
+# dbounce default profiles.
+#
+# Profiles are environment-aware deny+allow layers that fire BEFORE
+# per-task scopes and global rules. A profile deny is a hard floor —
+# a permissive task scope cannot override it. Pick the profile that
+# matches what you're doing with `--profile NAME` or
+# `DBOUNCE_PROFILE=NAME`.
+#
+# Edit freely: dbounce NEVER overwrites this file once it exists. To
+# regenerate from defaults, delete the file and rerun `dbounce run`.
+#
+# Only TWO profiles ship as built-in defaults:
+#
+#   full-user     passthrough (no rules); statements parsed + audit-
+#                 logged + advisory. The default when no --profile /
+#                 DBOUNCE_PROFILE is set. Opt out into `safe-default`
+#                 for write protection.
+#   safe-default  Cross-product safe-by-default — pure SELECT
+#                 statements pass via the sql_read_only baseline; any
+#                 mutating statement (INSERT/UPDATE/DELETE/DDL/CALL/
+#                 CTE-wrapped writes) denies via the AST-walk Layer 2
+#                 backstop. NOT a confidentiality boundary — reads of
+#                 sensitive tables still pass; pair with deny_keywords
+#                 to block known-sensitive table names.
+#
+# Community profiles (dev-only / staging-work / incident-response /
+# sandbox / etc.) ship separately under `community-profiles/` in the
+# dbounce repo. Install with:
+#
+#   dbounce profile install --from https://example.com/profile.yaml
+#
+# See `dbounce profile list` for the active profile + what each
+# profile covers.
+profiles:
+
+  full-user:
+    description: "No profile active; statements parsed + audit-logged + advisory. Default."
+    # full-user is a sentinel — zero deny / zero allow rules. Use this
+    # when you want only per-task scopes + global rules to drive
+    # verdicts. The proxy synthesizes this profile automatically even
+    # if you delete it from this file, so name lookup for "full-user"
+    # always succeeds.
+
+  safe-default:
+    description: "Cross-product safe-by-default — pure SELECT statements pass via the sql_read_only baseline; mutations (INSERT/UPDATE/DELETE/DDL/CALL/CTE-wrapped writes) deny via the AST-walk Layer 2 backstop. NOT a confidentiality boundary — reads of sensitive tables still pass; pair with deny_keywords to block known-sensitive table names."
+    # Pure SELECT classifier: SELECT / EXPLAIN (without ANALYZE) /
+    # SHOW pass the baseline; everything else falls to the AST-walk
+    # backstop below.
+    allow_baseline: sql_read_only
+    # AST-walk Layer 2 backstop. When the baseline doesn't accept the
+    # statement, this fires a DENY iff the parser flagged any mutating
+    # signal (IsDML / IsDDL / HasMutatingNode, or the statement type
+    # is one of the implicit-mutation shapes like CALL / DO / EXECUTE
+    # / WITH-WRITE / TRUNCATE / MERGE / COMMENT / COPY / LOAD /
+    # VACUUM). LOAD-BEARING: catches CTE-wrapped UPDATEs whose
+    # top-level keyword is WITH/SELECT.
+    deny_ast_mutating_nodes: true
+    # No deny_actions list here — the AST-walk backstop above is
+    # the comprehensive net. deny_actions is reserved for community
+    # profiles that want finer carve-outs (e.g. allow INSERT but deny
+    # DELETE/UPDATE/DDL).
+    # No exempt_resources / exempt_actions in the default. Operators
+    # who need a write-allowed audit table add it here:
+    #
+    #   exempt_resources:
+    #     - public.audit_log
+    #
+    # or carve out a single statement type:
+    #
+    #   exempt_actions:
+    #     - INSERT_INTO_audit_log

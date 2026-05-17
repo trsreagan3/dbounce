@@ -1,0 +1,684 @@
+// Package mcp implements dbounce's MCP (Model Context Protocol) server.
+//
+// D-Slice 7 — the MCP-over-stdio shape that Claude Code, Cursor,
+// Codex, and Devin all consume. An agent client connects to `dbounce
+// mcp`, discovers the tools via JSON-RPC 2.0 `tools/list`, and
+// invokes them with `tools/call`. Mirrors the Python iam-jit-bouncer
+// MCP tool family (`bouncer_*`) and kbouncer's MCP tool family
+// (`kbounce_*`) so an operator who already learned one tool surface
+// understands the other.
+//
+// Implementation notes:
+//
+//   - Hand-rolled JSON-RPC 2.0 loop over stdin/stdout. No external
+//     MCP library dependency.
+//   - Tools are dispatched via a string → handler map.
+//   - Tools that READ state read it FRESH on every call (no caching).
+//
+// Audit-cadence notes (per [[audit-cadence-discipline]]):
+//
+//   - MCP tools that MUTATE (dbounce_add_rule, dbounce_remove_rule)
+//     flow through the SAME store API + same input validation as the
+//     CLI. There is no MCP-specific bypass surface.
+//   - dbounce_recommend_mode_for_task is DETERMINISTIC, per
+//     [[bouncer-mode-selection-for-agents]]. No LLM call.
+//   - Agent-impersonation surface: the MCP server runs as the
+//     operator who started `dbounce mcp`. The agent that connects can
+//     do EXACTLY what dbounce-the-process can do — no more.
+package mcp
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+
+	"github.com/trsreagan3/dbounce/internal/parser"
+	"github.com/trsreagan3/dbounce/internal/profile"
+	"github.com/trsreagan3/dbounce/internal/proxy"
+	"github.com/trsreagan3/dbounce/internal/rules"
+	"github.com/trsreagan3/dbounce/internal/store"
+)
+
+// ProtocolVersion is the MCP protocol version we advertise. Tracks
+// the 2024-11-05 spec; Python + kbouncer advertise the same.
+const ProtocolVersion = "2024-11-05"
+
+// ServerName / ServerVersion identify the server to MCP clients.
+const (
+	ServerName    = "dbounce"
+	ServerVersion = "1.0.0"
+)
+
+// Config wires the MCP server to the live dbounce state on disk.
+// All fields are optional — a tool that needs something it doesn't
+// have surfaces a clear error to the caller.
+type Config struct {
+	// Store is the SQLite handle the rules / tasks / audit tools
+	// consult. Nil disables those tools.
+	Store *store.Store
+
+	// ActiveProfile names the profile currently bound to the running
+	// proxy. May be nil (full-user equivalent).
+	ActiveProfile *profile.Profile
+
+	// ProfilesPath is the path to the profiles.yaml currently in use.
+	ProfilesPath string
+
+	// Mode is the cooperative/transparent mode the running proxy was
+	// started with. Surfaced by dbounce_active_mode.
+	Mode proxy.Mode
+
+	// DefaultPolicy mirrors the proxy's default-policy flag.
+	DefaultPolicy proxy.DefaultPolicy
+
+	// Dialect mirrors the proxy's dialect flag.
+	Dialect proxy.Dialect
+
+	// TaskOwner is the owner slot the running proxy is bound to.
+	TaskOwner string
+
+	// Actor is the string recorded in audit rows when MCP-initiated
+	// mutations land. Defaults to "dbounce-mcp" when empty.
+	Actor string
+}
+
+// Server is the MCP-over-stdio server.
+type Server struct {
+	cfg Config
+	mu  sync.Mutex
+}
+
+// NewServer constructs an MCP server from the given config.
+func NewServer(cfg Config) *Server {
+	if cfg.Actor == "" {
+		cfg.Actor = "dbounce-mcp"
+	}
+	return &Server{cfg: cfg}
+}
+
+// Serve runs the JSON-RPC loop. One request per line on `in`; one
+// response per line on `out`. Blocks until `in` returns io.EOF.
+func (s *Server) Serve(in io.Reader, out io.Writer) error {
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	enc := json.NewEncoder(out)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var req rawRequest
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			_ = enc.Encode(errResponse(nil, -32700, fmt.Sprintf("parse error: %v", err)))
+			continue
+		}
+		resp := s.dispatch(req)
+		if resp == nil {
+			continue
+		}
+		if err := enc.Encode(resp); err != nil {
+			return fmt.Errorf("mcp: encode response: %w", err)
+		}
+	}
+	return scanner.Err()
+}
+
+type rawRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+func (s *Server) dispatch(req rawRequest) any {
+	switch req.Method {
+	case "initialize":
+		return okResponse(req.ID, map[string]any{
+			"protocolVersion": ProtocolVersion,
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo": map[string]any{
+				"name":    ServerName,
+				"version": ServerVersion,
+			},
+		})
+	case "tools/list":
+		return okResponse(req.ID, map[string]any{"tools": ToolDescriptors()})
+	case "tools/call":
+		var p struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return errResponse(req.ID, -32602, fmt.Sprintf("invalid params: %v", err))
+		}
+		result, err := s.callTool(p.Name, p.Arguments)
+		if err != nil {
+			result = map[string]any{
+				"error": err.Error(),
+			}
+		}
+		text, _ := json.MarshalIndent(result, "", "  ")
+		return okResponse(req.ID, map[string]any{
+			"content":           []map[string]any{{"type": "text", "text": string(text)}},
+			"structuredContent": result,
+		})
+	case "notifications/initialized", "notifications/cancelled":
+		return nil
+	}
+	return errResponse(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
+}
+
+func (s *Server) callTool(name string, args map[string]any) (map[string]any, error) {
+	switch name {
+	case "dbounce_active_mode":
+		return s.toolActiveMode(args)
+	case "dbounce_active_profile":
+		return s.toolActiveProfile(args)
+	case "dbounce_active_task":
+		return s.toolActiveTask(args)
+	case "dbounce_recommend_mode_for_task":
+		return toolRecommendModeForTask(args)
+	case "dbounce_list_rules":
+		return s.toolListRules(args)
+	case "dbounce_add_rule":
+		return s.toolAddRule(args)
+	case "dbounce_remove_rule":
+		return s.toolRemoveRule(args)
+	case "dbounce_decide":
+		return s.toolDecide(args)
+	case "dbounce_tail_decisions":
+		return s.toolTailDecisions(args)
+	}
+	return nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+func (s *Server) requireStore() error {
+	if s.cfg.Store == nil {
+		return errors.New("dbounce mcp: store not configured; pass --db to `dbounce mcp`")
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// Tools that READ live config
+// ---------------------------------------------------------------------
+
+func (s *Server) toolActiveMode(_ map[string]any) (map[string]any, error) {
+	return map[string]any{
+		"mode":           string(s.cfg.Mode),
+		"default_policy": string(s.cfg.DefaultPolicy),
+		"dialect":        string(s.cfg.Dialect),
+	}, nil
+}
+
+func (s *Server) toolActiveProfile(_ map[string]any) (map[string]any, error) {
+	if s.cfg.ActiveProfile == nil || s.cfg.ActiveProfile.Name == "" ||
+		s.cfg.ActiveProfile.Name == profile.FullUserProfileName {
+		return map[string]any{
+			"name":              profile.FullUserProfileName,
+			"description":       "No profile active; statements parsed + audit-logged + advisory. Default.",
+			"allow_baseline":    "",
+			"deny_keyword_n":    0,
+			"deny_action_n":     0,
+			"allow_rule_n":      0,
+			"deny_ast_mutating": false,
+			"source":            "local",
+			"profiles_path":     s.cfg.ProfilesPath,
+		}, nil
+	}
+	p := s.cfg.ActiveProfile
+	source := p.Source
+	if source == "" {
+		source = "local"
+	}
+	return map[string]any{
+		"name":              p.Name,
+		"description":       p.Description,
+		"allow_baseline":    string(p.AllowBaseline),
+		"deny_keyword_n":    len(p.DenyKeywords),
+		"deny_action_n":     len(p.DenyActions),
+		"allow_rule_n":      len(p.AllowRules),
+		"deny_ast_mutating": p.DenyASTMutatingNodes,
+		"exempt_resources":  append([]string{}, p.ExemptResources...),
+		"exempt_actions":    append([]string{}, p.ExemptActions...),
+		"source":            source,
+		"profiles_path":     s.cfg.ProfilesPath,
+	}, nil
+}
+
+func (s *Server) toolActiveTask(_ map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	t, err := s.cfg.Store.GetActiveTask(s.cfg.TaskOwner)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return map[string]any{"active": false}, nil
+	}
+	return map[string]any{
+		"active":       true,
+		"task_id":      t.TaskID,
+		"description":  t.Description,
+		"started_at":   t.StartedAt,
+		"expires_at":   t.ExpiresAt,
+		"allow_rule_n": len(t.AllowRules),
+		"deny_rule_n":  len(t.DenyRules),
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_recommend_mode_for_task — DETERMINISTIC decision matrix.
+// Per [[bouncer-mode-selection-for-agents]] + [[safety-mode-lean-permissive]]:
+// NOT an LLM call.
+// ---------------------------------------------------------------------
+
+// writeVerbs is the SQL-shaped equivalent of kbouncer's
+// containsWriteVerb K8s verb list. Case-insensitive at match time.
+var writeVerbs = map[string]bool{
+	"insert":   true,
+	"update":   true,
+	"delete":   true,
+	"merge":    true,
+	"truncate": true,
+	"drop":     true,
+	"create":   true,
+	"alter":    true,
+	"call":     true,
+	"do":       true,
+	"execute":  true,
+	"grant":    true,
+	"revoke":   true,
+	"rename":   true,
+	"comment":  true,
+	"copy":     true,
+	"load":     true,
+	"vacuum":   true,
+}
+
+// readOnlyVerbs lists keywords that confidently signal a read-only
+// task.
+var readOnlyVerbs = map[string]bool{
+	"select":  true,
+	"show":    true,
+	"explain": true,
+	"read":    true,
+	"query":   true,
+	"audit":   true,
+}
+
+func toolRecommendModeForTask(args map[string]any) (map[string]any, error) {
+	description := strings.ToLower(stringArg(args, "description", ""))
+	verbs := stringSliceArg(args, "verbs")
+	hasWrites := containsAnyVerb(verbs, writeVerbs) ||
+		descriptionMentionsAny(description, writeVerbs)
+	hasReads := containsAnyVerb(verbs, readOnlyVerbs) ||
+		descriptionMentionsAny(description, readOnlyVerbs)
+	prodNS := boolArg(args, "targets_prod")
+	wantsAudit := boolArg(args, "wants_audit_only", false)
+
+	// Decision matrix (mirrors kbouncer's K8s-shaped matrix, adapted
+	// to SQL-shaped verbs; cooperative is the lean-permissive default
+	// per [[safety-mode-lean-permissive]]):
+	//
+	//   wants_audit_only=true                      -> cooperative
+	//   targets_prod=true AND has writes           -> transparent
+	//   has writes only                            -> cooperative
+	//   reads-only / SELECT-only                   -> cooperative
+	//   ambiguous (no verbs, no description hints) -> cooperative
+	mode := proxy.ModeCooperative
+	reason := "cooperative mode: lean-permissive default per safety-mode-lean-permissive"
+	switch {
+	case wantsAudit:
+		mode = proxy.ModeCooperative
+		reason = "cooperative mode: audit-only declared (wants_audit_only=true)"
+	case prodNS && hasWrites:
+		mode = proxy.ModeTransparent
+		reason = "transparent mode: prod-targeting write task (targets_prod=true AND writes detected: DELETE/UPDATE/DROP/CALL/etc.)"
+	case hasWrites:
+		reason = "cooperative mode: non-prod writes; lean-permissive with audit + admin pause available"
+	case hasReads:
+		reason = "cooperative mode: reads-only (SELECT/EXPLAIN); no enforcement needed"
+	default:
+		reason = "cooperative mode: ambiguous task shape (no write/read hints); lean-permissive default"
+	}
+	return map[string]any{
+		"mode":          string(mode),
+		"reason":        reason,
+		"deterministic": true,
+	}, nil
+}
+
+func containsAnyVerb(verbs []string, vocab map[string]bool) bool {
+	for _, v := range verbs {
+		if vocab[strings.ToLower(strings.TrimSpace(v))] {
+			return true
+		}
+	}
+	return false
+}
+
+// descriptionMentionsAny returns true when the lower-cased
+// description contains any vocab token bounded by non-alphanumeric
+// on both sides (same word-boundary semantics as the profile
+// keyword-match path per [[cross-product-word-boundary]]).
+func descriptionMentionsAny(description string, vocab map[string]bool) bool {
+	if description == "" {
+		return false
+	}
+	for token := range vocab {
+		if wordBoundaryMatch(description, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func wordBoundaryMatch(s, token string) bool {
+	if token == "" || len(s) < len(token) {
+		return false
+	}
+	start := 0
+	for {
+		i := strings.Index(s[start:], token)
+		if i < 0 {
+			return false
+		}
+		i += start
+		leftOK := i == 0 || !isAlnum(s[i-1])
+		end := i + len(token)
+		rightOK := end == len(s) || !isAlnum(s[end])
+		if leftOK && rightOK {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+func isAlnum(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// ---------------------------------------------------------------------
+// dbounce_list_rules / add_rule / remove_rule — rule CRUD
+// ---------------------------------------------------------------------
+
+func (s *Server) toolListRules(_ map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	stored, err := s.cfg.Store.ListRules()
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]map[string]any, 0, len(stored))
+	for _, sr := range stored {
+		m := sr.Rule.ToMap()
+		m["id"] = int64(sr.ID)
+		rows = append(rows, m)
+	}
+	return map[string]any{
+		"rules": rows,
+		"count": len(rows),
+	}, nil
+}
+
+func (s *Server) toolAddRule(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	pattern := stringArg(args, "pattern", "")
+	effect := stringArg(args, "effect", "allow")
+	r := rules.ProxyRule{
+		Pattern:       pattern,
+		Effect:        rules.Effect(effect),
+		SchemaScope:   stringArg(args, "schema_scope", ""),
+		TableScope:    stringArg(args, "table_scope", ""),
+		FunctionScope: stringArg(args, "function_scope", ""),
+		Note:          stringArg(args, "note", ""),
+		Origin:        rules.OriginUser,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, err := s.cfg.Store.AddRule(r)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"id":      int64(id),
+		"pattern": r.Pattern,
+		"effect":  string(r.Effect),
+	}, nil
+}
+
+func (s *Server) toolRemoveRule(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	id := int64(intArg(args, "id", 0))
+	if id <= 0 {
+		return nil, errors.New("dbounce_remove_rule: id required (positive integer)")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ok, err := s.cfg.Store.RemoveRule(rules.ID(id))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"removed": ok, "id": id}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_decide — dry-run a SQL statement; returns verdict without
+// writing an audit row or forwarding upstream.
+// ---------------------------------------------------------------------
+
+func (s *Server) toolDecide(args map[string]any) (map[string]any, error) {
+	sql := stringArg(args, "statement", "")
+	if sql == "" {
+		return nil, errors.New("dbounce_decide: `statement` required (a SQL string)")
+	}
+	dialect := stringArg(args, "dialect", string(s.cfg.Dialect))
+	if dialect == "" {
+		dialect = parser.DialectPostgres
+	}
+	ps := parser.Parse(dialect, sql)
+
+	if s.cfg.ActiveProfile != nil && s.cfg.ActiveProfile.Name != profile.FullUserProfileName {
+		profileView := &profile.ParsedStatement{
+			StatementType:    ps.StatementType,
+			TablesTouched:    ps.TablesTouched,
+			FunctionsCalled:  ps.FunctionsCalled,
+			IsDML:            ps.IsDML,
+			IsDDL:            ps.IsDDL,
+			HasMutatingNode:  ps.HasMutatingNode,
+			IsExplain:        ps.IsExplain,
+			IsExplainAnalyze: ps.IsExplainAnalyze,
+		}
+		pv := s.cfg.ActiveProfile.Evaluate(profileView)
+		if pv.Denied {
+			return map[string]any{
+				"verdict":         "deny",
+				"decision_source": pv.Source,
+				"reason":          pv.Reason,
+				"statement_type":  ps.StatementType,
+			}, nil
+		}
+		if pv.Allowed {
+			return map[string]any{
+				"verdict":         "allow",
+				"decision_source": pv.Source,
+				"reason":          pv.Reason,
+				"statement_type":  ps.StatementType,
+			}, nil
+		}
+	}
+
+	if s.cfg.Store == nil {
+		return map[string]any{
+			"verdict":         string(s.cfg.DefaultPolicy),
+			"decision_source": "default",
+			"reason":          "no store configured; default policy applied",
+			"statement_type":  ps.StatementType,
+		}, nil
+	}
+	ruleSet, err := s.cfg.Store.LoadRuleSet()
+	if err != nil {
+		return nil, err
+	}
+	stmtView := &rules.ParsedStatement{
+		StatementType:    ps.StatementType,
+		TablesTouched:    ps.TablesTouched,
+		FunctionsCalled:  ps.FunctionsCalled,
+		IsDML:            ps.IsDML,
+		IsDDL:            ps.IsDDL,
+		HasMutatingNode:  ps.HasMutatingNode,
+		IsExplain:        ps.IsExplain,
+		IsExplainAnalyze: ps.IsExplainAnalyze,
+	}
+	res := ruleSet.Evaluate(stmtView)
+	if res != nil {
+		verdict := "allow"
+		source := "global.allow"
+		if res.Effect == rules.EffectDeny {
+			verdict = "deny"
+			source = "global.deny"
+		}
+		return map[string]any{
+			"verdict":         verdict,
+			"decision_source": source,
+			"reason":          fmt.Sprintf("matched rule pattern %q", res.Rule.Pattern),
+			"statement_type":  ps.StatementType,
+		}, nil
+	}
+	return map[string]any{
+		"verdict":         string(s.cfg.DefaultPolicy),
+		"decision_source": "default",
+		"reason":          fmt.Sprintf("no rule matched; default policy %q applied", s.cfg.DefaultPolicy),
+		"statement_type":  ps.StatementType,
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_tail_decisions — recent audit rows.
+// ---------------------------------------------------------------------
+
+func (s *Server) toolTailDecisions(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	limit := intArg(args, "limit", 50)
+	rows, err := s.cfg.Store.RecentDecisions(limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		row := map[string]any{
+			"at":                r.At.UTC().Format("2006-01-02T15:04:05Z"),
+			"dialect":           r.Dialect,
+			"statement":         r.Statement,
+			"statement_type":    r.StatementType,
+			"tables":            r.TablesTouched,
+			"functions":         r.FunctionsCalled,
+			"is_dml":            r.IsDML,
+			"is_ddl":            r.IsDDL,
+			"has_mutating_node": r.HasMutatingNode,
+			"verdict":           r.DecisionVerdict,
+			"reason":            r.DecisionReason,
+			"decision_source":   r.DecisionSource,
+			"profile_name":      r.ProfileName,
+			"enforced":          r.Enforced,
+		}
+		if r.TaskID != "" {
+			row["task_id"] = r.TaskID
+		}
+		out = append(out, row)
+	}
+	return map[string]any{
+		"decisions": out,
+		"count":     len(out),
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// arg-coercion helpers
+// ---------------------------------------------------------------------
+
+func stringArg(args map[string]any, key, def string) string {
+	if v, ok := args[key].(string); ok {
+		return v
+	}
+	return def
+}
+
+func intArg(args map[string]any, key string, def int) int {
+	switch v := args[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	}
+	return def
+}
+
+func boolArg(args map[string]any, key string, def ...bool) bool {
+	if v, ok := args[key].(bool); ok {
+		return v
+	}
+	if len(def) > 0 {
+		return def[0]
+	}
+	return false
+}
+
+func stringSliceArg(args map[string]any, key string) []string {
+	raw, ok := args[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, x := range raw {
+		if s, ok := x.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------
+// JSON-RPC envelope helpers
+// ---------------------------------------------------------------------
+
+func okResponse(id json.RawMessage, result any) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"id":      jsonRawOrNull(id),
+		"result":  result,
+	}
+}
+
+func errResponse(id json.RawMessage, code int, message string) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"id":      jsonRawOrNull(id),
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	}
+}
+
+func jsonRawOrNull(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return raw
+}
