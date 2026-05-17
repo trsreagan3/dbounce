@@ -62,13 +62,13 @@ func startProxyAgainstRealPG(t *testing.T, mode Mode) (int, *dbstore.Store) {
 	require.NoError(t, err)
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg := Config{
 		Host: "127.0.0.1", Port: wirePort,
 		MgmtHost: "127.0.0.1", MgmtPort: mgmtPort,
-		Mode: mode, Dialect: DialectPostgres,
+		WireListener: wireL,
+		MgmtListener: mgmtL,
+		Mode:         mode, Dialect: DialectPostgres,
 		Upstream:    up,
 		IdleTimeout: 10 * time.Second,
 		ReadTimeout: 10 * time.Second,

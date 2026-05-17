@@ -180,14 +180,14 @@ func startTLSObservationServer(t *testing.T, requireClient bool) (string, *tlsma
 	require.NoError(t, err)
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg := Config{
 		Host:          "127.0.0.1",
 		Port:          wirePort,
 		MgmtHost:      "127.0.0.1",
 		MgmtPort:      mgmtPort,
+		WireListener:  wireL,
+		MgmtListener:  mgmtL,
 		Mode:          ModeCooperative,
 		DefaultPolicy: DefaultPolicyAllow,
 		Dialect:       DialectPostgres,
@@ -327,14 +327,14 @@ func TestListenerTLS_NotConfiguredRepliesN(t *testing.T) {
 	require.NoError(t, err)
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg := Config{
 		Host:          "127.0.0.1",
 		Port:          wirePort,
 		MgmtHost:      "127.0.0.1",
 		MgmtPort:      mgmtPort,
+		WireListener:  wireL,
+		MgmtListener:  mgmtL,
 		Mode:          ModeCooperative,
 		DefaultPolicy: DefaultPolicyAllow,
 		Dialect:       DialectPostgres,
@@ -471,14 +471,14 @@ func TestMgmtTLS_HealthzOverHTTPS(t *testing.T) {
 	require.NoError(t, err)
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg := Config{
 		Host:            "127.0.0.1",
 		Port:            wirePort,
 		MgmtHost:        "127.0.0.1",
 		MgmtPort:        mgmtPort,
+		WireListener:    wireL,
+		MgmtListener:    mgmtL,
 		Mode:            ModeCooperative,
 		DefaultPolicy:   DefaultPolicyAllow,
 		Dialect:         DialectPostgres,

@@ -97,7 +97,19 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	// DSN-level busy_timeout makes EVERY connection in the pool wait +
+	// retry for up to N ms when a competing connection holds a lock,
+	// rather than failing immediately with SQLITE_BUSY. Necessary
+	// because we keep MaxOpenConns > 1 — concurrent forwarder-audit-
+	// write + healthz-count-read race against each other otherwise.
+	// 5s is generous for our workload (per-statement audit writes +
+	// healthz polls) and matches kbounce's setting.
+	//
+	// modernc.org/sqlite parses `_pragma=<name>(<value>)` in the DSN +
+	// applies it on every new connection — this is per-connection so
+	// passing it via DSN is the only correct shape for a pool.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("dbounce: sql.Open: %w", err)
 	}

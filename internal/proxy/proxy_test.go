@@ -41,10 +41,10 @@ func startTestServer(t *testing.T) (*Server, string, string, *store.Store) {
 		DefaultPolicy: DefaultPolicyAllow,
 		IdleTimeout:   5 * time.Second,
 	}.Normalize()
-	// Replace port 0 sentinels (Normalize would set defaults). We use
-	// net.Listen directly via the Server.Serve path, but that picks
-	// the configured port. To get a random ephemeral port we
-	// pre-listen here + then hand the listener to Server.
+	// Replace port 0 sentinels (Normalize would set defaults). We pre-
+	// bind both listeners on ephemeral ports + hand them through Config
+	// so Server.Serve does not close→re-Listen + race against another
+	// process / test grabbing the freed port. See #244.
 	wireL, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	mgmtL, err := net.Listen("tcp", "127.0.0.1:0")
@@ -52,11 +52,11 @@ func startTestServer(t *testing.T) (*Server, string, string, *store.Store) {
 
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg.Port = wirePort
 	cfg.MgmtPort = mgmtPort
+	cfg.WireListener = wireL
+	cfg.MgmtListener = mgmtL
 
 	srv := NewServer(cfg, st)
 	go func() {

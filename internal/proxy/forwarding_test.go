@@ -175,25 +175,28 @@ func startForwardingServer(t *testing.T, fake *fakePGUpstream, mode Mode) (*Serv
 	})
 	require.NoError(t, err)
 
+	// Pre-bind both listeners and hand them to Config so Server.Serve
+	// does not close→re-Listen on a port some other goroutine could
+	// grab in the meantime. See #244.
 	wireL, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	mgmtL, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg := Config{
-		Host:        "127.0.0.1",
-		Port:        wirePort,
-		MgmtHost:    "127.0.0.1",
-		MgmtPort:    mgmtPort,
-		Mode:        mode,
-		Dialect:     DialectPostgres,
-		Upstream:    up,
-		IdleTimeout: 5 * time.Second,
-		ReadTimeout: 5 * time.Second,
+		Host:         "127.0.0.1",
+		Port:         wirePort,
+		MgmtHost:     "127.0.0.1",
+		MgmtPort:     mgmtPort,
+		WireListener: wireL,
+		MgmtListener: mgmtL,
+		Mode:         mode,
+		Dialect:      DialectPostgres,
+		Upstream:     up,
+		IdleTimeout:  5 * time.Second,
+		ReadTimeout:  5 * time.Second,
 	}.Normalize()
 	srv := NewServer(cfg, st)
 	go func() { _ = srv.Serve() }()
@@ -271,6 +274,24 @@ func clientSession(t *testing.T, addr, sql string) (msgs []byte) {
 	return collected
 }
 
+// waitForDecisions polls st.CountDecisions until it sees at least n
+// rows or the deadline expires. The proxy's audit write happens in a
+// goroutine that runs to completion AFTER the client receives RFQ +
+// the test main thread returns from clientSession; without this poll
+// the test races the write.
+func waitForDecisions(t *testing.T, st *store.Store, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := st.CountDecisions()
+		if err == nil && got >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("waitForDecisions: never saw %d rows within 2s", n)
+}
+
 // ---- TESTS ----
 
 // TestForward_AllowForwardsAndDrainsResult: a SELECT in cooperative
@@ -302,6 +323,7 @@ func TestForward_AllowForwardsAndDrainsResult(t *testing.T) {
 	}
 	assert.True(t, sawQuery, "fake upstream must have received the Query")
 
+	waitForDecisions(t, st, 1)
 	rows, err := st.RecentDecisions(10)
 	require.NoError(t, err)
 	require.NotEmpty(t, rows)
@@ -337,6 +359,7 @@ func TestForward_TransparentDenyDoesNotForward(t *testing.T) {
 			"transparent deny MUST NOT forward to upstream")
 	}
 
+	waitForDecisions(t, st, 1)
 	rows, err := st.RecentDecisions(10)
 	require.NoError(t, err)
 	require.NotEmpty(t, rows)
@@ -374,6 +397,7 @@ func TestForward_CooperativeDenyStillForwards(t *testing.T) {
 	assert.True(t, sawQuery,
 		"cooperative DENY must STILL forward (advisory mode)")
 
+	waitForDecisions(t, st, 1)
 	rows, err := st.RecentDecisions(10)
 	require.NoError(t, err)
 	require.NotEmpty(t, rows)
@@ -406,13 +430,13 @@ func TestForward_UpstreamDialFailure(t *testing.T) {
 	require.NoError(t, err)
 	wirePort := wireL.Addr().(*net.TCPAddr).Port
 	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
-	_ = wireL.Close()
-	_ = mgmtL.Close()
 
 	cfg := Config{
 		Host: "127.0.0.1", Port: wirePort,
 		MgmtHost: "127.0.0.1", MgmtPort: mgmtPort,
-		Mode: ModeCooperative, Dialect: DialectPostgres,
+		WireListener: wireL,
+		MgmtListener: mgmtL,
+		Mode:         ModeCooperative, Dialect: DialectPostgres,
 		Upstream:    up,
 		IdleTimeout: 2 * time.Second,
 	}.Normalize()

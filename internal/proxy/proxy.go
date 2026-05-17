@@ -168,6 +168,16 @@ type Config struct {
 	// owns the loading.
 	MgmtTLSCertFile string
 	MgmtTLSKeyFile  string
+
+	// WireListener and MgmtListener let tests hand pre-bound listeners
+	// to Serve so the test process can reserve an ephemeral port (via
+	// net.Listen "127.0.0.1:0") and pass it through WITHOUT a
+	// close → re-Listen window that races against the OS port reuse
+	// pool. Production binds via Host+Port (these stay nil and the
+	// existing net.Listen branches fire). When non-nil, Shutdown closes
+	// them exactly once via the listener / http.Server it owns.
+	WireListener net.Listener
+	MgmtListener net.Listener
 }
 
 // Normalize fills in zero-valued fields with sensible defaults.
@@ -240,11 +250,22 @@ func NewServer(cfg Config, st *store.Store) *Server {
 
 // Serve binds the wire-protocol listener + the management HTTP
 // listener, then accepts connections until Shutdown is called.
+//
+// When Config.WireListener / Config.MgmtListener are non-nil the
+// pre-bound listener is used as-is (test path — eliminates the
+// close → re-Listen race). When nil, net.Listen runs against
+// Host+Port / MgmtHost+MgmtPort (production path).
 func (s *Server) Serve() error {
-	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("dbounce: bind %s: %w", addr, err)
+	var l net.Listener
+	if s.cfg.WireListener != nil {
+		l = s.cfg.WireListener
+	} else {
+		addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dbounce: bind %s: %w", addr, err)
+		}
+		l = ln
 	}
 	s.listener = l
 
@@ -259,11 +280,22 @@ func (s *Server) Serve() error {
 	// D-Slice 4: /healthz over HTTPS when both --management-tls-cert
 	// and --management-tls-key are set. Default is HTTP for backward
 	// compat with D-Slice 1's loopback-only liveness check.
+	//
+	// When MgmtListener is pre-bound (test path), call Serve / ServeTLS
+	// against it directly; http.Server takes ownership + closes it on
+	// Shutdown. Otherwise fall through to ListenAndServe(TLS).
+	mgmtL := s.cfg.MgmtListener
 	go func() {
 		var err error
-		if s.cfg.MgmtTLSCertFile != "" && s.cfg.MgmtTLSKeyFile != "" {
+		useTLS := s.cfg.MgmtTLSCertFile != "" && s.cfg.MgmtTLSKeyFile != ""
+		switch {
+		case mgmtL != nil && useTLS:
+			err = s.mgmtSrv.ServeTLS(mgmtL, s.cfg.MgmtTLSCertFile, s.cfg.MgmtTLSKeyFile)
+		case mgmtL != nil:
+			err = s.mgmtSrv.Serve(mgmtL)
+		case useTLS:
 			err = s.mgmtSrv.ListenAndServeTLS(s.cfg.MgmtTLSCertFile, s.cfg.MgmtTLSKeyFile)
-		} else {
+		default:
 			err = s.mgmtSrv.ListenAndServe()
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
