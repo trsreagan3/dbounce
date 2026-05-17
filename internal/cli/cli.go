@@ -356,8 +356,9 @@ func newRunCmd() *cobra.Command {
 		upstreamURL       string
 		upstreamCACert    string
 		upstreamTLSStr    string
-		dbPath            string
-		forceExternalBind bool
+		dbPath                string
+		forceExternalBind     bool
+		forceExternalMgmtBind bool
 		// D-Slice 4: TLS flags. All optional; empty preserves D-Slice
 		// 1+2's plaintext behavior.
 		listenerTLSCert     string
@@ -450,6 +451,29 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 						"box), re-run with --i-know-this-binds-externally.\n",
 					host)
 				os.Exit(2)
+			}
+
+			// HIGH-D8-04 (AUDIT-WB-DSLICES-1-8.md) closure: the same
+			// loopback guard MUST also apply to the management listener.
+			// /healthz discloses mode, dialect, active_profile, decision
+			// counters, AND pause.reason (operator-supplied free-text).
+			// The wire-listener-only guard was a footgun: operators who
+			// saw the wire-protocol message could reasonably assume mgmt
+			// shared the same default protection, but it didn't. Symmetric
+			// guard + parallel escape hatch closes the asymmetry. Returns
+			// an error (rather than os.Exit) so the guard is testable
+			// without the binary-level Exit semantics of the older guard.
+			if _, ok := loopbackHosts[mgmtHost]; !ok && !forceExternalMgmtBind {
+				return fmt.Errorf(
+					"refusing to bind the management listener to %q: "+
+						"/healthz exposes operator-configured fields including "+
+						"the active pause.reason free-text (HIGH-D8-04 from "+
+						"AUDIT-WB-DSLICES-1-8.md).\n\nIf you genuinely need to "+
+						"bind externally (test VM, network-segmented dev box, "+
+						"intentional read-only health endpoint behind a "+
+						"trusted reverse proxy), re-run with "+
+						"--i-know-mgmt-binds-externally.",
+					mgmtHost)
 			}
 
 			// D-Slice 2: resolve the upstream forwarding target. Empty
@@ -691,6 +715,11 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"/ ::1 / localhost. Binding externally exposes dbounce's "+
 			"credential-handling surface (once D-Slice 2 lands SCRAM "+
 			"pass-through). Don't pass without a specific reason.")
+	cmd.Flags().BoolVar(&forceExternalMgmtBind, "i-know-mgmt-binds-externally", false,
+		"Required acknowledgement when --mgmt-host is anything other than "+
+			"127.0.0.1 / ::1 / localhost. /healthz exposes operator-configured "+
+			"fields including the pause.reason free-text. HIGH-D8-04 from "+
+			"AUDIT-WB-DSLICES-1-8.md. Don't pass without a specific reason.")
 
 	// D-Slice 4: listener-side TLS for the SQL wire-protocol port.
 	cmd.Flags().StringVar(&listenerTLSCert, "listener-tls-cert", "",

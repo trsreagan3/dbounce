@@ -105,6 +105,66 @@ func TestRunCmd_MySQLRejectsListenerTLS(t *testing.T) {
 	}
 }
 
+// HIGH-D8-04 regression — management listener loopback guard. The
+// wire-protocol listener already guards against external binds; the
+// management listener (default 127.0.0.1) lacked the parallel guard,
+// so `--mgmt-host 0.0.0.0` would silently expose /healthz (which
+// discloses operator-controlled pause.reason text + deployment
+// fingerprint). AUDIT-WB-DSLICES-1-8.md §HIGH-D8-04 has the full
+// reproduction.
+
+func TestRunCmd_MgmtHostRequiresAcknowledgementWhenExternal(t *testing.T) {
+	cmd := newRunCmd()
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{
+		"--mgmt-host", "0.0.0.0",
+		"--host", "127.0.0.1",
+		"--db", t.TempDir() + "/x.db",
+		"--port", "0", "--mgmt-port", "0",
+	})
+	err := cmd.Execute()
+	require.Error(t, err,
+		"--mgmt-host 0.0.0.0 without acknowledgement MUST be rejected")
+	assert.Contains(t, err.Error(), "HIGH-D8-04",
+		"error must reference the audit ID")
+	assert.Contains(t, err.Error(), "--i-know-mgmt-binds-externally",
+		"error must name the escape-hatch flag")
+}
+
+func TestRunCmd_MgmtHostGuardLoopbackMembership(t *testing.T) {
+	// Directly verify the loopbackHosts map matches the wire-listener's
+	// definition so the mgmt guard is symmetric (the audit's "asymmetry
+	// footgun" is closed by sharing the same allowlist). We don't run
+	// the listener in test — that would block on Ctrl+C; the guard's
+	// correctness lives in the map membership + the conditional that
+	// uses it (covered by the rejection test above + by reading the
+	// source). Sanity that all expected entries are present:
+	for _, h := range []string{"127.0.0.1", "::1", "localhost", "ip6-localhost", "ip6-loopback"} {
+		_, ok := loopbackHosts[h]
+		assert.True(t, ok, "loopbackHosts map MUST contain %q so mgmt guard accepts it", h)
+	}
+	// And confirm a clear external-looking host is NOT a member.
+	for _, h := range []string{"0.0.0.0", "::", "1.2.3.4"} {
+		_, ok := loopbackHosts[h]
+		assert.False(t, ok, "loopbackHosts map MUST NOT contain %q", h)
+	}
+}
+
+func TestRunCmd_Help_MentionsMgmtBindAcknowledgement(t *testing.T) {
+	cmd := newRunCmd()
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{"--help"})
+	require.NoError(t, cmd.Execute())
+	help := out.String()
+	assert.Contains(t, help, "--i-know-mgmt-binds-externally",
+		"--help MUST surface the new acknowledgement flag")
+}
+
 func TestRootCmd_HasInitTLSSubcommand(t *testing.T) {
 	cmd := newRootCmd()
 	names := map[string]bool{}
