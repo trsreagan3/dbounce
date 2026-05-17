@@ -94,6 +94,15 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newAuditCmd())
 	root.AddCommand(newInitTLSCmd())
+	// D-Slice 8: pause + prompts + presets + rules subcommands. The
+	// nil profileWriter wires the in-package stub; D-Slice 7's profile
+	// package will replace this at merge time by passing a real
+	// implementation in. The interface (ProfileWriter, defined in
+	// prompts.go) decouples this branch from the profile package shape.
+	root.AddCommand(newPauseCmd())
+	root.AddCommand(newPromptsCmd(nil))
+	root.AddCommand(newPresetsCmd(nil))
+	root.AddCommand(newRulesCmd(nil))
 	return root
 }
 
@@ -144,6 +153,10 @@ func newRunCmd() *cobra.Command {
 		requireClientCert   bool
 		mgmtTLSCert         string
 		mgmtTLSKey          string
+		// D-Slice 8: async deny-prompt UX. When true, transparent DENY
+		// decisions enqueue a pending_prompts row for `dbounce prompts
+		// answer` to drain. Default false preserves D-Slice 3 behavior.
+		promptOnDeny bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -264,6 +277,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				ListenerTLS:     listenerTLSCfg,
 				MgmtTLSCertFile: mgmtTLSCert,
 				MgmtTLSKeyFile:  mgmtTLSKey,
+				PromptOnDeny:    promptOnDeny,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
@@ -418,6 +432,15 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"Generate via `dbounce init-tls`.")
 	cmd.Flags().StringVar(&mgmtTLSKey, "management-tls-key", "",
 		"PEM private key for the management HTTP listener (matches --management-tls-cert).")
+
+	// D-Slice 8: async deny-prompt UX.
+	cmd.Flags().BoolVar(&promptOnDeny, "prompt-on-deny", false,
+		"When in transparent mode, every DENY enqueues a row in "+
+			"pending_prompts. Drain the queue with `dbounce prompts list` "+
+			"+ `dbounce prompts answer ID --kind {ignore|always|profile}`. "+
+			"Has no effect in cooperative mode (advisory verdicts aren't "+
+			"prompted) or during an active pause window (operator already "+
+			"said allow).")
 	return cmd
 }
 

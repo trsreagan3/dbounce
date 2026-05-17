@@ -56,6 +56,19 @@ func TestRunCmd_Help(t *testing.T) {
 	assert.Contains(t, help, "--require-client-cert")
 	assert.Contains(t, help, "--management-tls-cert")
 	assert.Contains(t, help, "--management-tls-key")
+	// D-Slice 8 flag
+	assert.Contains(t, help, "--prompt-on-deny")
+}
+
+func TestRootCmd_HasDSlice8Subcommands(t *testing.T) {
+	cmd := newRootCmd()
+	names := map[string]bool{}
+	for _, c := range cmd.Commands() {
+		names[c.Name()] = true
+	}
+	for _, sub := range []string{"pause", "prompts", "presets", "rules"} {
+		assert.True(t, names[sub], "D-Slice 8 must wire %s subcommand", sub)
+	}
 }
 
 func TestRunCmd_MySQLRejectsListenerTLS(t *testing.T) {
