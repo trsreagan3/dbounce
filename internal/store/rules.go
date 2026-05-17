@@ -359,21 +359,43 @@ func (s *Store) EndTask(taskID, actor, endReason string, status tasks.Status) (b
 // TaskReview is the post-task review summary mirroring the Python
 // task_review_summary + kbounce TaskReview. Used by `dbounce tasks
 // review TASK_ID`.
+//
+// MED-D8-10 (AUDIT-WB-DSLICES-1-8.md) closure: pause-window demotions
+// (transparent DENY → ALLOW + pause_id, recorded with the reason
+// "pause-window demoted: rule engine wanted DENY (...)") are persisted
+// with decision_verdict='ALLOW'. The naive switch on verdict
+// double-counted those rows as plain allows, hiding the pause-demote
+// signal in the post-task review. We now scan pause_id directly +
+// surface the count separately so a reviewer running `dbounce tasks
+// review TASK_ID` sees the three categories: allow / deny /
+// pause-demoted-allow.
 type TaskReview struct {
-	TaskID          string
-	Description     string
-	Status          string
-	StartedAt       string
-	ExpiresAt       string
-	EndedAt         string
-	EndReason       string
-	Owner           string
-	DecisionCount   int
-	AllowCount      int
-	DenyCount       int
-	FirstDecisionAt string
-	LastDecisionAt  string
-	DeniedCalls     []TaskDeniedCall
+	TaskID             string
+	Description        string
+	Status             string
+	StartedAt          string
+	ExpiresAt          string
+	EndedAt            string
+	EndReason          string
+	Owner              string
+	DecisionCount      int
+	AllowCount         int
+	DenyCount          int
+	// PauseDemotedCount is the number of ALLOW rows whose pause_id is
+	// non-null — these are decisions the rule engine wanted to DENY
+	// but the operator's pause window demoted to ALLOW. Always >= 0.
+	// Subset of AllowCount: pause-demoted rows are also counted there
+	// because the persisted verdict IS allow + they did pass through
+	// the proxy. This field makes the pause-demote subset visible.
+	// MED-D8-10 closure.
+	PauseDemotedCount  int
+	FirstDecisionAt    string
+	LastDecisionAt     string
+	DeniedCalls        []TaskDeniedCall
+	// PauseDemotedCalls lists the pause-demoted rows so reviewers see
+	// "what would have been blocked while task X ran had the pause not
+	// been active?" Capped at 1000 like DeniedCalls.
+	PauseDemotedCalls  []TaskDeniedCall
 }
 
 // TaskDeniedCall is one denied statement recorded during the task
@@ -397,8 +419,14 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 	if sc == nil {
 		return nil, nil
 	}
+	// MED-D8-10 (AUDIT-WB-DSLICES-1-8.md): pull pause_id alongside the
+	// verdict so we can split out pause-demoted ALLOW rows from regular
+	// ALLOW rows. The proxy persists pause-demote with
+	// decision_verdict='ALLOW' + pause_id set; without inspecting
+	// pause_id the reviewer would see them as plain allows.
 	rs, err := s.db.Query(
-		`SELECT at, decision_verdict, statement_type, tables_json, decision_reason
+		`SELECT at, decision_verdict, statement_type, tables_json,
+		        decision_reason, pause_id
 		 FROM decisions WHERE task_id = ? ORDER BY id`, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("dbounce: task review decisions: %w", err)
@@ -415,9 +443,13 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 		Owner:       sc.Owner,
 	}
 	denied := make([]TaskDeniedCall, 0, 8)
+	pauseDemoted := make([]TaskDeniedCall, 0, 4)
 	for rs.Next() {
-		var at, verdict, stmtType, tablesJSON, reason string
-		if err := rs.Scan(&at, &verdict, &stmtType, &tablesJSON, &reason); err != nil {
+		var (
+			at, verdict, stmtType, tablesJSON, reason string
+			pauseID                                   sql.NullInt64
+		)
+		if err := rs.Scan(&at, &verdict, &stmtType, &tablesJSON, &reason, &pauseID); err != nil {
 			return nil, fmt.Errorf("dbounce: task review scan: %w", err)
 		}
 		out.DecisionCount++
@@ -428,6 +460,19 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 		switch verdict {
 		case "ALLOW":
 			out.AllowCount++
+			// MED-D8-10: a non-null pause_id on an ALLOW row means the
+			// rule engine wanted DENY but the operator's pause window
+			// demoted it. Surface separately so the reviewer sees the
+			// "what slipped through while paused?" set distinctly.
+			if pauseID.Valid {
+				out.PauseDemotedCount++
+				pauseDemoted = append(pauseDemoted, TaskDeniedCall{
+					At:            at,
+					StatementType: stmtType,
+					Tables:        unmarshalStrings(tablesJSON),
+					Reason:        reason,
+				})
+			}
 		case "DENY":
 			out.DenyCount++
 			denied = append(denied, TaskDeniedCall{
@@ -443,11 +488,16 @@ func (s *Store) TaskReviewSummary(taskID string) (*TaskReview, error) {
 	}
 	// Cap at 1000 entries per the Python WB27 MED-27-01 bound (mirrored
 	// by kbounce). Prevents an unbounded result from a long-running task
-	// with thousands of denied calls.
+	// with thousands of denied calls. The pause-demoted list applies
+	// the same cap for the same reason.
 	if len(denied) > 1000 {
 		denied = denied[:1000]
 	}
+	if len(pauseDemoted) > 1000 {
+		pauseDemoted = pauseDemoted[:1000]
+	}
 	out.DeniedCalls = denied
+	out.PauseDemotedCalls = pauseDemoted
 	return out, nil
 }
 

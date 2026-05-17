@@ -120,6 +120,12 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPromptsCmd(writer))
 	root.AddCommand(newPresetsCmd(writer))
 	root.AddCommand(newRulesCmd(writer))
+	// MED-D8-10 (AUDIT-WB-DSLICES-1-8.md) closure: wire the
+	// TaskReviewSummary helper into a CLI surface. Without this command
+	// the new PauseDemotedCount + PauseDemotedCalls fields aren't
+	// reachable; per [[deliberate-feature-completion]] both halves of
+	// the fix ship together.
+	root.AddCommand(newTasksCmd())
 	// D-Slice 6: dry-run SQL through the rule engine without starting
 	// a wire-protocol listener. The supported invocation path for
 	// Snowflake + BigQuery (which ship via the JDBC-driver-shim per
