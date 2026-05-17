@@ -386,6 +386,13 @@ func newRunCmd() *cobra.Command {
 		// swapped for [REDACTED] before insertion. Default false
 		// preserves the full-fidelity audit-reconstruction behavior.
 		redactLiterals bool
+		// LOW-D8-13 (AUDIT-WB-DSLICES-1-8.md): when true, the startup
+		// banner is reduced to listener address + dialect only — the
+		// fingerprint-sensitive fields (mode, default-policy, profile,
+		// upstream URL/TLS, audit db path) are suppressed. The full
+		// configuration remains available via /healthz for operators
+		// who want introspection through the management endpoint.
+		quietBanner bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -588,69 +595,27 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				PromptOnDeny:      promptOnDeny,
 				RedactLiterals:    redactLiterals,
 			}.Normalize()
-			_ = profileFromFlag // reserved for the not-selected banner in newer slices
 
 			s := proxy.NewServer(cfg, st)
 
 			// Banner per the agent-parity requirement + the read-write
 			// framing the safe-default profile (D-Slice 7) will hook
 			// into. Goes to stderr so stdout stays clean.
-			wireProto := "tcp"
-			if cfg.ListenerTLS != nil {
-				wireProto = "tcp+tls"
-				if cfg.ListenerTLS.RequireClientCert {
-					wireProto += "+mtls"
-				}
-			}
-			fmt.Fprintf(os.Stderr,
-				"dbounce wire listener  : %s:%d  (dialect=%s, mode=%s, default-policy=%s, transport=%s)\n",
-				cfg.Host, cfg.Port, cfg.Dialect, cfg.Mode, cfg.DefaultPolicy, wireProto)
-			mgmtScheme := "http"
-			if cfg.MgmtTLSCertFile != "" {
-				mgmtScheme = "https"
-			}
-			fmt.Fprintf(os.Stderr,
-				"dbounce mgmt /healthz : %s://%s:%d/healthz\n",
-				mgmtScheme, cfg.MgmtHost, cfg.MgmtPort)
-			fmt.Fprintf(os.Stderr, "audit db              : %s\n", st.Path())
-			if resolvedUpstream != nil {
-				fmt.Fprintf(os.Stderr,
-					"upstream              : %s (D-Slice 2 forwarding ACTIVE; TLS=%s)\n",
-					upstreamURL, resolvedUpstream.TLSMode)
-				if upstreamCACert != "" {
-					fmt.Fprintf(os.Stderr,
-						"upstream CA bundle    : %s\n", upstreamCACert)
-				}
-			} else {
-				fmt.Fprintln(os.Stderr,
-					"upstream              : <none> — observation-only mode (no forwarding)")
-			}
-			fmt.Fprintf(os.Stderr,
-				"profile               : %s (loaded from %s)\n",
-				activeProfile.Name, resolvedProfilesPath)
-			if !profileFromFlag && os.Getenv(envProfileVar) == "" {
-				fmt.Fprintln(os.Stderr,
-					"                        no --profile / "+envProfileVar+" set — running as 'full-user' "+
-						"(passthrough). To block writes by default, pass --profile safe-default OR "+
-						"export "+envProfileVar+"=safe-default.")
-			}
-			fmt.Fprintln(os.Stderr,
-				"mode                  : cooperative — every statement is parsed + audit-logged.")
-			fmt.Fprintln(os.Stderr,
-				"                        D-Slice 1 is OBSERVATION-ONLY: nothing actually executes")
-			fmt.Fprintln(os.Stderr,
-				"                        against the upstream. To opt into the (D-Slice 2+) transparent")
-			fmt.Fprintln(os.Stderr,
-				"                        block path once it ships, pass --mode transparent.")
-			fmt.Fprintln(os.Stderr,
-				"read vs write         : reads (SELECT) and writes (INSERT/UPDATE/DELETE/MERGE/DDL/")
-			fmt.Fprintln(os.Stderr,
-				"                        CALL/DO/EXECUTE/WITH-WRITE) are classified per-statement so the")
-			fmt.Fprintln(os.Stderr,
-				"                        D-Slice 7 safe-default profile can default to reads-fine +")
-			fmt.Fprintln(os.Stderr,
-				"                        writes-layered-checks (the readonly-admin-minus shape).")
-			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
+			//
+			// LOW-D8-13 (AUDIT-WB-DSLICES-1-8.md): when --quiet-banner
+			// is set, emit ONLY the listener address + dialect.
+			writeStartupBanner(os.Stderr, bannerOpts{
+				Cfg:                  cfg,
+				StoredAuditDBPath:    st.Path(),
+				UpstreamURL:          upstreamURL,
+				UpstreamCACert:       upstreamCACert,
+				ResolvedUpstream:     resolvedUpstream,
+				ActiveProfileName:    activeProfile.Name,
+				ResolvedProfilesPath: resolvedProfilesPath,
+				ProfileFromFlag:      profileFromFlag,
+				ProfileEnvSet:        os.Getenv(envProfileVar) != "",
+				Quiet:                quietBanner,
+			})
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -789,6 +754,15 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"Has no effect in cooperative mode (advisory verdicts aren't "+
 			"prompted) or during an active pause window (operator already "+
 			"said allow).")
+	cmd.Flags().BoolVar(&quietBanner, "quiet-banner", false,
+		"Reduce the startup banner to listener address + dialect only. "+
+			"Suppresses the mode / default-policy / profile / upstream / "+
+			"audit-db-path fields whose combination fingerprints the "+
+			"deployment when the banner is forwarded to centralized "+
+			"observability. Full configuration remains available via "+
+			"/healthz on the management endpoint. Recommended for "+
+			"production deployments where stderr is shipped to a shared "+
+			"log aggregator. LOW-D8-13 from AUDIT-WB-DSLICES-1-8.md.")
 	cmd.Flags().BoolVar(&redactLiterals, "redact-literals", false,
 		"When true, the audit row's recorded SQL has its quoted string "+
 			"literals swapped for [REDACTED] before persistence (numeric "+
