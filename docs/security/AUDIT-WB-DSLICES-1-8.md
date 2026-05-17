@@ -874,19 +874,22 @@ Larger MEDs deferred to v1.1 with rationale.
 | HIGH-D8-03 | CLOSED   | 6d58a93 | Path B: fail-fast on scoped allow rules at `CreateProfile` boundary. Path A (schema) → v1.1.   |
 | HIGH-D8-04 | CLOSED   | 4c63957 | `--mgmt-host` external-bind guard mirrors `--host` guard + parallel ack flag.                  |
 | HIGH-D8-05 | CLOSED   | 0abbcdb | `io.LimitReader` + size cap (1 MiB) on profile-install response body.                         |
-| MED-D8-06  | DEFERRED | —       | Upstream URL internal-IP allowlist. Needs `net.LookupHost` + per-range checks + opt-in flag + IPv4/IPv6 table-driven tests. Multi-file change; not a 5-10 line fix. v1.1 hardening slice. |
+| MED-D8-06  | CLOSED   | 6380f4e | SSRF allowlist in `upstream.Resolve`: deny 127/8, 169.254/16, 10/8, 172.16/12, 192.168/16, ::1, fe80::/10, fc00::/7, `.internal` / `.local` TLDs. DNS-rebinding caught via `net.LookupHost`. `--allow-internal-upstream` opt-in for legitimate intranet DBs. |
 | MED-D8-07  | CLOSED   | a6ba5b8 | `decisions` append-only via BEFORE UPDATE / BEFORE DELETE triggers.                           |
 | MED-D8-08  | CLOSED   | fcb737c | `pending_prompts.decision_id REFERENCES decisions(id)` + `_pragma=foreign_keys(1)`.            |
-| MED-D8-09  | DEFERRED | —       | Statement-body literal redaction (`--redact-literals`). Needs new flag, parser integration to swap literals for `?`, secret-pattern detection in audit-tail output. Large surface — v1.1 hardening slice. |
-| MED-D8-10  | DEFERRED | —       | `TaskReviewSummary` pause-demoted counter. `TaskReviewSummary` isn't yet wired into any CLI surface, so the misclassification doesn't reach operators today. Defer until the CLI consumer lands (then add the counter + display together). v1.1. |
+| MED-D8-09  | CLOSED   | 82f2035 | `--redact-literals` flag + `parser.RedactLiterals` (byte-scan, UTF-8 safe). Audit row's `Statement` swaps quoted string literals → `[REDACTED]` before persistence; `statement_redacted` column added (SchemaVersion 2 → 3) so MCP / `audit tail --json` consumers know SQL isn't replayable. |
+| MED-D8-10  | CLOSED   | 5d46614 | `dbounce tasks review TASK_ID` wires `TaskReviewSummary` into a CLI surface; new `PauseDemotedCount` + `PauseDemotedCalls` fields split pause-demoted ALLOWs out of the plain allow count so operators see "what slipped through while paused?" |
 | MED-D8-11  | CLOSED   | a6ba5b8 | 16 KiB cap on `tools/call` params at MCP dispatch (applies uniformly to all 9 tools).         |
-| LOW-D8-12  | DEFERRED | —       | `tmp.Sync()` + parent-dir sync. Not exercised by current test surface; track with v1.1 hardening. |
-| LOW-D8-13  | DEFERRED | —       | MySQL observation-mode banner fingerprint. Cosmetic; v1.1.                                   |
-| INFO-D8-14 | DEFERRED | —       | Stub ProfileWriter error message. Maintainability note; v1.1.                                |
+| LOW-D8-12  | CLOSED   | 0ee770e | DSN pins `synchronous=FULL`. Each `RecordDecision` is its own commit → fsync per audit row. Explicit pin defends against driver/config regressions that would flip to NORMAL / OFF silently. |
+| LOW-D8-13  | CLOSED   | 9070bac | `--quiet-banner` on `dbounce run` reduces startup banner to listener address + dialect only; mode / default-policy / profile / upstream / audit-db / read-vs-write framing suppressed. Full config still available via `/healthz`. Banner block extracted to `writeStartupBanner` for testability. |
+| INFO-D8-14 | CLOSED   | e20c053 | `stubProfileWriter` removed; `newPromptsCmd` / `newPromptsAnswerCmd` / `newPresetsCmd` / `newPresetsApplyCmd` / `newRulesCmd` / `newRulesRecommendCmd` panic on nil. After #245 the stub was unreachable in production; failing loudly at construction time catches future wiring regressions in CI rather than at operator-run time. |
 
-Test-count delta: 454 (audit baseline) → 500 (post-closure) — 46 new
-regression tests added across stripcomments, mysql, snowflake, bigquery,
-cli, profile, store, mcp packages.
+Test-count delta:
+  - audit baseline: 454
+  - post-URGENT-pass (CRITs + HIGHs + 3 MEDs at commit b997837): 500
+  - post-final-pass (this commit) : 553 — 53 additional regression
+    tests added for the 6 deferred findings, across upstream, parser,
+    proxy, store, cli packages.
 
 Audit cadence note: each closure was paired with at least one regression
 test that fails BEFORE the fix lands + passes after. The literal-
@@ -894,4 +897,12 @@ preservation case for the comment stripper (the most likely-to-be-buggy
 edge) is covered by TestStripSQLComments_StringLiteralPreserved +
 TestStripSQLComments_StringLiteralWithEscapedQuote +
 TestStripSQLComments_DoubleQuotedIdentifierPreserved + the per-dialect
-LiteralLooksLikeCommentNotStripped tests.
+LiteralLooksLikeCommentNotStripped tests. The literal-redaction case
+(MED-D8-09) cross-checks against the same stripcomments invariants
+(TestRedactLiterals_MatchesStripcommentsInvariant) so a future change
+to either helper that diverges from the other fails loudly. The SSRF
+gate (MED-D8-06) tests every CIDR + both TLD suffixes + the
+DNS-rebinding case via a stub LookupHost so the load-bearing
+"use net.LookupHost, not URL string parse" invariant is locked in.
+
+Pre-launch v1.0 closure complete: 0 deferred findings remain.
