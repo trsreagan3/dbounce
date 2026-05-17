@@ -2,18 +2,19 @@
 // 1 ships the observation-only PostgreSQL wire-protocol shape: parse
 // inbound Query / Parse / Bind / Execute messages, classify the SQL,
 // audit-log the decision, return a synthetic ReadyForQuery to the
-// client. No upstream forwarding — that ships in D-Slice 2.
+// client. D-Slice 2 wires real upstream forwarding; D-Slice 3 wires
+// the rule engine + per-task scopes (this file's `decide()` is where
+// the composition order lives).
 //
 // Per [[creates-never-mutates]]: the proxy NEVER executes SQL against
-// a real database in D-Slice 1. The synthetic ReadyForQuery keeps
-// well-behaved clients happy enough to send the next statement so the
-// operator can preview the full audit trail before flipping to D-Slice
-// 2's real forwarding.
+// a real database without an explicit upstream configured. The
+// synthetic ReadyForQuery keeps well-behaved clients happy enough to
+// send the next statement so the operator can preview the full audit
+// trail before flipping to real forwarding.
 //
-// Per [[safety-mode-lean-permissive]]: D-Slice 1's default verdict is
-// ALLOW (advisory) — the proxy observes + logs; it never blocks. The
-// transparent-mode block path is wired in D-Slice 2 once real
-// forwarding lands.
+// Per [[safety-mode-lean-permissive]]: D-Slice 1's default verdict
+// was always ALLOW (advisory). D-Slice 3 introduces real gating via
+// task scopes + global rules + default-policy fall-through.
 package proxy
 
 import (
@@ -31,7 +32,9 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/trsreagan3/dbounce/internal/parser"
+	dbrules "github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
+	"github.com/trsreagan3/dbounce/internal/tasks"
 )
 
 // Mode names dbounce's two operating shapes. Same vocabulary kbounce +
@@ -49,8 +52,8 @@ func (m Mode) IsValid() bool {
 }
 
 // DefaultPolicy names what dbounce does when no rule matches a
-// statement in transparent mode. D-Slice 1 has no rule engine, so the
-// flag is scaffolding for D-Slice 3.
+// statement in transparent mode. D-Slice 3 consults it at the end of
+// the composition order.
 type DefaultPolicy string
 
 const (
@@ -83,21 +86,60 @@ const (
 	VerdictDeny  Verdict = "DENY"
 )
 
+// DecisionSource* constants tag the audit row's decision_source column
+// with the rule layer that produced the verdict. Mirrors kbounce's
+// SourceProfile / SourceTask / SourceGlobal / SourceDefault enum so
+// cross-product audit-log scrapers can JOIN on a consistent label set.
+const (
+	// SourceProfile is reserved for the D-Slice 7 environment-profile
+	// hard floor (keyword-deny / verb-deny / account-deny). D-Slice 3
+	// leaves the placeholder; D-Slice 7 wires it.
+	SourceProfile = "profile"
+	// SourceTaskAllow / SourceTaskDeny tag verdicts fired by the active
+	// per-task scope. Distinct labels (allow vs deny) so reviewers can
+	// filter "what did this task explicitly block?" without joining on
+	// verdict.
+	SourceTaskAllow = "task.allow"
+	SourceTaskDeny  = "task.deny"
+	// SourceGlobalAllow / SourceGlobalDeny tag verdicts fired by a row
+	// in the global rules table.
+	SourceGlobalAllow = "global.allow"
+	SourceGlobalDeny  = "global.deny"
+	// SourceDefault tags fall-through verdicts from --default-policy
+	// (no rule matched).
+	SourceDefault = "default"
+	// SourceObservationLegacy is the D-Slice 1 label preserved for
+	// backward compat: rows recorded before the rule engine landed.
+	SourceObservationLegacy = "d-slice-1-observation-only"
+)
+
+// Decision is the full verdict packet evaluateAndAudit assembles for
+// the audit row. Carries the verdict + reason + audit-trail fields
+// (matched rule id, task id, decision source) so RecordDecision can
+// stamp every column the cross-product log scraper expects.
+type Decision struct {
+	Verdict       Verdict
+	Reason        string
+	Source        string
+	MatchedRuleID *int64
+	TaskID        string
+}
+
 // Config wires the proxy. CLI fills this from flags + the store + the
 // parser pkg's dialect dispatcher.
 type Config struct {
-	Host                string
-	Port                int
-	MgmtHost            string
-	MgmtPort            int
-	Mode                Mode
-	DefaultPolicy       DefaultPolicy
-	Dialect             Dialect
-	UpstreamURL         string // captured for audit in D-Slice 1; D-Slice 2 dials it
-	ReadTimeout         time.Duration
-	WriteTimeout        time.Duration
-	IdleTimeout         time.Duration
-	// ActiveProfile is filled by D-Slice 7. Stays nil through D-Slice 6.
+	Host          string
+	Port          int
+	MgmtHost      string
+	MgmtPort      int
+	Mode          Mode
+	DefaultPolicy DefaultPolicy
+	Dialect       Dialect
+	UpstreamURL   string // captured for audit; D-Slice 2's forwarding consumes it.
+	ReadTimeout   time.Duration
+	WriteTimeout  time.Duration
+	IdleTimeout   time.Duration
+	// ActiveProfileName is filled by D-Slice 7. Stays empty through D-Slice 6.
 	ActiveProfileName string
 }
 
@@ -150,9 +192,9 @@ var lookupErrorsCounter atomic.Int64
 // LookupErrorsCount returns the current counter value. Read-only.
 func LookupErrorsCount() int64 { return lookupErrorsCounter.Load() }
 
-// BumpLookupErrors increments the counter. Exported so the future
-// rule-engine path + audit-write path can flag their own errors
-// without re-importing the proxy package.
+// BumpLookupErrors increments the counter. Exported so the rule-engine
+// path + audit-write path can flag their own errors without re-
+// importing the proxy package.
 func BumpLookupErrors() { lookupErrorsCounter.Add(1) }
 
 // Server holds dbounce's running state: the wire listener, the
@@ -170,14 +212,7 @@ func NewServer(cfg Config, st *store.Store) *Server {
 }
 
 // Serve binds the wire-protocol listener + the management HTTP
-// listener, then accepts connections until Shutdown is called. Returns
-// the first listener error; the management server's errors are logged
-// + the wire-protocol listener wins.
-//
-// D-Slice 1 listener: per-connection goroutine reads PG wire-protocol
-// messages, hands each parsed statement to evaluateAndAudit, and writes
-// a synthetic ReadyForQuery back. No upstream dial; the connection
-// stays open as long as the client keeps sending well-formed messages.
+// listener, then accepts connections until Shutdown is called.
 func (s *Server) Serve() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	l, err := net.Listen("tcp", addr)
@@ -186,7 +221,6 @@ func (s *Server) Serve() error {
 	}
 	s.listener = l
 
-	// Start the management HTTP server. /healthz only in D-Slice 1.
 	mgmtAddr := fmt.Sprintf("%s:%d", s.cfg.MgmtHost, s.cfg.MgmtPort)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
@@ -213,8 +247,7 @@ func (s *Server) Serve() error {
 	}
 }
 
-// Shutdown stops the listener + the management HTTP server. Pending
-// connections see net.ErrClosed on their next read; they exit cleanly.
+// Shutdown stops the listener + the management HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.listener != nil {
 		_ = s.listener.Close()
@@ -225,15 +258,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// serveConn is the per-client read loop. Handles the PG wire-protocol
-// startup handshake (we ack but don't authenticate against an upstream
-// in D-Slice 1) then loops reading message envelopes. Every Query /
-// Parse / Bind / Execute hands the embedded SQL to the parser + audit
-// log, then a synthetic ReadyForQuery is sent.
-//
-// Per the audit-cadence self-check: malformed messages NEVER panic.
-// Read errors close the connection + log at debug; classify-errors
-// audit a row with statement_type=UNPARSEABLE + close the connection.
+// serveConn is the per-client read loop.
 func (s *Server) serveConn(conn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -245,11 +270,6 @@ func (s *Server) serveConn(conn net.Conn) {
 	}()
 	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
 
-	// Handshake. PG clients start with a StartupMessage (or
-	// SSLRequest). We refuse SSLRequest in D-Slice 1 (TLS lands in
-	// D-Slice 4); for StartupMessage we send AuthenticationOk +
-	// ParameterStatus + BackendKeyData + ReadyForQuery, then enter the
-	// command loop.
 	if err := pgHandshake(conn); err != nil {
 		log.Debug().Err(err).Str("remote", conn.RemoteAddr().String()).
 			Msg("dbounce: handshake failed")
@@ -268,7 +288,6 @@ func (s *Server) serveConn(conn net.Conn) {
 		}
 		switch msgType {
 		case msgTerminate:
-			// Client said goodbye. Clean exit.
 			return
 		case msgQuery:
 			sql := readCString(payload)
@@ -277,16 +296,10 @@ func (s *Server) serveConn(conn net.Conn) {
 				return
 			}
 		case msgParse:
-			// Parse: stmtName \0 sql \0 numParamTypes int16, then param oids.
-			// D-Slice 1: we only care about the SQL text; the rest is
-			// preserved for D-Slice 2's prepared-statement support.
 			_ = readCString(payload) // stmt name (discarded for now)
 			rest := payload[firstNullPlus1(payload):]
 			sql := readCString(rest)
 			s.evaluateAndAudit(sql, "Parse")
-			// Per the PG protocol the client expects a ParseComplete + a
-			// later Sync; we keep things simple and answer the implicit
-			// Sync with ReadyForQuery so a libpq client doesn't hang.
 			if err := writeParseComplete(conn); err != nil {
 				return
 			}
@@ -294,8 +307,6 @@ func (s *Server) serveConn(conn net.Conn) {
 				return
 			}
 		case msgBind:
-			// Bind binds a portal to a prepared statement. No SQL
-			// surface; D-Slice 1 just acks BindComplete + ReadyForQuery.
 			if err := writeBindComplete(conn); err != nil {
 				return
 			}
@@ -303,10 +314,6 @@ func (s *Server) serveConn(conn net.Conn) {
 				return
 			}
 		case msgExecute:
-			// Execute runs a previously-bound portal. No SQL surface;
-			// the SQL itself was already captured at the Parse step.
-			// D-Slice 1 acks CommandComplete + ReadyForQuery without
-			// executing.
 			if err := writeCommandComplete(conn, "SELECT 0"); err != nil {
 				return
 			}
@@ -318,11 +325,8 @@ func (s *Server) serveConn(conn net.Conn) {
 				return
 			}
 		case msgFlush, msgDescribe, msgClose:
-			// Acked silently. D-Slice 1 doesn't need to track portals.
+			// Acked silently.
 		default:
-			// Unknown / unsupported message type. Per the audit-cadence
-			// self-check, malformed messages MUST NOT panic — we log
-			// + close gracefully.
 			log.Debug().Uint8("type", msgType).
 				Str("remote", conn.RemoteAddr().String()).
 				Msg("dbounce: unsupported wire-protocol message; closing connection")
@@ -332,18 +336,17 @@ func (s *Server) serveConn(conn net.Conn) {
 }
 
 // evaluateAndAudit parses one inbound SQL statement, computes the
-// D-Slice 1 verdict (always ALLOW; advisory), and writes a row to the
-// audit log. Surfaced as a method on Server so D-Slices 3 + 7 can wire
-// their gating layers in without restructuring.
+// D-Slice 3 composition-order verdict, and writes a row to the audit
+// log.
 //
 // Per the audit-cadence self-check: this is where the audit row gets
-// enough fact for D-Slices 3+ to JOIN against. We include statement,
-// statement_type, tables, functions, decision_verdict, and the parser's
-// flag bag so the rule engine + recommender can compose against rows
-// already on disk.
+// enough fact for D-Slices 7+ to JOIN against. We include statement,
+// statement_type, tables, functions, decision_verdict, decision_source,
+// matched_rule_id, task_id + the parser's flag bag so the recommender
+// + the live-action-tail UI can compose against rows already on disk.
 func (s *Server) evaluateAndAudit(sql, source string) {
 	ps := parser.Parse(sql)
-	verdict, reason := s.decide(ps)
+	d := s.decide(ps)
 	row := store.DecisionRow{
 		At:               time.Now().UTC(),
 		Dialect:          ps.Dialect,
@@ -359,12 +362,17 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 		IsExplainAnalyze: ps.IsExplainAnalyze,
 		ImpersonatedRole: ps.ImpersonatedRole,
 		ParseErrors:      ps.ParseErrors,
-		DecisionVerdict:  string(verdict),
-		DecisionReason:   reason,
+		DecisionVerdict:  string(d.Verdict),
+		DecisionReason:   d.Reason,
 		ModeAtDecision:   string(s.cfg.Mode),
-		Enforced:         false, // D-Slice 1: never enforced (no forwarding)
-		ProfileName:      s.cfg.ActiveProfileName,
-		DecisionSource:   "d-slice-1-observation-only",
+		// Enforcement requires (a) transparent mode AND (b) a DENY
+		// verdict AND (c) D-Slice 2's forwarding wired. D-Slice 3 sets
+		// (a)+(b); D-Slice 2's forwarding handler honors it.
+		Enforced:       s.cfg.Mode == ModeTransparent && d.Verdict == VerdictDeny,
+		ProfileName:    s.cfg.ActiveProfileName,
+		DecisionSource: d.Source,
+		MatchedRuleID:  d.MatchedRuleID,
+		TaskID:         d.TaskID,
 	}
 	if _, err := s.store.RecordDecision(row); err != nil {
 		BumpLookupErrors()
@@ -373,20 +381,184 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 	}
 }
 
-// decide is the D-Slice 1 verdict function: ALWAYS allow, with a
-// human-readable reason that explains the observation-only stance.
-// D-Slices 3 + 7 + 8 layer real gating on top.
-func (s *Server) decide(ps *parser.ParsedStatement) (Verdict, string) {
-	// Per [[safety-mode-lean-permissive]]: D-Slice 1 is observation-
-	// only. The proxy never blocks; the audit row captures intent so
-	// the operator can preview what transparent mode would have done
-	// once D-Slice 2 lands.
-	reason := fmt.Sprintf(
-		"observation-only (statement_type=%s, tables=%d, functions=%d); "+
-			"D-Slice 1 never forwards or blocks",
-		ps.StatementType, len(ps.TablesTouched), len(ps.FunctionsCalled),
-	)
-	return VerdictAllow, reason
+// decide runs the D-Slice 3 composition order over a parsed statement
+// and returns a Decision packet. The composition order is load-bearing
+// — a single bug here turns the entire safety story upside down — so
+// it's written in strict step-by-step form that mirrors the Python
+// decisions.py and kbounce's EvaluateRequestFull semantics.
+//
+// Composition order (each step is fall-through unless it short-circuits):
+//
+//  1. Profile keyword-deny / verb-deny / account-deny (HARD FLOOR;
+//     D-Slice 7 fills this; D-Slice 3 leaves a no-op placeholder).
+//  2. Profile allow rules (D-Slice 7).
+//  3. Active task scope's DENY rules → DENY (task-explicit-deny beats
+//     EVERYTHING below — the agent saying "no prod" is binding even
+//     when global rules would have allowed).
+//  4. Global rules from the rules table — first-match (within the
+//     matcher, DENY beats ALLOW).
+//     - Global DENY → DENY (fires regardless of task scope; the admin's
+//       baseline can't be overridden by a task-allow).
+//     - Global ALLOW match noted but not committed; task-allow may
+//       still override depending on step 5.
+//  5. Active task scope's ALLOW rules → ALLOW.
+//     - Task-allow match → ALLOW.
+//     - With a task active and no task-allow match:
+//         * Global ALLOW matched in step 4 → ALLOW (the global
+//           baseline still blessed this; the task didn't reject it).
+//         * Otherwise → DENY out-of-task-scope (the agent's positive
+//           declaration IS the allowlist when a task is active).
+//  6. No task active + no rule matched → default-policy fall-through.
+//
+// Per [[creates-never-mutates]]: this function NEVER mutates state.
+// All side effects (audit write) live in evaluateAndAudit.
+//
+// Per the audit-cadence self-check: the order above is the SINGLE
+// authoritative document. Any future slice that re-orders steps MUST
+// update this comment + add a regression test that proves the new
+// order against the BB+WB scenarios in proxy_test.go.
+func (s *Server) decide(ps *parser.ParsedStatement) Decision {
+	// Step 1+2: profile gates. D-Slice 7 placeholder. When wired,
+	// profile-deny short-circuits with Source=SourceProfile (verdict
+	// DENY); profile-allow falls through. The placeholder is documented
+	// rather than wired so D-Slice 7's diff is purely additive.
+
+	// Build the rules-package view of the statement. Symmetric to
+	// kbounce's ruleReq construction (kept distinct from
+	// parser.ParsedStatement so the rule engine has no parser-pkg
+	// dependency).
+	stmtView := &dbrules.ParsedStatement{
+		StatementType:    ps.StatementType,
+		TablesTouched:    ps.TablesTouched,
+		FunctionsCalled:  ps.FunctionsCalled,
+		IsDML:            ps.IsDML,
+		IsDDL:            ps.IsDDL,
+		HasMutatingNode:  ps.HasMutatingNode,
+		IsExplain:        ps.IsExplain,
+		IsExplainAnalyze: ps.IsExplainAnalyze,
+	}
+
+	// Step 3 setup: load the active task (if any). Read failure is
+	// logged + treated as "no active task" so a transient SQLite hiccup
+	// doesn't crash the proxy. Same policy as kbounce + ibounce.
+	var activeTask *tasks.Scope
+	if s.store != nil {
+		at, terr := s.store.GetActiveTask("")
+		if terr != nil {
+			BumpLookupErrors()
+			log.Warn().Err(terr).Msg("dbounce: active-task lookup failed")
+		} else {
+			activeTask = at
+		}
+	}
+
+	// Step 3: task-explicit-deny short-circuits with DENY.
+	if activeTask != nil {
+		if td := activeTask.DenyRuleSet().Evaluate(stmtView); td != nil {
+			return Decision{
+				Verdict: VerdictDeny,
+				Reason: fmt.Sprintf(
+					"task-explicit-deny (task %s, pattern %q)",
+					activeTask.TaskID, td.Rule.Pattern),
+				Source: SourceTaskDeny,
+				TaskID: activeTask.TaskID,
+			}
+		}
+	}
+
+	// Step 4: global rules from the rules table. Loaded fresh per
+	// decision in D-Slice 3 (small table; if it grows we'll add an
+	// in-memory cache invalidated by a config-event hook).
+	var ruleSet *dbrules.RuleSet
+	if s.store != nil {
+		rs, rerr := s.store.LoadRuleSet()
+		if rerr != nil {
+			BumpLookupErrors()
+			log.Warn().Err(rerr).Msg("dbounce: load ruleset failed")
+		} else {
+			ruleSet = rs
+		}
+	}
+	var globalMatch *dbrules.EvalResult
+	if ruleSet != nil {
+		globalMatch = ruleSet.Evaluate(stmtView)
+	}
+	if globalMatch != nil && globalMatch.Effect == dbrules.EffectDeny {
+		return Decision{
+			Verdict: VerdictDeny,
+			Reason: fmt.Sprintf(
+				"explicit-deny rule (pattern %q)", globalMatch.Rule.Pattern),
+			Source: SourceGlobalDeny,
+			TaskID: taskIDOrEmpty(activeTask),
+		}
+	}
+
+	// Step 5: task-allow (when a task is active).
+	if activeTask != nil {
+		if ta := activeTask.AllowRuleSet().Evaluate(stmtView); ta != nil && ta.Effect == dbrules.EffectAllow {
+			return Decision{
+				Verdict: VerdictAllow,
+				Reason: fmt.Sprintf(
+					"task-allow rule (task %s, pattern %q)",
+					activeTask.TaskID, ta.Rule.Pattern),
+				Source: SourceTaskAllow,
+				TaskID: activeTask.TaskID,
+			}
+		}
+		// With a task active and no task-allow match: global-allow can
+		// still let infrastructure calls through (per kbounce + Python
+		// decisions.py composition). Otherwise it's out-of-task-scope.
+		if globalMatch != nil && globalMatch.Effect == dbrules.EffectAllow {
+			return Decision{
+				Verdict: VerdictAllow,
+				Reason: fmt.Sprintf(
+					"explicit-allow rule (global, pattern %q; not declared in task %s)",
+					globalMatch.Rule.Pattern, activeTask.TaskID),
+				Source: SourceGlobalAllow,
+				TaskID: activeTask.TaskID,
+			}
+		}
+		return Decision{
+			Verdict: VerdictDeny,
+			Reason: fmt.Sprintf(
+				"out-of-task-scope (task %s active; unmatched by task allow rules)",
+				activeTask.TaskID),
+			Source: SourceTaskDeny,
+			TaskID: activeTask.TaskID,
+		}
+	}
+
+	// No active task: a global explicit-allow stands if it matched.
+	if globalMatch != nil && globalMatch.Effect == dbrules.EffectAllow {
+		return Decision{
+			Verdict: VerdictAllow,
+			Reason: fmt.Sprintf(
+				"explicit-allow rule (pattern %q)", globalMatch.Rule.Pattern),
+			Source: SourceGlobalAllow,
+		}
+	}
+
+	// Step 6: default-policy fall-through.
+	verdict := VerdictAllow
+	reason := "default policy: allow (no rule matched)"
+	if s.cfg.DefaultPolicy == DefaultPolicyDeny {
+		verdict = VerdictDeny
+		reason = "default policy: deny (no rule matched)"
+	}
+	return Decision{
+		Verdict: verdict,
+		Reason:  reason,
+		Source:  SourceDefault,
+	}
+}
+
+// taskIDOrEmpty returns the active task id or "" when nil. Tiny helper
+// to keep the decide() short-circuits readable.
+func taskIDOrEmpty(at *tasks.Scope) string {
+	if at == nil {
+		return ""
+	}
+	return at.TaskID
 }
 
 // healthz responds 200 with a small JSON liveness payload. Bypasses
@@ -438,8 +610,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // EnsureLogger applies a minimal zerolog config when the caller has
-// not set one. CLI calls this at startup so library users (tests) get
-// plain JSON logs without configuring the logger themselves.
+// not set one.
 func EnsureLogger() {
 	zerolog.TimeFieldFormat = time.RFC3339
 	level := zerolog.InfoLevel
@@ -451,9 +622,7 @@ func EnsureLogger() {
 	zerolog.SetGlobalLevel(level)
 }
 
-// ParseMode parses a CLI flag value into a Mode, returning an error
-// for unknown values. Kept here so cmd/ doesn't have to repeat the
-// validation.
+// ParseMode parses a CLI flag value into a Mode.
 func ParseMode(s string) (Mode, error) {
 	m := Mode(s)
 	if m.IsValid() {
@@ -462,8 +631,7 @@ func ParseMode(s string) (Mode, error) {
 	return "", fmt.Errorf("dbounce: unknown mode %q (want cooperative | transparent)", s)
 }
 
-// ParseDefaultPolicy parses a CLI flag value into a DefaultPolicy,
-// returning an error for unknown values.
+// ParseDefaultPolicy parses a CLI flag value into a DefaultPolicy.
 func ParseDefaultPolicy(s string) (DefaultPolicy, error) {
 	p := DefaultPolicy(s)
 	if p.IsValid() {
@@ -472,8 +640,7 @@ func ParseDefaultPolicy(s string) (DefaultPolicy, error) {
 	return "", fmt.Errorf("dbounce: unknown default-policy %q (want allow | deny)", s)
 }
 
-// ParseDialect parses a CLI flag value into a Dialect, returning an
-// error for unknown values. D-Slice 1 accepts only postgres.
+// ParseDialect parses a CLI flag value into a Dialect.
 func ParseDialect(s string) (Dialect, error) {
 	d := Dialect(s)
 	if d.IsValid() {
@@ -487,7 +654,6 @@ func ParseDialect(s string) (Dialect, error) {
 // ---------------------------------------------------------------------------
 
 const (
-	// Frontend message type bytes per the PG protocol.
 	msgQuery     byte = 'Q'
 	msgParse     byte = 'P'
 	msgBind      byte = 'B'
@@ -499,16 +665,7 @@ const (
 	msgTerminate byte = 'X'
 )
 
-// pgHandshake reads the StartupMessage / SSLRequest and writes the
-// minimum-viable startup response so a libpq client transitions into
-// the command loop.
-//
-// D-Slice 1 always answers AuthenticationOk (we don't dial an upstream
-// to check credentials; that's D-Slice 2). This is safe because the
-// listener defaults to 127.0.0.1 (per the loopback guard in the CLI).
 func pgHandshake(conn net.Conn) error {
-	// First 4 bytes = total length (BE int32). Next 4 bytes = protocol
-	// version OR SSLRequest magic (80877103).
 	hdr := make([]byte, 8)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
 		return fmt.Errorf("read startup header: %w", err)
@@ -516,14 +673,10 @@ func pgHandshake(conn net.Conn) error {
 	length := binary.BigEndian.Uint32(hdr[0:4])
 	magic := binary.BigEndian.Uint32(hdr[4:8])
 
-	// SSLRequest = 80877103. D-Slice 1 doesn't speak TLS yet; respond
-	// 'N' (no SSL) per the protocol and let the client decide whether
-	// to continue in plaintext.
 	if magic == 80877103 {
 		if _, err := conn.Write([]byte{'N'}); err != nil {
 			return fmt.Errorf("write SSL-no: %w", err)
 		}
-		// After 'N' the client sends a fresh StartupMessage.
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return fmt.Errorf("read second startup header: %w", err)
 		}
@@ -531,7 +684,6 @@ func pgHandshake(conn net.Conn) error {
 		magic = binary.BigEndian.Uint32(hdr[4:8])
 	}
 
-	// GSSENCRequest = 80877104. Same treatment as SSLRequest.
 	if magic == 80877104 {
 		if _, err := conn.Write([]byte{'N'}); err != nil {
 			return fmt.Errorf("write GSS-no: %w", err)
@@ -543,15 +695,10 @@ func pgHandshake(conn net.Conn) error {
 		magic = binary.BigEndian.Uint32(hdr[4:8])
 	}
 
-	// CancelRequest = 80877102. Operator pressed Ctrl+C in psql. We
-	// don't have a backend session to cancel in D-Slice 1; close.
 	if magic == 80877102 {
 		return errors.New("CancelRequest received; nothing to cancel in D-Slice 1")
 	}
 
-	// Now `length` is the StartupMessage length INCLUDING the 4-byte
-	// length prefix; magic is the protocol-version int32. Read the
-	// rest of the body (length - 8 bytes already consumed).
 	if length < 8 || length > 1<<20 {
 		return fmt.Errorf("implausible startup length: %d", length)
 	}
@@ -559,30 +706,22 @@ func pgHandshake(conn net.Conn) error {
 	if _, err := io.ReadFull(conn, body); err != nil {
 		return fmt.Errorf("read startup body: %w", err)
 	}
-	// We ignore the parameter pairs in D-Slice 1.
 
-	// Write AuthenticationOk (R, length 8, code 0).
 	if err := writeMessage(conn, 'R', []byte{0, 0, 0, 0}); err != nil {
 		return err
 	}
-	// Write a minimal BackendKeyData (K, length 12, pid + secret) so
-	// libpq clients have something to track.
 	bkd := make([]byte, 8)
-	binary.BigEndian.PutUint32(bkd[0:4], 1) // pid
-	binary.BigEndian.PutUint32(bkd[4:8], 0) // secret
+	binary.BigEndian.PutUint32(bkd[0:4], 1)
+	binary.BigEndian.PutUint32(bkd[4:8], 0)
 	if err := writeMessage(conn, 'K', bkd); err != nil {
 		return err
 	}
-	// ReadyForQuery (Z, length 5, status 'I' = idle).
 	if err := writeMessage(conn, 'Z', []byte{'I'}); err != nil {
 		return err
 	}
 	return nil
 }
 
-// readPGMessage reads a single non-startup wire-protocol message.
-// Returns the message type byte + the payload (without the 4-byte
-// length prefix).
 func readPGMessage(conn net.Conn) (byte, []byte, error) {
 	hdr := make([]byte, 5)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
@@ -591,9 +730,6 @@ func readPGMessage(conn net.Conn) (byte, []byte, error) {
 	msgType := hdr[0]
 	length := binary.BigEndian.Uint32(hdr[1:5])
 	if length < 4 || length > 16<<20 {
-		// Per the audit-cadence self-check: malformed length bytes
-		// MUST NOT panic. Return an error; the caller closes the
-		// connection cleanly.
 		return 0, nil, fmt.Errorf("implausible message length: %d", length)
 	}
 	payload := make([]byte, length-4)
@@ -605,7 +741,6 @@ func readPGMessage(conn net.Conn) (byte, []byte, error) {
 	return msgType, payload, nil
 }
 
-// writeMessage writes a single non-startup wire-protocol message.
 func writeMessage(conn net.Conn, msgType byte, payload []byte) error {
 	hdr := make([]byte, 5)
 	hdr[0] = msgType
@@ -638,9 +773,6 @@ func writeCommandComplete(conn net.Conn, tag string) error {
 	return writeMessage(conn, 'C', payload)
 }
 
-// readCString reads bytes up to the first NUL byte from b and returns
-// them as a string. Returns the entire buffer when no NUL is present
-// (malformed messages — caller decides what to do).
 func readCString(b []byte) string {
 	for i, c := range b {
 		if c == 0 {
@@ -650,9 +782,6 @@ func readCString(b []byte) string {
 	return string(b)
 }
 
-// firstNullPlus1 returns the index after the first NUL byte in b, or
-// len(b) when no NUL is present. Used to skip past the statement-name
-// field in Parse messages.
 func firstNullPlus1(b []byte) int {
 	for i, c := range b {
 		if c == 0 {
@@ -666,12 +795,8 @@ func firstNullPlus1(b []byte) int {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-// writeJSON is a tiny wrapper so /healthz doesn't directly depend on
-// encoding/json — keeps the JSON encoder swappable should we ever want
-// to do batched-flush output in a later slice.
 func writeJSON(w io.Writer, v any) error {
 	return jsonEncode(w, v)
 }
 
-// lookupEnv is a tiny wrapper to keep `os` import contained.
 func lookupEnv(key string) string { return osLookupEnv(key) }

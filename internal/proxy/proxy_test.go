@@ -29,13 +29,17 @@ func startTestServer(t *testing.T) (*Server, string, string, *store.Store) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := Config{
-		Host:        "127.0.0.1",
-		Port:        0, // any
-		MgmtHost:    "127.0.0.1",
-		MgmtPort:    0,
-		Mode:        ModeCooperative,
-		Dialect:     DialectPostgres,
-		IdleTimeout: 5 * time.Second,
+		Host:     "127.0.0.1",
+		Port:     0, // any
+		MgmtHost: "127.0.0.1",
+		MgmtPort: 0,
+		Mode:     ModeCooperative,
+		Dialect:  DialectPostgres,
+		// Default-allow keeps the wire-protocol smoke tests focused on
+		// transport correctness; D-Slice 3's composition-order tests
+		// drive the rule engine via in-process decide() calls instead.
+		DefaultPolicy: DefaultPolicyAllow,
+		IdleTimeout:   5 * time.Second,
 	}.Normalize()
 	// Replace port 0 sentinels (Normalize would set defaults). We use
 	// net.Listen directly via the Server.Serve path, but that picks
@@ -181,7 +185,10 @@ func TestWireProtocol_HandshakeAndQuery(t *testing.T) {
 	assert.Equal(t, "ALLOW", rows[0].DecisionVerdict)
 	assert.Equal(t, "cooperative", rows[0].ModeAtDecision)
 	assert.False(t, rows[0].Enforced,
-		"D-Slice 1 must NEVER enforce — observation-only invariant")
+		"cooperative mode must NEVER enforce — advisory-only invariant")
+	// D-Slice 3 source tagging: with no rules + default-allow, the
+	// verdict comes from the default-policy fall-through.
+	assert.Equal(t, SourceDefault, rows[0].DecisionSource)
 }
 
 func TestWireProtocol_MultipleQueries(t *testing.T) {
