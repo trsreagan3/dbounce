@@ -1,0 +1,149 @@
+# dbounce — BigQuery rule pack (D-Slice 6)
+#
+# This pack seeds the default rules a dbounce deployment running with
+# the BigQuery JDBC-driver-shim (or the google-cloud-bigquery client
+# wrapper) starts with. BigQuery's "wire protocol" is the REST/gRPC API
+# behind google-cloud-bigquery, so dbounce does NOT ship a native
+# wire-protocol proxy in v1.0 — the customer wraps their BigQuery
+# client with a shim that calls `dbounce decide` (or the
+# dbounce_decide MCP tool) before each query. See
+# docs/SHIM-INTEGRATION.md.
+#
+# Per [[scorer-is-ground-truth]]: this pack ships
+# calibration_status: experimental — BigQuery doesn't have the same
+# eval-corpus depth as the PG/MySQL packs and the underlying parser
+# (xwb1989 + BigQuery keyword pre-checks) is best-effort. Operators
+# SHOULD review every rule before relying on this pack in transparent
+# mode. Cooperative-mode (advisory) deployment is the safe starting
+# point.
+#
+# Per [[v1-scope-bar]]: shipping BigQuery support at v1.0 closes the
+# founder-locked "4 dialects in v1.0" scope.
+
+metadata:
+  dialect: bigquery
+  version: 0.1.0
+  calibration_status: experimental
+  source: dbounce-internal
+  notes: |
+    First-pass BigQuery rule pack. Verb coverage matches the
+    bigquery.go parser's pre-check labels (D-Slice 6) plus the
+    xwb1989 AST shapes shared with the MySQL parser. The CREATE MODEL
+    / EXPORT DATA / __TABLES__ enumeration denies are the load-
+    bearing protections; everything else is a sensible default
+    operators are expected to tune.
+
+rules:
+  # ---------- READS ----------
+
+  - pattern: "SELECT:*"
+    effect: allow
+    origin: preset
+    note: "Reads are the largest share of BigQuery traffic; allow by default."
+
+  - pattern: "SHOW:*"
+    effect: allow
+    origin: preset
+    note: "SHOW TABLES / SHOW SCHEMAS are informational."
+
+  - pattern: "EXPLAIN:*"
+    effect: allow
+    origin: preset
+    note: "EXPLAIN alone does NOT execute; allow."
+
+  # ---------- TRANSACTIONS ----------
+
+  - pattern: "TRANSACTION:*"
+    effect: allow
+    origin: preset
+    note: "BEGIN TRANSACTION / COMMIT / ROLLBACK — session-state only."
+
+  # ---------- WRITES (allowed by default; narrow via task scope) ----------
+
+  - pattern: "INSERT:*"
+    effect: allow
+    origin: preset
+    note: "INSERT is the common write — allow."
+
+  - pattern: "UPDATE:*"
+    effect: allow
+    origin: preset
+    note: "UPDATE allowed by default."
+
+  - pattern: "DELETE:*"
+    effect: allow
+    origin: preset
+    note: "DELETE allowed by default."
+
+  - pattern: "MERGE:*"
+    effect: allow
+    origin: preset
+    note: |
+      MERGE allowed by default. BigQuery's MERGE is a single-statement
+      upsert; the parser flags it with MutatingNodeType=MERGE-INTO so
+      audit reviewers can distinguish from INSERT/UPDATE.
+
+  # ---------- HARD DENIES ----------
+
+  # EXPORT DATA / LOAD DATA — the canonical BigQuery bulk-transfer
+  # shapes. EXPORT DATA is the exfil direction (table → GCS); LOAD DATA
+  # is the ingest direction (GCS → table). Both are gated together
+  # under StmtCopy / StmtLoad.
+  - pattern: "COPY:*"
+    effect: deny
+    origin: preset
+    note: |
+      EXPORT DATA is BigQuery's bulk-export verb (table → GCS bucket).
+      The canonical exfil shape; the rule pack denies by default.
+      Operators who genuinely need export-to-GCS open a task-scoped
+      allow with a narrow uri predicate.
+
+  - pattern: "LOAD:*"
+    effect: deny
+    origin: preset
+    note: |
+      LOAD DATA is BigQuery's bulk-ingest verb (GCS → table). Block
+      by default; admins who need bulk load open a task-scoped allow
+      with the destination table + source URI scoped.
+
+  # ---------- DDL ----------
+
+  - pattern: "DDL:*"
+    effect: deny
+    origin: preset
+    note: |
+      CREATE / ALTER / DROP / RENAME require an explicit task-scoped
+      allow. CREATE MODEL (BQ ML) is included in this deny — model
+      creation is billing-affecting + creates artifacts with their
+      own downstream access semantics.
+
+  # ---------- AUDIT-INFRA + ENUMERATION PROTECTION ----------
+
+  # SELECT * FROM `project.dataset.__TABLES__` — enumerates every
+  # table in a dataset. Adversaries use this to map a tenant's
+  # schema before targeting individual tables. The rule pack denies
+  # by default in non-dev profiles. In dev profiles, operators can
+  # override via a task-scoped allow OR add a profile-level
+  # exempt_resources entry per [[bouncer-default-profile-pattern]].
+  - pattern: "SELECT:*"
+    effect: deny
+    table_scope: "*.__tables__"
+    origin: preset
+    note: |
+      __TABLES__ is BigQuery's per-dataset enumeration view.
+      Adversaries SELECT * from it to map a tenant's schema. Deny
+      by default; legitimate enumeration goes through the BigQuery
+      Information Schema (INFORMATION_SCHEMA.TABLES) which has its
+      own access controls.
+
+  # Audit-log exfil — INFORMATION_SCHEMA.JOBS / JOBS_BY_PROJECT carry
+  # the query history. Reading + exfiltrating these is an enumeration
+  # shape adversaries use to map who-ran-what.
+  - pattern: "SELECT:*"
+    effect: deny
+    table_scope: "information_schema.jobs*"
+    origin: preset
+    note: |
+      INFORMATION_SCHEMA.JOBS / JOBS_BY_PROJECT carry BigQuery's
+      query history. Require a task-scoped allow with a narrow
+      time-window predicate; bulk enumeration is denied by default.

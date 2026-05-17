@@ -70,20 +70,38 @@ func (p DefaultPolicy) IsValid() bool {
 
 // Dialect names a SQL wire protocol.
 //
-//   - postgres (D-Slice 1) — PG wire-protocol listener + libpg_query parser.
-//   - mysql    (D-Slice 5) — MySQL wire-protocol listener + xwb1989/sqlparser.
+//   - postgres  (D-Slice 1) — PG wire-protocol listener + libpg_query parser.
+//   - mysql     (D-Slice 5) — MySQL wire-protocol listener + xwb1989/sqlparser.
+//   - snowflake (D-Slice 6) — JDBC-driver-shim only (no wire-protocol proxy
+//     in v1.0); parser uses xwb1989/sqlparser with Snowflake keyword
+//     extensions. calibration_status: experimental — see
+//     docs/SHIM-INTEGRATION.md for the honest trade-offs.
+//   - bigquery  (D-Slice 6) — JDBC-driver-shim only (no wire-protocol proxy
+//     in v1.0); parser uses xwb1989/sqlparser with BigQuery keyword
+//     extensions. calibration_status: experimental — see
+//     docs/SHIM-INTEGRATION.md for the honest trade-offs.
 //
-// D-Slice 6 adds snowflake + bigquery.
+// Per [[v1-scope-bar]] + [[scorer-is-ground-truth]]: shipping snowflake +
+// bigquery via the shim path (vs the PG/MySQL native wire-protocol path)
+// is a deliberate honest trade-off — the customer's app MUST cooperate
+// with the shim; an adversarial client that calls the underlying driver
+// directly bypasses dbounce entirely. The CLI's `dbounce run --dialect
+// snowflake|bigquery` fails fast pointing at docs/SHIM-INTEGRATION.md;
+// the supported invocation path for these dialects is `dbounce decide`
+// (or the dbounce_decide MCP tool) called from a shim wrapper.
 type Dialect string
 
 const (
-	DialectPostgres Dialect = "postgres"
-	DialectMySQL    Dialect = "mysql"
+	DialectPostgres  Dialect = "postgres"
+	DialectMySQL     Dialect = "mysql"
+	DialectSnowflake Dialect = "snowflake"
+	DialectBigQuery  Dialect = "bigquery"
 )
 
 // IsValid reports whether d is one of the recognized values.
 func (d Dialect) IsValid() bool {
-	return d == DialectPostgres || d == DialectMySQL
+	return d == DialectPostgres || d == DialectMySQL ||
+		d == DialectSnowflake || d == DialectBigQuery
 }
 
 // Verdict names dbounce's gating outcome on a single statement.
@@ -897,8 +915,7 @@ func ParseDialect(s string) (Dialect, error) {
 	if d.IsValid() {
 		return d, nil
 	}
-	return "", fmt.Errorf("dbounce: unknown dialect %q (want %q or %q)",
-		s, DialectPostgres, DialectMySQL)
+	return "", fmt.Errorf("dbounce: unknown dialect %q (want postgres, mysql, snowflake, or bigquery)", s)
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,18 @@ const (
 	DialectPostgres = "postgres"
 	// DialectMySQL routes Parse() through xwb1989/sqlparser (D-Slice 5).
 	DialectMySQL = "mysql"
+	// DialectSnowflake routes Parse() through the xwb1989/sqlparser-based
+	// Snowflake parser (D-Slice 6). Best-effort: Snowflake's grammar
+	// extends MySQL-ish SQL with VARIANT / OBJECT_INSERT / STAGE /
+	// WAREHOUSE / COPY INTO / PUT verbs. Per [[scorer-is-ground-truth]]:
+	// the Snowflake rule pack ships calibration_status: experimental.
+	DialectSnowflake = "snowflake"
+	// DialectBigQuery routes Parse() through the xwb1989/sqlparser-based
+	// BigQuery parser (D-Slice 6). Best-effort: BigQuery's grammar
+	// extends SQL with CREATE MODEL / EXPORT DATA / FOR SYSTEM_TIME AS OF
+	// + the __TABLES__ enumeration shape. Per [[scorer-is-ground-truth]]:
+	// the BigQuery rule pack ships calibration_status: experimental.
+	DialectBigQuery = "bigquery"
 )
 
 // Statement-type constants. Surfaced into ParsedStatement.StatementType
@@ -144,14 +156,18 @@ func Parse(dialect, raw string) *ParsedStatement {
 		return parsePostgres(raw)
 	case DialectMySQL:
 		return parseMySQL(raw)
+	case DialectSnowflake:
+		return parseSnowflake(raw)
+	case DialectBigQuery:
+		return parseBigQuery(raw)
 	default:
 		return &ParsedStatement{
 			Raw:           raw,
 			Dialect:       dialect,
 			StatementType: StmtUnparseable,
 			ParseErrors: []string{fmt.Sprintf(
-				"dbounce parser: unknown dialect %q (want %q or %q)",
-				dialect, DialectPostgres, DialectMySQL)},
+				"dbounce parser: unknown dialect %q (want postgres, mysql, snowflake, or bigquery)",
+				dialect)},
 		}
 	}
 }

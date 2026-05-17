@@ -120,6 +120,12 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPromptsCmd(writer))
 	root.AddCommand(newPresetsCmd(writer))
 	root.AddCommand(newRulesCmd(writer))
+	// D-Slice 6: dry-run SQL through the rule engine without starting
+	// a wire-protocol listener. The supported invocation path for
+	// Snowflake + BigQuery (which ship via the JDBC-driver-shim per
+	// [[dbounce-build-plan]] §D-Slice 6); also works for postgres +
+	// mysql so the shim pattern is dialect-uniform.
+	root.AddCommand(newDecideCmd())
 	return root
 }
 
@@ -361,6 +367,26 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				return err
 			}
 
+			// D-Slice 6 guard: snowflake + bigquery ship via the JDBC-
+			// driver-shim, NOT via a wire-protocol proxy. `dbounce run`
+			// binds a TCP listener that speaks PG or MySQL wire protocol;
+			// there is no such listener for Snowflake/BigQuery in v1.0
+			// because their wire protocols are HTTPS-based + closed-spec
+			// per [[dbounce-build-plan]] §D-Slice 6 + [[v1-scope-bar]].
+			// Fail fast here pointing the operator at the supported
+			// invocation path (`dbounce decide` + the dbounce_decide MCP
+			// tool) so we don't silently start a TCP listener that the
+			// customer's Snowflake driver will never connect to.
+			if dialect == proxy.DialectSnowflake || dialect == proxy.DialectBigQuery {
+				return fmt.Errorf(
+					"dbounce run --dialect %s is not supported (no wire-protocol "+
+						"proxy for these dialects in v1.0; use the JDBC-shim "+
+						"approach — see docs/SHIM-INTEGRATION.md). The supported "+
+						"invocation path is `dbounce decide --dialect %s` (or the "+
+						"dbounce_decide MCP tool) called from a shim wrapper.",
+					dialect, dialect)
+			}
+
 			// D-Slice 5 → 4 cross-slice guard: MySQL listener TLS not
 			// shipped yet (per dbounce-build-plan §D-Slice 5). Fail-fast
 			// here rather than silently accepting flags that won't take
@@ -597,10 +623,13 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"allow | deny. What transparent mode does when no rule matches. "+
 			"Scaffolding for D-Slice 3 (no rule engine yet).")
 	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
-		"SQL wire-protocol dialect: postgres (default) | mysql. "+
-			"D-Slice 5 ships mysql via xwb1989/sqlparser + a MySQL wire-"+
-			"protocol listener (auth pass-through; COM_QUERY gating; "+
-			"prepared statements + listener TLS deferred to post-launch).")
+		"SQL wire-protocol dialect: postgres (default) | mysql | snowflake | bigquery. "+
+			"postgres + mysql ship native wire-protocol proxies; snowflake + "+
+			"bigquery ship as JDBC-driver-shim only (no wire-protocol proxy "+
+			"in v1.0 — `dbounce run --dialect snowflake|bigquery` fails fast "+
+			"pointing at docs/SHIM-INTEGRATION.md, which describes the "+
+			"shim-wrapping pattern that delivers `dbounce decide` calls to "+
+			"the parser + rule engine for these dialects).")
 	cmd.Flags().StringVar(&upstreamURL, "upstream", "",
 		"Upstream DB URL (e.g. postgres://user@host:5432/db). When set, "+
 			"dbounce dials this on every inbound session + forwards SCRAM "+
