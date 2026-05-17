@@ -231,6 +231,51 @@ func TestMySQL_LoadXML(t *testing.T) {
 	assert.Contains(t, ps.TablesTouched, "products")
 }
 
+// CRIT-D8-01 regression — comment-prefix bypass. Every shape below was
+// exploitable before stripcomments.go landed: the trimmed prefix on raw
+// bytes missed because the byte at position 0 was `/` or `-` not `L`.
+// AUDIT-WB-DSLICES-1-8.md §CRIT-D8-01 has the full reproduction.
+
+func TestMySQL_LoadDataInfile_BlockCommentPrefix(t *testing.T) {
+	ps := myParse(`/* */ LOAD DATA INFILE '/tmp/x' INTO TABLE secrets`)
+	assert.Equal(t, StmtLoad, ps.StatementType,
+		"leading /* */ block comment MUST NOT hide LOAD DATA from the prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, mysqlMutatingLoadDataInfile, ps.MutatingNodeType)
+	assert.Contains(t, ps.TablesTouched, "secrets")
+}
+
+func TestMySQL_LoadDataInfile_LineCommentPrefix(t *testing.T) {
+	ps := myParse("-- attacker injected\nLOAD DATA INFILE '/tmp/x' INTO TABLE secrets")
+	assert.Equal(t, StmtLoad, ps.StatementType,
+		"leading -- comment MUST NOT hide LOAD DATA from the prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Contains(t, ps.TablesTouched, "secrets")
+}
+
+func TestMySQL_LoadDataInfile_NestedBlockCommentPrefix(t *testing.T) {
+	ps := myParse(`/*outer /*inner*/ outer*/ LOAD DATA INFILE '/tmp/x' INTO TABLE u`)
+	assert.Equal(t, StmtLoad, ps.StatementType,
+		"nested block comments MUST be stripped fully before the prefix check")
+	assert.True(t, ps.HasMutatingNode)
+}
+
+func TestMySQL_LoadDataInfile_CaseInsensitivePrefix(t *testing.T) {
+	ps := myParse(`/* x */ lOaD DaTa InFiLe '/tmp/x' INTO TABLE u`)
+	assert.Equal(t, StmtLoad, ps.StatementType,
+		"case-insensitive prefix MUST match after comment-strip + ToUpper")
+	assert.True(t, ps.HasMutatingNode)
+}
+
+func TestMySQL_LiteralLooksLikeCommentNotStripped(t *testing.T) {
+	// String literal CONTAINING a comment-shaped substring MUST NOT be
+	// confused with an actual comment. This SELECT must classify as
+	// SELECT, not get falsely flagged as a LOAD.
+	ps := myParse(`SELECT '/* not a comment */ LOAD DATA' FROM t`)
+	assert.Equal(t, StmtSelect, ps.StatementType,
+		"comment markers inside a string literal MUST NOT trigger the LOAD prefix")
+}
+
 // Transactions.
 
 func TestMySQL_Begin(t *testing.T) {

@@ -105,13 +105,23 @@ func parseSnowflake(raw string) *ParsedStatement {
 		out.StatementType = StmtUnknown
 		return out
 	}
-	upper := strings.ToUpper(trimmed)
+
+	// CRIT-D8-02 closure: strip SQL comments BEFORE the prefix test.
+	// `/* */ EXPORT DATA ...` / `/* */ COPY INTO @stage ...` are exfil
+	// shapes Snowflake accepts; the bare HasPrefix scan misses them
+	// because the byte at position 0 is `/`, not the verb. See
+	// stripcomments.go + AUDIT-WB-DSLICES-1-8.md for the full
+	// reproduction. The stripped form is used for both the upper-case
+	// prefix test AND the per-extension extractors (so an
+	// `INTO TABLE fake` hidden inside a comment can't fool them).
+	stripped := strings.TrimSpace(stripSQLComments(trimmed))
+	upper := strings.ToUpper(stripped)
 
 	// Snowflake-specific keyword pre-checks. These run BEFORE we hand
 	// bytes to xwb1989 because xwb1989's grammar doesn't recognize
 	// these as top-level statements. Order matters: more-specific
 	// prefixes first.
-	if handled := classifySnowflakeExtension(upper, trimmed, out); handled {
+	if handled := classifySnowflakeExtension(upper, stripped, out); handled {
 		return out
 	}
 

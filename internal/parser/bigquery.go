@@ -81,13 +81,23 @@ func parseBigQuery(raw string) *ParsedStatement {
 		out.StatementType = StmtUnknown
 		return out
 	}
-	upper := strings.ToUpper(trimmed)
+
+	// CRIT-D8-02 closure: strip SQL comments BEFORE the prefix test.
+	// `/* */ EXPORT DATA OPTIONS(...) AS SELECT ...` is the canonical
+	// BigQuery exfil shape BigQuery accepts; the bare HasPrefix scan
+	// misses it because the byte at position 0 is `/`, not the verb.
+	// See stripcomments.go + AUDIT-WB-DSLICES-1-8.md. The stripped
+	// form is used for both the upper-case prefix test AND the per-
+	// extension extractors (so an `INTO fake` hidden inside a comment
+	// can't fool them).
+	stripped := strings.TrimSpace(stripSQLComments(trimmed))
+	upper := strings.ToUpper(stripped)
 
 	// BigQuery-specific keyword pre-checks. These run BEFORE we hand
 	// bytes to xwb1989 because xwb1989's grammar doesn't recognize
 	// these as top-level statements. Order matters: more-specific
 	// prefixes first.
-	if handled := classifyBigQueryExtension(upper, trimmed, out); handled {
+	if handled := classifyBigQueryExtension(upper, stripped, out); handled {
 		return out
 	}
 

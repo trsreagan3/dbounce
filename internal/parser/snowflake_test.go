@@ -198,3 +198,59 @@ func TestSnowflake_PutSurvivesEvenWhenXWBDoesNot(t *testing.T) {
 	assert.NotEqual(t, StmtUnparseable, ps.StatementType,
 		"PUT pre-check MUST run BEFORE xwb1989 (which doesn't know PUT)")
 }
+
+// CRIT-D8-02 regression — comment-prefix bypass on Snowflake-specific
+// verbs. AUDIT-WB-DSLICES-1-8.md §CRIT-D8-02 has the full reproduction:
+// a `/* */ COPY INTO @stage ...` / `/* */ EXPORT ...` / `/* */ PUT ...`
+// would fall through to xwb1989 (which doesn't model these) and get
+// classified as StmtUnparseable instead of triggering the
+// COPY-INTO-STAGE / PUT / GRANT mutating-node-type rules.
+
+func TestSnowflake_CopyIntoStage_BlockCommentPrefix(t *testing.T) {
+	ps := sfParse(`/* x */ COPY INTO @exfil_stage FROM sales.customer_data`)
+	assert.Equal(t, StmtCopy, ps.StatementType,
+		"leading /* */ block comment MUST NOT hide COPY INTO @stage from the prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, snowflakeMutatingCopyIntoStage, ps.MutatingNodeType)
+	assert.Contains(t, ps.TablesTouched, "sales.customer_data")
+}
+
+func TestSnowflake_Put_LineCommentPrefix(t *testing.T) {
+	ps := sfParse("-- attacker injected\nPUT file:///tmp/data.csv @my_stage")
+	assert.Equal(t, StmtCopy, ps.StatementType,
+		"leading -- comment MUST NOT hide PUT from the prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, snowflakeMutatingPut, ps.MutatingNodeType)
+}
+
+func TestSnowflake_Grant_NestedBlockCommentPrefix(t *testing.T) {
+	ps := sfParse(`/*outer /*inner*/ outer*/ GRANT SELECT ON TABLE sales.x TO ROLE analyst`)
+	assert.Equal(t, StmtDDL, ps.StatementType,
+		"nested block comments MUST be stripped fully before the GRANT prefix check")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, snowflakeMutatingGrant, ps.MutatingNodeType)
+}
+
+func TestSnowflake_Undrop_BlockCommentPrefix(t *testing.T) {
+	ps := sfParse(`/* */ UNDROP TABLE sales.customer_data`)
+	assert.Equal(t, StmtDDL, ps.StatementType,
+		"leading /* */ MUST NOT hide UNDROP")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, snowflakeMutatingUndrop, ps.MutatingNodeType)
+}
+
+func TestSnowflake_UseSecondaryRoles_CommentPrefix(t *testing.T) {
+	ps := sfParse(`/*evade*/ USE SECONDARY ROLES ALL`)
+	assert.Equal(t, StmtUse, ps.StatementType,
+		"leading comment MUST NOT hide USE SECONDARY ROLES (privilege escalation)")
+	assert.True(t, ps.HasMutatingNode)
+	assert.Equal(t, snowflakeMutatingUseSecondary, ps.MutatingNodeType)
+}
+
+func TestSnowflake_LiteralLooksLikeCommentNotStripped(t *testing.T) {
+	// String literal containing comment-shaped markers MUST stay a
+	// literal — and the SELECT classification MUST be preserved.
+	ps := sfParse(`SELECT '/* not a comment */ COPY INTO @x' FROM t`)
+	assert.Equal(t, StmtSelect, ps.StatementType,
+		"comment markers inside a string literal MUST NOT trigger any extension prefix")
+}

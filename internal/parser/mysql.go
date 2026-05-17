@@ -68,7 +68,14 @@ func parseMySQL(raw string) *ParsedStatement {
 	// LOAD as a top-level statement, but it's the canonical MySQL exfil
 	// shape and the rule pack MUST be able to match on it. Surface it
 	// explicitly BEFORE we hand bytes to the AST parser.
-	upper := strings.ToUpper(trimmed)
+	//
+	// CRIT-D8-01 closure: strip SQL comments BEFORE the prefix test.
+	// `/* */ LOAD DATA INFILE ...` is a real-world exfil shape MySQL
+	// accepts; the bare HasPrefix scan misses it because the byte at
+	// position 0 is `/`, not `L`. See stripcomments.go for the helper +
+	// AUDIT-WB-DSLICES-1-8.md for the full reproduction.
+	stripped := strings.TrimSpace(stripSQLComments(trimmed))
+	upper := strings.ToUpper(stripped)
 	if strings.HasPrefix(upper, "LOAD DATA") ||
 		strings.HasPrefix(upper, "LOAD XML") ||
 		strings.HasPrefix(upper, "LOAD INDEX") {
@@ -76,7 +83,9 @@ func parseMySQL(raw string) *ParsedStatement {
 		out.HasMutatingNode = true
 		out.MutatingNodeType = mysqlMutatingLoadDataInfile
 		out.IsDML = true
-		out.TablesTouched = mysqlLoadDataInfileTable(trimmed)
+		// Table extraction runs on the stripped form so the "INTO TABLE"
+		// scan isn't fooled by `/* INTO TABLE fake */` inside a comment.
+		out.TablesTouched = mysqlLoadDataInfileTable(stripped)
 		return out
 	}
 
