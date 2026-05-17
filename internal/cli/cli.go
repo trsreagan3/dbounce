@@ -1,0 +1,437 @@
+// Package cli is dbounce's cobra command tree. Both the cmd/dbounce
+// binary and any future packaging shims delegate to cli.Main so the
+// command surface has a single source of truth.
+//
+// D-Slice 1 commands:
+//
+//	dbounce run           start the SQL-wire-protocol listener
+//	dbounce audit tail    show recent decisions from the audit log
+//	dbounce --version     print version + commit + build time
+//
+// Profile / rules / tasks / pause / prompts / presets / mcp / init-tls
+// land in D-Slices 3-8 respectively. The cobra parent commands aren't
+// scaffolded here because cobra would print them in --help and mislead
+// the operator into thinking they're partially-implemented; better to
+// add them at the same time the underlying subcommands ship.
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/rs/zerolog/log"
+	"github.com/spf13/cobra"
+
+	"github.com/trsreagan3/dbounce/internal/proxy"
+	"github.com/trsreagan3/dbounce/internal/store"
+)
+
+// loopbackHosts mirrors kbounce + ibounce's CRIT-32-02 closure:
+// dbounce will hold inbound client SCRAM challenges + bearer tokens
+// once D-Slice 2 lands; binding externally exposes that surface to
+// anyone on the network. Refuse non-loopback bindings unless the
+// operator passed --i-know-this-binds-externally to acknowledge they
+// read the threat model.
+var loopbackHosts = map[string]struct{}{
+	"127.0.0.1":     {},
+	"::1":           {},
+	"localhost":     {},
+	"ip6-localhost": {},
+	"ip6-loopback":  {},
+}
+
+// version is overridden at build time via -ldflags
+// "-X github.com/trsreagan3/dbounce/internal/cli.version=...". Unstamped
+// builds report "dev".
+var version = "dev"
+
+// commit is the git SHA the binary was built from. Set via -ldflags
+// "-X github.com/trsreagan3/dbounce/internal/cli.commit=...". Unset →
+// "none".
+var commit = "none"
+
+// buildTime is the ISO-8601 UTC timestamp the binary was built at.
+// Set via -ldflags
+// "-X github.com/trsreagan3/dbounce/internal/cli.buildTime=...". Unset
+// → "unknown".
+var buildTime = "unknown"
+
+// Main is the package's exported entry point so any binary that wraps
+// dbounce (homebrew shim, distro packager, downstream fork) runs the
+// same code path.
+func Main() {
+	proxy.EnsureLogger()
+	if err := newRootCmd().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// versionString returns the human-readable version surfaced via
+// `dbounce --version`. Format: `dbounce <version> (commit X, built Y)`.
+// Mirrors kbounce + ibounce's UAT-K2 HIGH-K2-06 closure pattern.
+func versionString() string {
+	return fmt.Sprintf("dbounce %s (commit %s, built %s)", version, commit, buildTime)
+}
+
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "dbounce",
+		Short:         "Local SQL gating proxy",
+		Long:          rootLongHelp,
+		Version:       versionString(),
+		SilenceUsage:  true,
+		SilenceErrors: false,
+	}
+	root.SetVersionTemplate("{{.Version}}\n")
+	root.AddCommand(newRunCmd())
+	root.AddCommand(newAuditCmd())
+	return root
+}
+
+const rootLongHelp = `dbounce is a local proxy that sits between a SQL client (psql /
+a coding agent / an analytics tool / a CI job) and the real database.
+It parses every statement, records the decision in an audit log, and
+(in later slices, transparent mode) can deny statements that don't
+match its rule set.
+
+Two operating modes (mirroring kbounce + ibounce):
+
+  cooperative   parse + log every statement (D-Slice 1 default).
+                D-Slice 1 NEVER forwards or blocks — observation only.
+  transparent   DENY verdicts return a SQL error to the client.
+                Real upstream forwarding lands in D-Slice 2.
+
+D-Slice 1 ships:
+  - PostgreSQL wire-protocol listener (observation-only)
+  - AST-aware statement parser (pg_query_go v6)
+  - Decision audit log (~/.dbounce/state.db)
+  - dbounce run, dbounce audit tail, dbounce --version, /healthz
+
+Read-vs-write framing: D-Slice 1 records statement_type (SELECT vs
+INSERT/UPDATE/DELETE/MERGE/DDL/CALL/DO/EXECUTE/WITH-WRITE) for every
+row + flags HasMutatingNode so the D-Slice 7 safe-default profile
+can default to "reads are fine; writes get layered checks" out of
+the gate.`
+
+func newRunCmd() *cobra.Command {
+	var (
+		port              int
+		host              string
+		mgmtHost          string
+		mgmtPort          int
+		modeStr           string
+		defaultPolStr     string
+		dialectStr        string
+		upstream          string
+		dbPath            string
+		forceExternalBind bool
+	)
+	cmd := &cobra.Command{
+		Use:   "run",
+		Short: "Start the SQL wire-protocol listener",
+		Long: `Start the dbounce SQL wire-protocol listener.
+
+The wire-protocol listener binds to 127.0.0.1:5433 by default
+(loopback only — dbounce will hold SCRAM challenges + bearer tokens
+once D-Slice 2's real forwarding lands; binding externally exposes
+that surface). The management HTTP listener for /healthz binds to
+127.0.0.1:8768 (distinct from kbounce's 8766 and ibounce's 8767).
+
+D-Slice 1 is OBSERVATION-ONLY: each inbound statement is parsed +
+audit-logged, then a synthetic ReadyForQuery is sent to the client.
+NOTHING ACTUALLY EXECUTES against any upstream. D-Slice 2 lands real
+forwarding.
+
+Ctrl+C exits cleanly (graceful shutdown).`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mode, err := proxy.ParseMode(modeStr)
+			if err != nil {
+				return err
+			}
+			defaultPol, err := proxy.ParseDefaultPolicy(defaultPolStr)
+			if err != nil {
+				return err
+			}
+			dialect, err := proxy.ParseDialect(dialectStr)
+			if err != nil {
+				return err
+			}
+
+			// CRIT-32-02 (mirrored from kbounce + ibounce): refuse to
+			// bind externally without explicit operator acknowledgement.
+			if _, ok := loopbackHosts[host]; !ok && !forceExternalBind {
+				fmt.Fprintf(os.Stderr,
+					"refusing to bind to %q: this exposes dbounce's "+
+						"credential-handling surface to the network.\n\n"+
+						"If you genuinely need to bind externally (test VM "+
+						"with no real DB credentials, network-segmented dev "+
+						"box), re-run with --i-know-this-binds-externally.\n",
+					host)
+				os.Exit(2)
+			}
+
+			st, err := store.Open(dbPath)
+			if err != nil {
+				return fmt.Errorf("open store: %w", err)
+			}
+			defer st.Close()
+
+			cfg := proxy.Config{
+				Host:          host,
+				Port:          port,
+				MgmtHost:      mgmtHost,
+				MgmtPort:      mgmtPort,
+				Mode:          mode,
+				DefaultPolicy: defaultPol,
+				Dialect:       dialect,
+				UpstreamURL:   upstream,
+			}.Normalize()
+
+			s := proxy.NewServer(cfg, st)
+
+			// Banner per the agent-parity requirement + the read-write
+			// framing the safe-default profile (D-Slice 7) will hook
+			// into. Goes to stderr so stdout stays clean.
+			fmt.Fprintf(os.Stderr,
+				"dbounce wire listener  : %s:%d  (dialect=%s, mode=%s, default-policy=%s)\n",
+				cfg.Host, cfg.Port, cfg.Dialect, cfg.Mode, cfg.DefaultPolicy)
+			fmt.Fprintf(os.Stderr,
+				"dbounce mgmt /healthz : http://%s:%d/healthz\n",
+				cfg.MgmtHost, cfg.MgmtPort)
+			fmt.Fprintf(os.Stderr, "audit db              : %s\n", st.Path())
+			if upstream != "" {
+				fmt.Fprintf(os.Stderr,
+					"upstream              : %s (captured for audit; D-Slice 1 does NOT forward)\n", upstream)
+			} else {
+				fmt.Fprintln(os.Stderr,
+					"upstream              : <none>")
+			}
+			fmt.Fprintln(os.Stderr,
+				"profile               : no profile selected (safe-default profile ships in D-Slice 7).")
+			fmt.Fprintln(os.Stderr,
+				"mode                  : cooperative — every statement is parsed + audit-logged.")
+			fmt.Fprintln(os.Stderr,
+				"                        D-Slice 1 is OBSERVATION-ONLY: nothing actually executes")
+			fmt.Fprintln(os.Stderr,
+				"                        against the upstream. To opt into the (D-Slice 2+) transparent")
+			fmt.Fprintln(os.Stderr,
+				"                        block path once it ships, pass --mode transparent.")
+			fmt.Fprintln(os.Stderr,
+				"read vs write         : reads (SELECT) and writes (INSERT/UPDATE/DELETE/MERGE/DDL/")
+			fmt.Fprintln(os.Stderr,
+				"                        CALL/DO/EXECUTE/WITH-WRITE) are classified per-statement so the")
+			fmt.Fprintln(os.Stderr,
+				"                        D-Slice 7 safe-default profile can default to reads-fine +")
+			fmt.Fprintln(os.Stderr,
+				"                        writes-layered-checks (the readonly-admin-minus shape).")
+			fmt.Fprintln(os.Stderr, "Ctrl+C to stop.")
+
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			serveErr := make(chan error, 1)
+			go func() {
+				err := s.Serve()
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
+					serveErr <- err
+					return
+				}
+				serveErr <- nil
+			}()
+
+			select {
+			case <-ctx.Done():
+				log.Info().Msg("dbounce received shutdown signal")
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := s.Shutdown(shutdownCtx); err != nil {
+					return fmt.Errorf("shutdown: %w", err)
+				}
+				if err := <-serveErr; err != nil {
+					return err
+				}
+				fmt.Fprintln(os.Stderr, "dbounce stopped.")
+				return nil
+			case err := <-serveErr:
+				return err
+			}
+		},
+	}
+	cmd.Flags().IntVar(&port, "port", 5433,
+		"TCP port for the SQL wire-protocol listener (loopback only by default).")
+	cmd.Flags().StringVar(&host, "host", "127.0.0.1",
+		"Interface to bind the wire-protocol listener. Anything other than "+
+			"127.0.0.1 / ::1 / localhost requires --i-know-this-binds-externally.")
+	cmd.Flags().StringVar(&mgmtHost, "mgmt-host", "127.0.0.1",
+		"Interface to bind the management HTTP listener (/healthz). Loopback by default.")
+	cmd.Flags().IntVar(&mgmtPort, "mgmt-port", 8768,
+		"TCP port for the management HTTP listener (/healthz). Distinct from "+
+			"kbounce's 8766 and ibounce's 8767 so all three products coexist.")
+	cmd.Flags().StringVar(&modeStr, "mode", "cooperative",
+		"cooperative | transparent. cooperative = parse + log + advisory. "+
+			"transparent = DENY verdicts return a SQL error (D-Slice 2+).")
+	cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
+		"allow | deny. What transparent mode does when no rule matches. "+
+			"Scaffolding for D-Slice 3 (no rule engine yet).")
+	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
+		"SQL wire-protocol dialect. D-Slice 1 supports: postgres. "+
+			"D-Slice 5 adds mysql; D-Slice 6 adds snowflake + bigquery.")
+	cmd.Flags().StringVar(&upstream, "upstream", "",
+		"Upstream DB URL (e.g. postgres://user:pass@host:5432/db). Captured "+
+			"in audit rows in D-Slice 1; real forwarding ships in D-Slice 2.")
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"SQLite audit DB path (default: ~/.dbounce/state.db, or DBOUNCE_DB env).")
+	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false,
+		"Required acknowledgement when --host is anything other than 127.0.0.1 "+
+			"/ ::1 / localhost. Binding externally exposes dbounce's "+
+			"credential-handling surface (once D-Slice 2 lands SCRAM "+
+			"pass-through). Don't pass without a specific reason.")
+	return cmd
+}
+
+// newAuditCmd implements `dbounce audit ...`. D-Slice 1 ships `tail`
+// only — the highest-leverage operator workflow ("show me what just
+// went through the proxy"). Later slices may add `search`, `export`,
+// and diff-against-baseline.
+func newAuditCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "audit",
+		Short: "Inspect the dbounce decision audit log",
+		Long: `dbounce records every parsed statement in a local SQLite audit
+log at ~/.dbounce/state.db. ` + "`dbounce audit tail`" + ` is the
+fastest way to see what a SQL client just sent through the proxy +
+what verdict each statement got.`,
+		Args: cobra.NoArgs,
+	}
+	cmd.RunE = parentRequiresSubcommand("audit", cmd)
+	cmd.AddCommand(newAuditTailCmd())
+	return cmd
+}
+
+// parentRequiresSubcommand returns a RunE that prints a clear error +
+// returns exit 1 when a cobra parent command is invoked without a
+// known sub-subcommand. Mirrors kbounce's UAT-K2 BLOCKER-K2-02
+// closure pattern.
+func parentRequiresSubcommand(parent string, _ *cobra.Command) func(*cobra.Command, []string) error {
+	return func(c *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			fmt.Fprintf(c.ErrOrStderr(),
+				"dbounce: missing subcommand for %q; see `dbounce %s --help` for valid subs\n",
+				parent, parent)
+			os.Exit(1)
+		}
+		fmt.Fprintf(c.ErrOrStderr(),
+			"dbounce: unknown subcommand %q for %q; see `dbounce %s --help` for valid subs\n",
+			args[0], parent, parent)
+		os.Exit(1)
+		return nil
+	}
+}
+
+func newAuditTailCmd() *cobra.Command {
+	var (
+		limit   int
+		dbPath  string
+		asJSON  bool
+	)
+	cmd := &cobra.Command{
+		Use:   "tail",
+		Short: "Show the most recent N decisions (newest first)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Bound --limit at parse time so operators understand the
+			// range rather than silently no-op'ing on out-of-range
+			// values. Mirrors kbounce + ibounce UAT-K2 HIGH-K2-03.
+			if limit < 1 || limit > 1000 {
+				return fmt.Errorf("--limit must be in 1-1000 (got %d)", limit)
+			}
+			st, err := store.Open(dbPath)
+			if err != nil {
+				return fmt.Errorf("open store: %w", err)
+			}
+			defer st.Close()
+			rows, err := st.RecentDecisions(limit)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				// Cross-product parity per [[cross-product-agent-parity]]:
+				// kbounce + ibounce both ship `audit tail --json`; dbounce
+				// matches the shape (one decision per line, newest first).
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				for _, r := range rows {
+					rec := map[string]any{
+						"at":                r.At.UTC().Format(time.RFC3339),
+						"dialect":           r.Dialect,
+						"statement":         r.Statement,
+						"statement_type":    r.StatementType,
+						"tables":            r.TablesTouched,
+						"functions":         r.FunctionsCalled,
+						"is_dml":            r.IsDML,
+						"is_ddl":            r.IsDDL,
+						"has_mutating_node": r.HasMutatingNode,
+						"mutating_node_type": r.MutatingNodeType,
+						"is_explain":        r.IsExplain,
+						"is_explain_analyze": r.IsExplainAnalyze,
+						"impersonated_role": r.ImpersonatedRole,
+						"parse_errors":      r.ParseErrors,
+						"decision_verdict":  r.DecisionVerdict,
+						"decision_reason":   r.DecisionReason,
+						"mode_at_decision":  r.ModeAtDecision,
+						"enforced":          r.Enforced,
+						"decision_source":   r.DecisionSource,
+						"profile_name":      r.ProfileName,
+						"task_id":           r.TaskID,
+						"is_stream":         r.IsStream,
+						"stream_kind":       r.StreamKind,
+					}
+					if err := enc.Encode(rec); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if len(rows) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "(no decisions recorded yet)")
+				return nil
+			}
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-12s  %s\n",
+				"AT (UTC)", "MODE", "VERDICT", "STMT-TYPE", "STATEMENT")
+			for _, r := range rows {
+				at := r.At.UTC().Format("2006-01-02 15:04:05")
+				stmt := r.Statement
+				if len(stmt) > 60 {
+					stmt = stmt[:57] + "..."
+				}
+				fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-12s  %s\n",
+					at, r.ModeAtDecision, r.DecisionVerdict, r.StatementType, stmt)
+				if r.DecisionReason != "" {
+					reason := r.DecisionReason
+					if len(reason) > 80 {
+						reason = reason[:77] + "..."
+					}
+					fmt.Fprintf(w, "%52s  %s\n", "↳", reason)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&limit, "limit", 50,
+		"Max rows to return (1-1000). Default 50.")
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"SQLite DB path (default: ~/.dbounce/state.db, or DBOUNCE_DB env).")
+	cmd.Flags().BoolVar(&asJSON, "json", false,
+		"Emit one JSON object per decision row, newest first. Mirrors "+
+			"kbounce + ibounce's `audit tail --json` for cross-product "+
+			"agent parity.")
+	return cmd
+}
