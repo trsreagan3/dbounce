@@ -256,6 +256,20 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_prompts_status ON pending_prompts(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_prompts_created_at ON pending_prompts(created_at)`,
+		// MED-D8-07 (AUDIT-WB-DSLICES-1-8.md) closure: enforce append-only
+		// semantics on `decisions` via BEFORE UPDATE / BEFORE DELETE
+		// triggers. The audit log is dbounce's gating invariant — a
+		// caller with sqlite write access can still bypass via PRAGMA
+		// (same-UID attacker has equivalent reach), so this is defense-
+		// in-depth, not cryptographic tamper-evidence. A rolling hash
+		// chain across rows is the post-launch full-tamper-evidence
+		// path; these triggers close the "honest log" gap.
+		`CREATE TRIGGER IF NOT EXISTS decisions_no_update
+			BEFORE UPDATE ON decisions
+			BEGIN SELECT RAISE(ABORT, 'dbounce: decisions is append-only (MED-D8-07)'); END`,
+		`CREATE TRIGGER IF NOT EXISTS decisions_no_delete
+			BEFORE DELETE ON decisions
+			BEGIN SELECT RAISE(ABORT, 'dbounce: decisions is append-only (MED-D8-07)'); END`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {

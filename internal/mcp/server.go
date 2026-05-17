@@ -53,6 +53,13 @@ const (
 	ServerVersion = "1.0.0"
 )
 
+// maxToolCallParamsBytes caps the raw JSON-RPC `params` payload for
+// `tools/call`. Bounded BEFORE per-tool dispatch so a runaway / hostile
+// agent can't burn parser CPU on multi-MB SQL strings (within the
+// 4 MiB scanner buffer). 16 KiB is generous for any single legitimate
+// SQL statement plus its tool-args envelope. MED-D8-11 closure.
+const maxToolCallParamsBytes = 16 * 1024
+
 // Config wires the MCP server to the live dbounce state on disk.
 // All fields are optional — a tool that needs something it doesn't
 // have surfaces a clear error to the caller.
@@ -148,6 +155,25 @@ func (s *Server) dispatch(req rawRequest) any {
 	case "tools/list":
 		return okResponse(req.ID, map[string]any{"tools": ToolDescriptors()})
 	case "tools/call":
+		// MED-D8-11 (AUDIT-WB-DSLICES-1-8.md) closure: bound the
+		// per-call argument size. Without a cap, a runaway / malicious
+		// agent can submit multi-MB SQL strings (within the 4 MiB line
+		// buffer) and burn parser CPU + memory in libpg_query /
+		// xwb1989 / the Snowflake-BigQuery prefix scan. 16 KiB is
+		// generous for any legitimate single-statement input
+		// (Postgres's max identifier is 63 bytes; a SELECT touching
+		// 50 columns + 5 joins is < 2 KiB). The cap applies uniformly
+		// to ALL tools — measuring at the raw Params bytes is simpler +
+		// stricter than per-arg measurement after JSON parse, and it
+		// short-circuits BEFORE any tool-specific work happens.
+		if len(req.Params) > maxToolCallParamsBytes {
+			return errResponse(req.ID, -32602,
+				fmt.Sprintf(
+					"tools/call params exceed maximum size of %d bytes "+
+						"(MED-D8-11 from AUDIT-WB-DSLICES-1-8.md): submit "+
+						"smaller chunks. Got %d bytes.",
+					maxToolCallParamsBytes, len(req.Params)))
+		}
 		var p struct {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`

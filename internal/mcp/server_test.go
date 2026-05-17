@@ -268,3 +268,59 @@ func TestServer_EOFExitsCleanly(t *testing.T) {
 	err := srv.Serve(strings.NewReader(""), io.Discard)
 	require.NoError(t, err)
 }
+
+// MED-D8-11 regression — `tools/call` must bound per-call params size
+// so a runaway / malicious agent can't burn parser CPU + memory on
+// multi-MB inputs (within the 4 MiB JSON-RPC scanner buffer).
+// AUDIT-WB-DSLICES-1-8.md §MED-D8-11 has the full reproduction.
+
+func TestServer_ToolsCallRejectsOversizedParams(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+	// Build a SQL string that exceeds the params cap when wrapped in
+	// the JSON-RPC params envelope. The cap is on raw bytes of the
+	// params payload, so a + 256-byte cushion (envelope overhead + a
+	// little slack) is enough.
+	big := strings.Repeat("SELECT 1; ", (maxToolCallParamsBytes/10)+128)
+	reqBody := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "dbounce_decide",
+			"arguments": map[string]any{"statement": big},
+		},
+	}
+	reqBytes, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+	in := bytes.NewReader(append(reqBytes, '\n'))
+	out := &bytes.Buffer{}
+	require.NoError(t, srv.Serve(in, out))
+
+	var resp map[string]any
+	require.NoError(t, json.NewDecoder(out).Decode(&resp))
+	errMap, ok := resp["error"].(map[string]any)
+	require.True(t, ok, "oversized tools/call MUST yield a JSON-RPC error, got: %v", resp)
+	assert.Equal(t, float64(-32602), errMap["code"],
+		"oversized params MUST surface as -32602 invalid-params")
+	msg, _ := errMap["message"].(string)
+	assert.Contains(t, msg, "MED-D8-11",
+		"error MUST reference the audit ID for triage")
+	assert.Contains(t, msg, "exceed maximum size",
+		"error MUST surface the size-cap signal")
+}
+
+func TestServer_ToolsCallAcceptsTypicalSQL(t *testing.T) {
+	// Sanity: a normal-sized SQL statement (a few hundred bytes) MUST
+	// NOT trip the guard.
+	srv, _ := newTestServer(t, nil)
+	sql := "SELECT id, name, email FROM users " +
+		"WHERE created_at > '2026-01-01' AND status = 'active' " +
+		"ORDER BY created_at DESC LIMIT 100"
+	resp := rpcCall(t, srv, "tools/call", map[string]any{
+		"name":      "dbounce_decide",
+		"arguments": map[string]any{"statement": sql},
+	})
+	_, hasErr := resp["error"]
+	assert.False(t, hasErr,
+		"typical SQL MUST NOT trip the MED-D8-11 guard; got error: %v", resp["error"])
+}

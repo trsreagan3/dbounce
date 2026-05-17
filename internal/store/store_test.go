@@ -206,6 +206,61 @@ func TestGetActivePause_NoneActive(t *testing.T) {
 	assert.Nil(t, p)
 }
 
+// MED-D8-07 regression — `decisions` table must be append-only.
+// BEFORE UPDATE / BEFORE DELETE triggers added per
+// AUDIT-WB-DSLICES-1-8.md §MED-D8-07. The triggers are defense-in-
+// depth (a same-UID attacker can disable them via PRAGMA), but they
+// close the "honest log" integrity gap so casual writes against the
+// SQLite file can't quietly rewrite audit history.
+
+func TestRecordDecision_AppendOnly_UpdateRejected(t *testing.T) {
+	s := scratchStore(t)
+	id, err := s.RecordDecision(DecisionRow{
+		At:              time.Now().UTC(),
+		Dialect:         "postgres",
+		Statement:       "SELECT 1",
+		StatementType:   "SELECT",
+		DecisionVerdict: "ALLOW",
+		DecisionReason:  "observation-only",
+		ModeAtDecision:  "cooperative",
+	})
+	require.NoError(t, err)
+	require.Greater(t, id, int64(0))
+
+	// Attempt to mutate the row's verdict — the BEFORE UPDATE trigger
+	// MUST reject the operation. SQLite's RAISE(ABORT, ...) surfaces
+	// as a regular Exec error.
+	_, err = s.db.Exec(
+		`UPDATE decisions SET decision_verdict = ? WHERE id = ?`,
+		"ALLOW-tampered", id)
+	require.Error(t, err, "UPDATE on decisions MUST be rejected (MED-D8-07)")
+	assert.Contains(t, err.Error(), "append-only",
+		"trigger MUST surface the append-only invariant in the error")
+	assert.Contains(t, err.Error(), "MED-D8-07",
+		"trigger MUST reference the audit ID")
+}
+
+func TestRecordDecision_AppendOnly_DeleteRejected(t *testing.T) {
+	s := scratchStore(t)
+	id, err := s.RecordDecision(DecisionRow{
+		At:              time.Now().UTC(),
+		Dialect:         "postgres",
+		Statement:       "DELETE FROM secrets",
+		StatementType:   "DELETE",
+		DecisionVerdict: "DENY",
+		DecisionReason:  "test",
+		ModeAtDecision:  "transparent",
+	})
+	require.NoError(t, err)
+	require.Greater(t, id, int64(0))
+
+	// Attempt to delete the row — the BEFORE DELETE trigger MUST reject.
+	_, err = s.db.Exec(`DELETE FROM decisions WHERE id = ?`, id)
+	require.Error(t, err, "DELETE on decisions MUST be rejected (MED-D8-07)")
+	assert.Contains(t, err.Error(), "append-only")
+	assert.Contains(t, err.Error(), "MED-D8-07")
+}
+
 func TestDefaultDBPath_EnvOverride(t *testing.T) {
 	t.Setenv("DBOUNCE_DB", "/tmp/dbounce-test-override.db")
 	p, err := DefaultDBPath()
