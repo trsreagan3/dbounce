@@ -299,3 +299,35 @@ func TestDefaultDBPath_EnvOverride(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/dbounce-test-override.db", p)
 }
+
+func TestStore_PRAGMA_SynchronousFull(t *testing.T) {
+	// LOW-D8-12 (AUDIT-WB-DSLICES-1-8.md): the store DSN pins
+	// synchronous=FULL so an audit-row commit fsyncs before
+	// RecordDecision returns. Without this guarantee, a power loss
+	// between the commit + the buffered write reaching the platter
+	// could erase the last few audit rows — same data the reviewer
+	// would need to investigate the crash itself.
+	//
+	// SQLite reports synchronous as 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+	// We assert FULL (2) via PRAGMA on a fresh connection. A future
+	// driver upgrade or DSN edit that silently flipped to NORMAL would
+	// break this test before the durability regression reached users.
+	s := scratchStore(t)
+	var mode int
+	require.NoError(t, s.db.QueryRow("PRAGMA synchronous").Scan(&mode))
+	assert.Equal(t, 2, mode,
+		"PRAGMA synchronous must be FULL (2) — every connection in the "+
+			"pool MUST fsync per commit so audit rows survive power loss")
+}
+
+func TestStore_PRAGMA_ForeignKeys(t *testing.T) {
+	// MED-D8-08: smoke-confirm the foreign_keys pragma is on for new
+	// connections — already covered by TestPendingPrompts_ForeignKeyEnforced
+	// behaviorally, but a direct PRAGMA assertion catches a DSN regression
+	// that flips the flag silently.
+	s := scratchStore(t)
+	var on int
+	require.NoError(t, s.db.QueryRow("PRAGMA foreign_keys").Scan(&on))
+	assert.Equal(t, 1, on,
+		"PRAGMA foreign_keys must be 1 on every connection")
+}

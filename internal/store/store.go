@@ -121,7 +121,25 @@ func Open(path string) (*Store, error) {
 	// every pool connection has it enabled. Same-UID attacker can
 	// disable via PRAGMA (defense-in-depth, not cryptographic), but
 	// this closes the casual-write integrity gap.
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	//
+	// LOW-D8-12 (AUDIT-WB-DSLICES-1-8.md) closure: pin
+	// `synchronous=FULL` explicitly. FULL is SQLite's default in
+	// rollback-journal mode (and the modernc.org/sqlite driver doesn't
+	// switch us to WAL by default), so this is largely defense-in-depth
+	// — but the audit log's value depends on durability across power
+	// loss, and a future driver/config change that quietly flips us to
+	// `synchronous=NORMAL` (the WAL default) or worse `OFF` could lose
+	// the last committed audit row. Pinning it on every connection
+	// makes the durability story explicit + survives driver upgrades.
+	// Trade-off documented: FULL adds an fsync per commit; for
+	// dbounce's per-statement audit writes this is the right side of
+	// the latency/durability trade — every decision MUST be on disk
+	// before the wire-protocol path moves on, otherwise a crash erases
+	// evidence the audit reviewer might be the only source of.
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)" +
+		"&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("dbounce: sql.Open: %w", err)
