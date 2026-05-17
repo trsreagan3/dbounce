@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/trsreagan3/dbounce/internal/profile"
+	dbrules "github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
 )
 
@@ -493,6 +494,104 @@ func TestProfileWriterAdapter_CollisionReturnsErrProfileExists(t *testing.T) {
 	require.True(t, present)
 	assert.Equal(t, "pre-existing", got.Description,
 		"adapter must never overwrite an existing profile (creates-never-mutates)")
+}
+
+// HIGH-D8-03 regression — profileWriterAdapter.CreateProfile must
+// fail-fast when an allow rule carries SchemaScope / TableScope /
+// FunctionScope (which profile.ProfileAllowRule would silently drop,
+// widening the persisted rule). AUDIT-WB-DSLICES-1-8.md §HIGH-D8-03
+// has the full reproduction. Per [[creates-never-mutates]] +
+// [[scorer-is-ground-truth]], silent widening is the worst failure
+// mode for a security gate; explicit error is the correct stop-gap
+// until profile.ProfileAllowRule grows the scope fields in v1.1.
+
+func TestProfileWriterAdapter_RejectsAllowRuleWithSchemaScope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	adapter := newCLIProfileWriter(path)
+
+	scoped := []dbrules.ProxyRule{
+		{Pattern: "SELECT:*", SchemaScope: "reporting"},
+	}
+	err := adapter.CreateProfile("scoped-allow", "would widen", scoped, nil)
+	require.Error(t, err, "scoped allow rule MUST be rejected to prevent silent widening")
+	assert.Contains(t, err.Error(), "HIGH-D8-03",
+		"error must reference the audit ID so the operator can find context")
+	assert.Contains(t, err.Error(), "schema_scope",
+		"error must surface which axis was offending")
+
+	// Confirm no profile was written (fail-fast = no partial state).
+	_, statErr := os.Stat(path)
+	assert.True(t, os.IsNotExist(statErr),
+		"profiles.yaml MUST NOT be created when the guard fires")
+}
+
+func TestProfileWriterAdapter_RejectsAllowRuleWithTableScope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	adapter := newCLIProfileWriter(path)
+
+	scoped := []dbrules.ProxyRule{
+		{Pattern: "SELECT:*", TableScope: "public.metrics"},
+	}
+	err := adapter.CreateProfile("scoped-allow", "would widen", scoped, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "table_scope")
+}
+
+func TestProfileWriterAdapter_RejectsAllowRuleWithFunctionScope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	adapter := newCLIProfileWriter(path)
+
+	scoped := []dbrules.ProxyRule{
+		{Pattern: "CALL:*", FunctionScope: "audit_*"},
+	}
+	err := adapter.CreateProfile("scoped-allow", "would widen", scoped, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "function_scope")
+}
+
+func TestProfileWriterAdapter_AllowsUnscopedRule(t *testing.T) {
+	// Sanity: an allow rule with NO scope fields persists successfully
+	// (the guard must not fire when there's nothing to drop).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	adapter := newCLIProfileWriter(path)
+
+	unscoped := []dbrules.ProxyRule{
+		{Pattern: "SELECT:public.metrics", Note: "ok"},
+	}
+	require.NoError(t, adapter.CreateProfile("unscoped-allow",
+		"no scope to drop", unscoped, nil),
+		"unscoped allow rule MUST persist successfully")
+
+	ps, err := profile.LoadProfiles(path)
+	require.NoError(t, err)
+	got, present := ps.All["unscoped-allow"]
+	require.True(t, present)
+	require.Len(t, got.AllowRules, 1)
+	assert.Equal(t, "SELECT:public.metrics", got.AllowRules[0].Pattern)
+}
+
+func TestProfileWriterAdapter_RejectsMultipleScopedRulesNamesAll(t *testing.T) {
+	// Error message must list ALL offending rules so the operator can
+	// fix them in one round-trip (not just the first offender).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles.yaml")
+	adapter := newCLIProfileWriter(path)
+
+	scoped := []dbrules.ProxyRule{
+		{Pattern: "SELECT:*", SchemaScope: "reporting"},
+		{Pattern: "INSERT:*", TableScope: "staging.*"},
+		{Pattern: "OK:*"}, // no scope — fine in isolation
+	}
+	err := adapter.CreateProfile("multi-scoped", "would widen all", scoped, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `pattern="SELECT:*"`)
+	assert.Contains(t, err.Error(), `pattern="INSERT:*"`)
+	assert.NotContains(t, err.Error(), `pattern="OK:*"`,
+		"unscoped rule MUST NOT be named as offending")
 }
 
 func TestMain(m *testing.M) {
