@@ -85,6 +85,19 @@ type Options struct {
 	// DialTimeout caps how long the proxy waits for the outbound TCP
 	// dial. Zero defaults to 10s.
 	DialTimeout time.Duration
+
+	// AllowInternal opts the operator into upstream hosts that resolve
+	// to RFC1918 / RFC4193 / link-local / loopback / cloud-metadata
+	// ranges. Off by default; surfaced via --allow-internal-upstream on
+	// `dbounce run`. See MED-D8-06 (AUDIT-WB-DSLICES-1-8.md) for the
+	// SSRF threat model that motivates the gate.
+	AllowInternal bool
+
+	// LookupHost lets tests inject a stub DNS resolver so the SSRF gate
+	// is exercised without network. Production callers leave this nil;
+	// Resolve falls back to net.LookupHost. Mirrors how the rest of the
+	// package isolates side effects for testability.
+	LookupHost func(host string) ([]string, error)
 }
 
 // Upstream is the resolved PG target the proxy dials per inbound
@@ -221,6 +234,21 @@ func Resolve(opts Options) (*Upstream, error) {
 		parsed.Host = parsed.Host + ":5432"
 	}
 
+	// MED-D8-06 (AUDIT-WB-DSLICES-1-8.md) closure: SSRF allowlist.
+	// Operator-supplied upstream URLs CAN reach cloud-metadata endpoints
+	// (169.254.169.254), RFC1918 networks, IPv6 link-local, .internal /
+	// .local TLDs, or loopback unless --allow-internal-upstream is set.
+	// The check uses net.LookupHost (NOT just a string-parse of the URL)
+	// so DNS-rebinding-style probes ("attacker.com" resolving to 10.0.0.1)
+	// are also rejected. An opt-in flag preserves the legitimate
+	// intranet-DB case behind an explicit operator acknowledgement.
+	hostname := parsed.Hostname()
+	if !opts.AllowInternal {
+		if err := guardInternalHost(hostname, opts.LookupHost); err != nil {
+			return nil, err
+		}
+	}
+
 	up := &Upstream{
 		URL:         parsed,
 		CACertPath:  opts.CACertPath,
@@ -251,4 +279,132 @@ func ParseTLSMode(s string) (TLSMode, error) {
 		return m, nil
 	}
 	return "", fmt.Errorf("dbounce: invalid --upstream-tls %q (want verify | skip | disable)", s)
+}
+
+// internalRanges enumerates the CIDR blocks an upstream MUST NOT resolve
+// into unless the operator passed --allow-internal-upstream. Covers:
+//
+//   - 127.0.0.0/8  — IPv4 loopback
+//   - 169.254.0.0/16 — IPv4 link-local + cloud-metadata (AWS/GCP/Azure
+//     all expose instance metadata at 169.254.169.254; reaching this
+//     endpoint via a dbounce proxy connection would let a compromised
+//     upstream-URL config exfiltrate IAM credentials).
+//   - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 — RFC1918
+//   - ::1/128 — IPv6 loopback
+//   - fe80::/10 — IPv6 link-local
+//   - fc00::/7 — RFC4193 unique local (IPv6 RFC1918 equivalent)
+//
+// MED-D8-06 (AUDIT-WB-DSLICES-1-8.md) closure.
+var internalRanges = func() []*net.IPNet {
+	cidrs := []string{
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"::1/128",
+		"fe80::/10",
+		"fc00::/7",
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			// Compile-time table; a malformed entry is a programmer
+			// error. Panic at init time rather than ship a silently
+			// permissive resolver.
+			panic(fmt.Sprintf("dbounce: invalid internal CIDR %q: %v", c, err))
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
+// internalTLDSuffixes names DNS suffixes whose lookups MUST NOT proceed
+// unless the operator opted in. ".internal" is the cloud-platform
+// convention for private DNS (GKE, EKS internal zones); ".local" is
+// mDNS / Bonjour territory. Both are common SSRF targets.
+var internalTLDSuffixes = []string{".internal", ".local"}
+
+// guardInternalHost rejects host strings that resolve to (or textually
+// match) internal-network ranges unless the operator passed
+// --allow-internal-upstream. Hostname-suffix checks fire BEFORE DNS so
+// `.internal` / `.local` lookups never leave the process when blocked.
+// The actual IP allowlist uses net.LookupHost — not URL string parsing —
+// so a DNS-rebinding probe like `attacker.com` resolving to 10.0.0.1
+// is also caught.
+//
+// MED-D8-06 (AUDIT-WB-DSLICES-1-8.md) closure.
+func guardInternalHost(host string, lookup func(string) ([]string, error)) error {
+	if host == "" {
+		// Caller has already rejected empty-host URLs upstream of this
+		// call. Defensive return-OK for the empty case so this helper
+		// never spuriously rejects a URL the parser already accepted.
+		return nil
+	}
+	lower := strings.ToLower(host)
+	for _, suf := range internalTLDSuffixes {
+		if strings.HasSuffix(lower, suf) {
+			return fmt.Errorf(
+				"dbounce: upstream host %q matches internal TLD suffix %q; "+
+					"this is rejected by default to prevent SSRF-shaped abuse "+
+					"of operator-influenced upstream URLs (MED-D8-06). Pass "+
+					"--allow-internal-upstream on `dbounce run` to opt in "+
+					"for a legitimate intranet DB.",
+				host, suf)
+		}
+	}
+	// If the host is already a literal IP, no DNS lookup is needed.
+	if ip := net.ParseIP(host); ip != nil {
+		if name, ok := matchInternalRange(ip); ok {
+			return fmt.Errorf(
+				"dbounce: upstream host %q resolves to %s which is inside "+
+					"internal range %s; rejected by default (MED-D8-06 SSRF "+
+					"gate). Pass --allow-internal-upstream on `dbounce run` "+
+					"to opt in.", host, ip.String(), name)
+		}
+		return nil
+	}
+	// Hostname: resolve + check every returned IP. Reject on the FIRST
+	// match — DNS-rebinding-style attacks that return mixed public +
+	// private IPs are still caught (the proxy might dial either).
+	resolver := lookup
+	if resolver == nil {
+		resolver = net.LookupHost
+	}
+	addrs, err := resolver(host)
+	if err != nil {
+		return fmt.Errorf(
+			"dbounce: lookup upstream host %q: %w (refused by SSRF gate "+
+				"because we can't confirm the host is public; pass "+
+				"--allow-internal-upstream if this is intentional)", host, err)
+	}
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil {
+			continue
+		}
+		if name, ok := matchInternalRange(ip); ok {
+			return fmt.Errorf(
+				"dbounce: upstream host %q resolves to %s which is inside "+
+					"internal range %s; rejected by default (MED-D8-06 SSRF "+
+					"gate). Pass --allow-internal-upstream on `dbounce run` "+
+					"to opt in.", host, ip.String(), name)
+		}
+	}
+	return nil
+}
+
+// matchInternalRange returns the matching CIDR's string + true when ip
+// falls inside any guarded internal range. Centralized so the error
+// message can name the exact range the operator's host hit — honest
+// errors per [[v1-scope-bar]] (operator can decide whether the match is
+// a real intranet DB worth opting into or a misconfiguration to fix).
+func matchInternalRange(ip net.IP) (string, bool) {
+	for _, n := range internalRanges {
+		if n.Contains(ip) {
+			return n.String(), true
+		}
+	}
+	return "", false
 }

@@ -170,8 +170,9 @@ func startForwardingServer(t *testing.T, fake *fakePGUpstream, mode Mode) (*Serv
 	t.Cleanup(func() { _ = st.Close() })
 
 	up, err := upstream.Resolve(upstream.Options{
-		UpstreamURL: fake.URL(),
-		TLSMode:     upstream.TLSModeDisable, // fake doesn't speak TLS
+		UpstreamURL:   fake.URL(),
+		TLSMode:       upstream.TLSModeDisable, // fake doesn't speak TLS
+		AllowInternal: true,                    // test fixture binds 127.0.0.1
 	})
 	require.NoError(t, err)
 
@@ -419,8 +420,9 @@ func TestForward_UpstreamDialFailure(t *testing.T) {
 
 	up, err := upstream.Resolve(upstream.Options{
 		// Port 1 is unassigned → ECONNREFUSED.
-		UpstreamURL: "postgres://tester@127.0.0.1:1/postgres",
-		TLSMode:     upstream.TLSModeDisable,
+		UpstreamURL:   "postgres://tester@127.0.0.1:1/postgres",
+		TLSMode:       upstream.TLSModeDisable,
+		AllowInternal: true, // intentional loopback test fixture
 	})
 	require.NoError(t, err)
 
@@ -505,8 +507,9 @@ func TestHostAllowed_NilUpstreamFailsClosed(t *testing.T) {
 
 func TestHostAllowed_EmptyInboundAllowed(t *testing.T) {
 	up, err := upstream.Resolve(upstream.Options{
-		UpstreamURL: "postgres://localhost:5432/db",
-		TLSMode:     upstream.TLSModeDisable,
+		UpstreamURL:   "postgres://localhost:5432/db",
+		TLSMode:       upstream.TLSModeDisable,
+		AllowInternal: true, // loopback host string
 	})
 	require.NoError(t, err)
 	assert.True(t, hostAllowed("", up),
@@ -514,9 +517,12 @@ func TestHostAllowed_EmptyInboundAllowed(t *testing.T) {
 }
 
 func TestHostAllowed_MatchingHostAllowed(t *testing.T) {
+	// Stub LookupHost so the SSRF gate doesn't depend on whether
+	// pg.example.com resolves on the test machine.
 	up, err := upstream.Resolve(upstream.Options{
 		UpstreamURL: "postgres://pg.example.com:5432/db",
 		TLSMode:     upstream.TLSModeDisable,
+		LookupHost:  func(string) ([]string, error) { return []string{"93.184.216.34"}, nil },
 	})
 	require.NoError(t, err)
 	assert.True(t, hostAllowed("pg.example.com:5432", up))
@@ -530,6 +536,7 @@ func TestHostAllowed_DifferentHostRefused(t *testing.T) {
 	up, err := upstream.Resolve(upstream.Options{
 		UpstreamURL: "postgres://pg.example.com:5432/db",
 		TLSMode:     upstream.TLSModeDisable,
+		LookupHost:  func(string) ([]string, error) { return []string{"93.184.216.34"}, nil },
 	})
 	require.NoError(t, err)
 	assert.False(t, hostAllowed("attacker.example.com:5432", up),

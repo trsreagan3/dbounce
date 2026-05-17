@@ -51,8 +51,9 @@ func startProxyAgainstRealPG(t *testing.T, mode Mode) (int, *dbstore.Store) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	up, err := upstream.Resolve(upstream.Options{
-		UpstreamURL: pgURLFromEnv(),
-		TLSMode:     upstream.TLSModeDisable,
+		UpstreamURL:   pgURLFromEnv(),
+		TLSMode:       upstream.TLSModeDisable,
+		AllowInternal: true, // integration test uses local PG (127.0.0.1)
 	})
 	require.NoError(t, err)
 

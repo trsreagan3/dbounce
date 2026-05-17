@@ -353,9 +353,10 @@ func newRunCmd() *cobra.Command {
 		modeStr           string
 		defaultPolStr     string
 		dialectStr        string
-		upstreamURL       string
-		upstreamCACert    string
-		upstreamTLSStr    string
+		upstreamURL         string
+		upstreamCACert      string
+		upstreamTLSStr      string
+		allowInternalUpstream bool
 		dbPath                string
 		forceExternalBind     bool
 		forceExternalMgmtBind bool
@@ -485,9 +486,10 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 					return err
 				}
 				up, err := upstream.Resolve(upstream.Options{
-					UpstreamURL: upstreamURL,
-					CACertPath:  upstreamCACert,
-					TLSMode:     tlsMode,
+					UpstreamURL:   upstreamURL,
+					CACertPath:    upstreamCACert,
+					TLSMode:       tlsMode,
+					AllowInternal: allowInternalUpstream,
 				})
 				if err != nil {
 					return fmt.Errorf("resolve upstream: %w", err)
@@ -708,6 +710,15 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"--upstream-ca-cert. skip disables verification (self-signed "+
 			"dev clusters; never production). disable refuses TLS even "+
 			"when the upstream offers it.")
+	cmd.Flags().BoolVar(&allowInternalUpstream, "allow-internal-upstream", false,
+		"Opt-in: permit --upstream hosts that resolve to internal IP "+
+			"ranges (127.0.0.0/8, 169.254.0.0/16 incl. AWS/GCP/Azure "+
+			"metadata, 10/8, 172.16/12, 192.168/16, ::1, fe80::/10, "+
+			"fc00::/7) or .internal / .local TLDs. Default false rejects "+
+			"these to defend against SSRF-shaped abuse of operator-"+
+			"influenced upstream URLs (MED-D8-06 from "+
+			"AUDIT-WB-DSLICES-1-8.md). Pass only when the upstream is a "+
+			"legitimate intranet DB.")
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite audit DB path (default: ~/.dbounce/state.db, or DBOUNCE_DB env).")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false,
