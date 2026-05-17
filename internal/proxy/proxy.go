@@ -35,6 +35,7 @@ import (
 	dbrules "github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/tasks"
+	"github.com/trsreagan3/dbounce/internal/upstream"
 )
 
 // Mode names dbounce's two operating shapes. Same vocabulary kbounce +
@@ -135,7 +136,11 @@ type Config struct {
 	Mode          Mode
 	DefaultPolicy DefaultPolicy
 	Dialect       Dialect
-	UpstreamURL   string // captured for audit; D-Slice 2's forwarding consumes it.
+	UpstreamURL   string // captured for audit + startup-banner; the load-bearing forwarding target lives on Upstream below
+	// Upstream is the D-Slice 2 forwarding target. Nil = observation-only.
+	// Non-nil = serveConn dials this on every inbound session + pumps
+	// SCRAM auth + forwards ALLOW verdicts.
+	Upstream      *upstream.Upstream
 	ReadTimeout   time.Duration
 	WriteTimeout  time.Duration
 	IdleTimeout   time.Duration
@@ -269,6 +274,15 @@ func (s *Server) serveConn(conn net.Conn) {
 		_ = conn.Close()
 	}()
 	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
+
+	// D-Slice 2: when an upstream is configured, dispatch to the
+	// forwarding handler. The observation-only handshake remains for
+	// the no-upstream case so `dbounce run` keeps working as a
+	// parse-only audit-tap without a real database.
+	if s.upstreamForwardingActive() {
+		s.serveConnWithUpstream(conn)
+		return
+	}
 
 	if err := pgHandshake(conn); err != nil {
 		log.Debug().Err(err).Str("remote", conn.RemoteAddr().String()).

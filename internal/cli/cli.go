@@ -31,6 +31,7 @@ import (
 
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	"github.com/trsreagan3/dbounce/internal/store"
+	"github.com/trsreagan3/dbounce/internal/upstream"
 )
 
 // loopbackHosts mirrors kbounce + ibounce's CRIT-32-02 closure:
@@ -129,7 +130,9 @@ func newRunCmd() *cobra.Command {
 		modeStr           string
 		defaultPolStr     string
 		dialectStr        string
-		upstream          string
+		upstreamURL       string
+		upstreamCACert    string
+		upstreamTLSStr    string
 		dbPath            string
 		forceExternalBind bool
 	)
@@ -178,6 +181,25 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				os.Exit(2)
 			}
 
+			// D-Slice 2: resolve the upstream forwarding target. Empty
+			// --upstream preserves D-Slice 1 observation-only mode.
+			var resolvedUpstream *upstream.Upstream
+			if upstreamURL != "" {
+				tlsMode, err := upstream.ParseTLSMode(upstreamTLSStr)
+				if err != nil {
+					return err
+				}
+				up, err := upstream.Resolve(upstream.Options{
+					UpstreamURL: upstreamURL,
+					CACertPath:  upstreamCACert,
+					TLSMode:     tlsMode,
+				})
+				if err != nil {
+					return fmt.Errorf("resolve upstream: %w", err)
+				}
+				resolvedUpstream = up
+			}
+
 			st, err := store.Open(dbPath)
 			if err != nil {
 				return fmt.Errorf("open store: %w", err)
@@ -192,7 +214,8 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				Mode:          mode,
 				DefaultPolicy: defaultPol,
 				Dialect:       dialect,
-				UpstreamURL:   upstream,
+				UpstreamURL:   upstreamURL,
+				Upstream:      resolvedUpstream,
 			}.Normalize()
 
 			s := proxy.NewServer(cfg, st)
@@ -207,12 +230,17 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				"dbounce mgmt /healthz : http://%s:%d/healthz\n",
 				cfg.MgmtHost, cfg.MgmtPort)
 			fmt.Fprintf(os.Stderr, "audit db              : %s\n", st.Path())
-			if upstream != "" {
+			if resolvedUpstream != nil {
 				fmt.Fprintf(os.Stderr,
-					"upstream              : %s (captured for audit; D-Slice 1 does NOT forward)\n", upstream)
+					"upstream              : %s (D-Slice 2 forwarding ACTIVE; TLS=%s)\n",
+					upstreamURL, resolvedUpstream.TLSMode)
+				if upstreamCACert != "" {
+					fmt.Fprintf(os.Stderr,
+						"upstream CA bundle    : %s\n", upstreamCACert)
+				}
 			} else {
 				fmt.Fprintln(os.Stderr,
-					"upstream              : <none>")
+					"upstream              : <none> — observation-only mode (no forwarding)")
 			}
 			fmt.Fprintln(os.Stderr,
 				"profile               : no profile selected (safe-default profile ships in D-Slice 7).")
@@ -284,9 +312,21 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
 		"SQL wire-protocol dialect. D-Slice 1 supports: postgres. "+
 			"D-Slice 5 adds mysql; D-Slice 6 adds snowflake + bigquery.")
-	cmd.Flags().StringVar(&upstream, "upstream", "",
-		"Upstream DB URL (e.g. postgres://user:pass@host:5432/db). Captured "+
-			"in audit rows in D-Slice 1; real forwarding ships in D-Slice 2.")
+	cmd.Flags().StringVar(&upstreamURL, "upstream", "",
+		"Upstream DB URL (e.g. postgres://user@host:5432/db). When set, "+
+			"dbounce dials this on every inbound session + forwards SCRAM "+
+			"auth verbatim + proxies ALLOW verdicts. When empty, dbounce "+
+			"runs in observation-only mode (D-Slice 1 behavior).")
+	cmd.Flags().StringVar(&upstreamCACert, "upstream-ca-cert", "",
+		"Optional CA bundle (PEM) for outbound TLS validation. Empty = "+
+			"system trust store. Has no effect when --upstream-tls=skip "+
+			"or --upstream-tls=disable.")
+	cmd.Flags().StringVar(&upstreamTLSStr, "upstream-tls", "verify",
+		"Outbound TLS mode: verify | skip | disable. verify (default) "+
+			"validates the upstream's cert against the system trust + any "+
+			"--upstream-ca-cert. skip disables verification (self-signed "+
+			"dev clusters; never production). disable refuses TLS even "+
+			"when the upstream offers it.")
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite audit DB path (default: ~/.dbounce/state.db, or DBOUNCE_DB env).")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false,

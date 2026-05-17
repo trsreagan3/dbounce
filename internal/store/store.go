@@ -52,7 +52,11 @@ import (
 //	    pending_prompts tables, all the D-Slice 7 + D-Slice 8 columns
 //	    materialized up-front so the schema doesn't churn across
 //	    slices.
-const SchemaVersion = 1
+//	2 — D-Slice 2 forwarding: decisions table gains forwarded /
+//	    upstream_status / upstream_response_summary so audit reviewers
+//	    can distinguish forwarded vs not-forwarded vs upstream-errored
+//	    decisions without parsing the reason text.
+const SchemaVersion = 2
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors DBOUNCE_DB for tests and CI sandboxes that want
@@ -174,7 +178,10 @@ func (s *Store) migrate() error {
 			task_id TEXT,
 			pause_id INTEGER,
 			is_stream INTEGER NOT NULL DEFAULT 0,
-			stream_kind TEXT NOT NULL DEFAULT ''
+			stream_kind TEXT NOT NULL DEFAULT '',
+			forwarded INTEGER NOT NULL DEFAULT 0,
+			upstream_status TEXT NOT NULL DEFAULT '',
+			upstream_response_summary TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_decisions_at ON decisions(at)`,
 		`CREATE INDEX IF NOT EXISTS idx_decisions_verdict ON decisions(decision_verdict)`,
@@ -241,6 +248,21 @@ func (s *Store) migrate() error {
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("dbounce: migrate: %w (stmt=%q)", err, q)
+		}
+	}
+
+	// D-Slice 2 additive migration for databases stamped at v1: add the
+	// forwarding-audit columns if they aren't already present. The
+	// CREATE TABLE above declares them so fresh databases get them
+	// inline; addColumnIfMissing handles upgrade-in-place for
+	// pre-existing v1 databases.
+	for _, col := range []struct{ name, decl string }{
+		{"forwarded", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_status", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_response_summary", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing("decisions", col.name, col.decl); err != nil {
+			return err
 		}
 	}
 
@@ -344,6 +366,20 @@ type DecisionRow struct {
 	IsStream bool
 	// StreamKind: "copy", "result-set-stream", "" (not streaming).
 	StreamKind string
+	// Forwarded is true when D-Slice 2's forwarder actually proxied the
+	// message to the upstream. False when (a) no upstream is configured
+	// (observation-only), or (b) transparent-mode DENY refused without
+	// forwarding. Lets audit reviewers ask "which decisions touched the
+	// real database?" with a single column.
+	Forwarded bool
+	// UpstreamStatus names the outcome of the upstream call: "ok" /
+	// "error" / "not_forwarded". Empty in D-Slice 1.
+	UpstreamStatus string
+	// UpstreamResponseSummary is a short human-readable description of
+	// the upstream's reply ("23 rows returned", "upstream error:
+	// relation 'foo' does not exist") for the audit reviewer. Bounded
+	// at ~256 chars by the writer.
+	UpstreamResponseSummary string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -367,6 +403,13 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("dbounce: marshal parse errors: %w", err)
 	}
+	// Bound the upstream-response summary at 256 chars so a chatty
+	// upstream error (a stack trace, a multi-line plpgsql NOTICE) can't
+	// bloat individual SQLite rows.
+	upstreamSummary := d.UpstreamResponseSummary
+	if len(upstreamSummary) > 256 {
+		upstreamSummary = upstreamSummary[:253] + "..."
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO decisions(
 			at, dialect, statement, statement_type,
@@ -377,8 +420,9 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			decision_verdict, decision_reason, mode_at_decision, enforced,
 			decision_source, profile_name,
 			matched_rule_id, task_id, pause_id,
-			is_stream, stream_kind
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			is_stream, stream_kind,
+			forwarded, upstream_status, upstream_response_summary
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Dialect, d.Statement, d.StatementType,
 		tablesJSON, functionsJSON,
 		boolToInt(d.IsDML), boolToInt(d.IsDDL), boolToInt(d.HasMutatingNode), d.MutatingNodeType,
@@ -388,6 +432,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		d.DecisionSource, nullableString(d.ProfileName),
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID), nullableInt(d.PauseID),
 		boolToInt(d.IsStream), d.StreamKind,
+		boolToInt(d.Forwarded), d.UpstreamStatus, upstreamSummary,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("dbounce: record decision: %w", err)
@@ -429,7 +474,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		decision_verdict, decision_reason, mode_at_decision, enforced,
 		decision_source, profile_name,
 		matched_rule_id, task_id, pause_id,
-		is_stream, stream_kind
+		is_stream, stream_kind,
+		forwarded, upstream_status, upstream_response_summary
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -456,6 +502,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			taskID           sql.NullString
 			pauseID          sql.NullInt64
 			isStream         int
+			forwarded        int
 		)
 		if err := rows.Scan(
 			&atStr, &d.Dialect, &d.Statement, &d.StatementType,
@@ -467,6 +514,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&d.DecisionSource, &profileName,
 			&ruleID, &taskID, &pauseID,
 			&isStream, &d.StreamKind,
+			&forwarded, &d.UpstreamStatus, &d.UpstreamResponseSummary,
 		); err != nil {
 			return nil, fmt.Errorf("dbounce: recent decisions scan: %w", err)
 		}
@@ -497,6 +545,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			d.PauseID = &pid
 		}
 		d.IsStream = isStream != 0
+		d.Forwarded = forwarded != 0
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
@@ -596,6 +645,5 @@ func unmarshalStrings(s string) []string {
 	return xs
 }
 
-// silence unused-helper lint while the rest of the migration helpers
-// land in later D-Slices.
-var _ = (*Store)(nil).addColumnIfMissing
+// D-Slice 2 actively uses addColumnIfMissing for the forwarding-audit
+// column migration. Future slices reuse it for their own column adds.
