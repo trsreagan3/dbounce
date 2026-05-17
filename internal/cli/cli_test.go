@@ -58,6 +58,37 @@ func TestRunCmd_Help(t *testing.T) {
 	assert.Contains(t, help, "--management-tls-key")
 }
 
+func TestRunCmd_MySQLRejectsListenerTLS(t *testing.T) {
+	// D-Slice 5 → 4 cross-slice guard: MySQL listener TLS not shipped.
+	// CLI must fail-fast rather than silently accept TLS flags that the
+	// MySQL handler won't honor.
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"tls-cert", []string{"--dialect=mysql", "--listener-tls-cert=/tmp/x.pem"}},
+		{"tls-key", []string{"--dialect=mysql", "--listener-tls-key=/tmp/x.key"}},
+		{"require-client-cert", []string{"--dialect=mysql", "--require-client-cert"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newRunCmd()
+			out := &bytes.Buffer{}
+			cmd.SetOut(out)
+			cmd.SetErr(out)
+			cmd.SilenceUsage = true
+			cmd.SetArgs(append(tc.args,
+				"--db", t.TempDir()+"/x.db",
+				"--port", "0", "--mgmt-port", "0",
+				"--host", "127.0.0.1",
+			))
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "MySQL")
+		})
+	}
+}
+
 func TestRootCmd_HasInitTLSSubcommand(t *testing.T) {
 	cmd := newRootCmd()
 	names := map[string]bool{}

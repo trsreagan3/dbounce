@@ -177,6 +177,19 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				return err
 			}
 
+			// D-Slice 5 → 4 cross-slice guard: MySQL listener TLS not
+			// shipped yet (per dbounce-build-plan §D-Slice 5). Fail-fast
+			// here rather than silently accepting flags that won't take
+			// effect on the MySQL handler. Revisit when MySQL TLS lands.
+			if dialect == proxy.DialectMySQL &&
+				(listenerTLSCert != "" || listenerTLSKey != "" || requireClientCert) {
+				return fmt.Errorf(
+					"--dialect=mysql does not yet support listener TLS " +
+						"(--listener-tls-cert / --listener-tls-key / " +
+						"--require-client-cert). MySQL listener TLS is " +
+						"post-launch; use --dialect=postgres for now.")
+			}
+
 			// CRIT-32-02 (mirrored from kbounce + ibounce): refuse to
 			// bind externally without explicit operator acknowledgement.
 			if _, ok := loopbackHosts[host]; !ok && !forceExternalBind {
