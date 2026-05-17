@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,6 +260,37 @@ func TestRecordDecision_AppendOnly_DeleteRejected(t *testing.T) {
 	require.Error(t, err, "DELETE on decisions MUST be rejected (MED-D8-07)")
 	assert.Contains(t, err.Error(), "append-only")
 	assert.Contains(t, err.Error(), "MED-D8-07")
+}
+
+// MED-D8-08 regression — pending_prompts.decision_id MUST be a FK
+// against decisions(id) AND foreign_keys pragma MUST be enabled on
+// the connection so the constraint is actually enforced. SQLite ships
+// with FK enforcement OFF by default; without the pragma the FK
+// declaration is documentary, not enforced.
+
+func TestPendingPrompts_ForeignKeyEnforced(t *testing.T) {
+	s := scratchStore(t)
+
+	// Confirm the pragma is actually ON for the connection (defense-in-
+	// depth check — DSN should have set it, but a typo here would
+	// silently leave the FK undefended).
+	var fk int
+	require.NoError(t, s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&fk))
+	require.Equal(t, 1, fk, "foreign_keys pragma MUST be enabled (MED-D8-08)")
+
+	// Direct insert against a non-existent decision_id MUST be rejected
+	// by the FK constraint. The application code never hits this path
+	// (always inserts a decision first + uses the returned id), so the
+	// test exercises the constraint directly.
+	_, err := s.db.Exec(
+		`INSERT INTO pending_prompts(
+			created_at, decision_id, statement_type, deny_reason
+		) VALUES (?, ?, ?, ?)`,
+		"2026-05-18T00:00:00Z", 999999, "DELETE", "test")
+	require.Error(t, err,
+		"FK violation on pending_prompts.decision_id MUST be rejected (MED-D8-08)")
+	assert.Contains(t, strings.ToLower(err.Error()), "foreign key",
+		"error MUST surface the FK violation; got: %v", err)
 }
 
 func TestDefaultDBPath_EnvOverride(t *testing.T) {

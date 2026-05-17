@@ -108,7 +108,15 @@ func Open(path string) (*Store, error) {
 	// modernc.org/sqlite parses `_pragma=<name>(<value>)` in the DSN +
 	// applies it on every new connection — this is per-connection so
 	// passing it via DSN is the only correct shape for a pool.
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)"
+	// MED-D8-08 (AUDIT-WB-DSLICES-1-8.md) closure: enable
+	// `foreign_keys` so the FK declaration on `pending_prompts.
+	// decision_id` (added in the migrate stmts) is actually enforced.
+	// SQLite ships with FK enforcement OFF by default for historical-
+	// compatibility reasons; per-connection PRAGMA via the DSN ensures
+	// every pool connection has it enabled. Same-UID attacker can
+	// disable via PRAGMA (defense-in-depth, not cryptographic), but
+	// this closes the casual-write integrity gap.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("dbounce: sql.Open: %w", err)
@@ -240,10 +248,19 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_pause_events_ends_at ON pause_events(ends_at)`,
 		// pending_prompts: scaffolded for D-Slice 8 async deny-prompt UX.
+		// MED-D8-08: decision_id carries a FOREIGN KEY REFERENCES
+		// decisions(id) so a delete-+-reuse attack against decisions
+		// (impossible today given the append-only triggers from
+		// MED-D8-07, but defense-in-depth) can't leave dangling /
+		// re-pointed prompts. FK enforcement is enabled at connection
+		// open via the foreign_keys pragma on the DSN.
+		// Existing pre-MED-D8-08 databases retain the pre-FK table
+		// shape (SQLite can't ALTER TABLE to add an FK); fresh
+		// installations (the v1.0 launch case) get the constraint.
 		`CREATE TABLE IF NOT EXISTS pending_prompts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			created_at TEXT NOT NULL,
-			decision_id INTEGER NOT NULL,
+			decision_id INTEGER NOT NULL REFERENCES decisions(id),
 			statement_type TEXT NOT NULL DEFAULT '',
 			tables_json TEXT NOT NULL DEFAULT '[]',
 			functions_json TEXT NOT NULL DEFAULT '[]',
