@@ -108,6 +108,7 @@ func TestServer_ToolsList_AllToolsPresent(t *testing.T) {
 		"dbounce_remove_rule",
 		"dbounce_decide",
 		"dbounce_tail_decisions",
+		"dbounce_pending_sync_prompts",
 	}
 	for _, n := range want {
 		assert.True(t, names[n], "tool %q must be in tools/list", n)
@@ -324,3 +325,45 @@ func TestServer_ToolsCallAcceptsTypicalSQL(t *testing.T) {
 	assert.False(t, hasErr,
 		"typical SQL MUST NOT trip the MED-D8-11 guard; got error: %v", resp["error"])
 }
+
+// #203 — dbounce_pending_sync_prompts must return only LIVE waiters.
+func TestTool_PendingSyncPrompts_ReturnsLiveWaitersOnly(t *testing.T) {
+	srv, st := newTestServer(t, nil)
+	// Seed a decision row + sync prompt; do NOT cancel or wake →
+	// waiter stays live for the duration of this test.
+	decID, err := st.RecordDecision(store.DecisionRow{
+		Dialect:         "postgres",
+		Statement:       "DELETE FROM public.users",
+		StatementType:   "DELETE",
+		TablesTouched:   []string{"public.users"},
+		DecisionVerdict: "DENY",
+		DecisionReason:  "test",
+		ModeAtDecision:  "transparent",
+	})
+	require.NoError(t, err)
+	promptID, waitID, _, err := st.AddSyncPendingPrompt(store.PendingPrompt{
+		DecisionID:    decID,
+		StatementType: "DELETE",
+		TablesTouched: []string{"public.users"},
+		DenyReason:    "out-of-task-scope",
+	})
+	require.NoError(t, err)
+
+	sc := rpcCallTool(t, srv, "dbounce_pending_sync_prompts", nil)
+	assert.Equal(t, float64(1), sc["count"], "expected exactly one live waiter")
+	waiting, ok := sc["waiting"].([]any)
+	require.True(t, ok)
+	require.Len(t, waiting, 1)
+	entry := waiting[0].(map[string]any)
+	assert.Equal(t, float64(promptID), entry["id"])
+	assert.Equal(t, "DELETE", entry["statement_type"])
+	assert.Equal(t, waitID, entry["sync_wait_id"])
+
+	// Wake the waiter → the next call must show count=0 (the wake
+	// removes the in-memory registry entry).
+	_, _ = st.WakeSyncPendingPrompt(waitID, store.PromptDecisionAllow)
+	sc2 := rpcCallTool(t, srv, "dbounce_pending_sync_prompts", nil)
+	assert.Equal(t, float64(0), sc2["count"],
+		"after wake, dbounce_pending_sync_prompts must return zero waiters")
+}
+

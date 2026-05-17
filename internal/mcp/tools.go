@@ -166,6 +166,21 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "dbounce_pending_sync_prompts",
+			"description": "List the synchronous deny-prompts (#203 — " +
+				"--sync-prompt-on-deny) whose request goroutine is currently " +
+				"BLOCKED waiting for `dbounce prompts answer`. Each entry " +
+				"carries id (use with prompts answer), statement_type, " +
+				"tables, deny_reason, and sync_wait_id. Excludes historical " +
+				"prompts that have been answered/timed-out — only LIVE " +
+				"waiters appear. DETERMINISTIC: SQL query of pending_prompts " +
+				"JOINed against the in-memory wait-channel registry.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name": "dbounce_tail_decisions",
 			"description": "Inspect the recent decision audit log " +
 				"(every statement dbounce gated). Newest first. Useful " +

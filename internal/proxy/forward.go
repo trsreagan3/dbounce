@@ -83,6 +83,179 @@ func (s *Server) upstreamForwardingActive() bool {
 	return s.cfg.Upstream != nil
 }
 
+// syncPromptActive reports whether #203's synchronous deny-prompt
+// path should fire for THIS request. The check intentionally mirrors
+// the "block before deny" gate exactly so PG + MySQL forwarders agree
+// without a per-protocol fork:
+//
+//   - --sync-prompt-on-deny must be set (operator opt-in)
+//   - mode must be transparent (cooperative DENYs are advisory; sync
+//     would be theater)
+//   - an upstream must be configured (otherwise there's nowhere to
+//     forward an allow answer to; the CLI also rejects this at parse,
+//     so this is a defensive duplicate)
+//   - no pause window may be active (pause supersedes — the operator
+//     already said "let it through")
+//
+// Lookup-failure on IsPaused logs + treats as "not paused" (same
+// policy as the rest of the proxy — a flaky SQLite read must not
+// silently disable a security gate).
+func (s *Server) syncPromptActive() bool {
+	if !s.cfg.SyncPromptOnDeny {
+		return false
+	}
+	if s.cfg.Mode != ModeTransparent {
+		return false
+	}
+	if !s.upstreamForwardingActive() {
+		return false
+	}
+	if s.store == nil {
+		return false
+	}
+	paused, _, err := s.store.IsPaused()
+	if err != nil {
+		BumpLookupErrors()
+		log.Warn().Err(err).Msg("dbounce: IsPaused lookup failed in syncPromptActive; treating as not paused")
+		return true
+	}
+	return !paused
+}
+
+// awaitSyncPromptDecision enqueues a sync prompt + blocks the calling
+// goroutine until the operator answers, the timeout expires, or the
+// caller's context fires. Returns the decision applied (allow / deny /
+// timeout) along with the prompt id that was created (audit-row
+// linkage) and the sync_wait_id (so callers can log it).
+//
+// SHARED across PG + MySQL forwarders so the lifecycle is in one
+// place. The protocol-specific bytes ("emit ErrorResponse" vs "emit
+// ERR_Packet" / "forward the original packet" vs "forward the
+// original message") still live in each forwarder; this helper owns
+// the channel + timeout + cancel-on-exit lifecycle.
+//
+// CROSS-PROCESS WAKEUP: The in-memory registry channel works ONLY
+// when the proxy + the `dbounce prompts answer` invocation share a
+// process (rare; the CLI typically runs as a separate command). To
+// make the cross-process case work, this helper ALSO polls the
+// pending_prompts row's status column on a 200ms cadence + maps the
+// persisted answer kind onto a PromptDecision. Both paths race; the
+// first one wins. The poll is cheap (single indexed lookup against
+// SQLite) and bounded by the same timeout.
+func (s *Server) awaitSyncPromptDecision(ps *parsedStatementView, decisionID int64, denyReason string) (store.PromptDecision, int64, string) {
+	if s.store == nil {
+		// Defensive: callers gate on syncPromptActive() which already
+		// requires a store, but be conservative.
+		return resolveSyncPromptTimeout(s.cfg.SyncPromptDefault), 0, ""
+	}
+	promptID, waitID, ch, err := s.store.AddSyncPendingPrompt(store.PendingPrompt{
+		DecisionID:      decisionID,
+		StatementType:   ps.StatementType,
+		TablesTouched:   ps.TablesTouched,
+		FunctionsCalled: ps.FunctionsCalled,
+		DenyReason:      denyReason,
+	})
+	if err != nil {
+		BumpLookupErrors()
+		log.Warn().Err(err).Int64("decision_id", decisionID).
+			Msg("dbounce: enqueue sync pending prompt failed; falling back to deny")
+		// Audit invariant: we'd rather over-deny than silently allow
+		// on storage-layer failure. The CLI's transparent-mode DENY
+		// path fires next.
+		return store.PromptDecisionDeny, 0, ""
+	}
+	timeout := s.cfg.SyncPromptTimeout
+	if timeout <= 0 {
+		// Defensive: Normalize sets a default, but if a caller
+		// constructs Config directly without Normalize() this
+		// prevents a 0-duration timer (fires immediately) from
+		// silently turning sync into "always use the default".
+		timeout = 30 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	// Cross-process poll. 200ms strikes the balance between operator-
+	// perceived latency ("I answered, why is the query still hung?")
+	// + SQLite read overhead (negligible for an indexed single-row
+	// lookup, but no point hammering it). Stops on the same defer
+	// chain as `timer`.
+	poll := time.NewTicker(200 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case decision, ok := <-ch:
+			if !ok {
+				return resolveSyncPromptTimeout(s.cfg.SyncPromptDefault), promptID, waitID
+			}
+			log.Info().Str("sync_wait_id", waitID).Int64("prompt_id", promptID).
+				Str("decision", string(decision)).
+				Msg("dbounce: sync deny-prompt resolved by operator answer (same-process channel)")
+			return decision, promptID, waitID
+		case <-poll.C:
+			// Cross-process path: read the row's status. The CLI's
+			// `prompts answer` UPDATEd the row (via the same SQLite
+			// file) but couldn't wake our in-memory channel because
+			// it's a separate process. We poll for the change.
+			p, perr := s.store.GetPendingPrompt(promptID)
+			if perr != nil {
+				BumpLookupErrors()
+				log.Warn().Err(perr).Int64("prompt_id", promptID).
+					Msg("dbounce: poll sync prompt status failed; continuing")
+				continue
+			}
+			if p == nil || p.Status == store.PromptPending {
+				continue
+			}
+			// Operator answered cross-process. Cancel our registry
+			// entry so it doesn't leak; map answer kind → decision.
+			s.store.CancelSyncPendingPrompt(waitID)
+			decision := store.PromptDecisionDeny
+			switch p.AnswerKind {
+			case "always", "profile":
+				decision = store.PromptDecisionAllow
+			case "ignore":
+				decision = store.PromptDecisionDeny
+			default:
+				// Defensive: an unrecognized kind defaults to deny.
+				decision = store.PromptDecisionDeny
+			}
+			log.Info().Str("sync_wait_id", waitID).Int64("prompt_id", promptID).
+				Str("answer_kind", p.AnswerKind).Str("decision", string(decision)).
+				Msg("dbounce: sync deny-prompt resolved by operator answer (cross-process poll)")
+			return decision, promptID, waitID
+		case <-timer.C:
+			s.store.CancelSyncPendingPrompt(waitID)
+			applied := resolveSyncPromptTimeout(s.cfg.SyncPromptDefault)
+			log.Info().Str("sync_wait_id", waitID).Int64("prompt_id", promptID).
+				Dur("timeout", timeout).Str("applied", string(applied)).
+				Msg("dbounce: sync deny-prompt timed out; applying --sync-prompt-default")
+			return applied, promptID, waitID
+		}
+	}
+}
+
+// parsedStatementView is the small subset of parser.ParsedStatement
+// the sync-prompt helper needs to enqueue a row. Kept proxy-private
+// so the helper doesn't pull in the parser pkg dependency
+// unnecessarily.
+type parsedStatementView struct {
+	StatementType   string
+	TablesTouched   []string
+	FunctionsCalled []string
+}
+
+// resolveSyncPromptTimeout maps the operator's --sync-prompt-default
+// to the corresponding PromptDecision. Timeout is its own distinct
+// PromptDecision in the wakeup ch path, but here we project it onto
+// the applied verdict so downstream decide-branches stay binary
+// (forward vs not-forward).
+func resolveSyncPromptTimeout(d SyncPromptDefault) store.PromptDecision {
+	if d == SyncPromptDefaultAllow {
+		return store.PromptDecisionAllow
+	}
+	return store.PromptDecisionDeny
+}
+
 // serveConnWithUpstream is the D-Slice 2 per-connection handler.
 func (s *Server) serveConnWithUpstream(in net.Conn) {
 	f := &Forwarder{
@@ -354,21 +527,76 @@ func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload
 	}
 
 	if dec.Verdict == VerdictDeny && f.srv.cfg.Mode == ModeTransparent {
-		row.Forwarded = false
-		row.UpstreamStatus = upstreamStatusNotForwarded
-		row.UpstreamResponseSummary = "transparent-mode deny: " + dec.Reason
-		row.Enforced = true
-		f.recordDecision(row, source)
-		if err := f.writeErrorToClient(sqlStateInsufficientPrivilege,
-			fmt.Sprintf("dbounce: denied: %s", dec.Reason)); err != nil {
-			return fmt.Errorf("write transparent-deny ErrorResponse: %w", err)
-		}
-		if msgType == msgQuery {
-			if err := writeReadyForQuery(f.in); err != nil {
-				return fmt.Errorf("write RFQ after deny: %w", err)
+		// #203 sync-prompt-on-deny: BLOCK this goroutine waiting for
+		// the operator's answer BEFORE we commit to denying. If the
+		// operator answers allow (kind=always or kind=profile), we
+		// flip the local decision to allow + fall through to the
+		// forward path. If they answer deny (kind=ignore) or the
+		// timeout fires with --sync-prompt-default=deny, we proceed
+		// with the existing transparent-deny path.
+		//
+		// We record the DENY audit row FIRST (so the sync prompt has
+		// a real decision_id FK to point at + the audit log captures
+		// "the rule engine wanted DENY"), then re-record the eventual
+		// resolved outcome as a second row. That double-row pattern
+		// keeps both halves of the decision visible to post-incident
+		// review: "rule wanted deny, operator allowed via sync prompt
+		// at HH:MM:SS, request forwarded with N rows returned."
+		syncFlippedToAllow := false
+		if f.srv.syncPromptActive() {
+			pendingRow := row
+			pendingRow.Forwarded = false
+			pendingRow.UpstreamStatus = upstreamStatusNotForwarded
+			pendingRow.UpstreamResponseSummary = "sync-prompt-on-deny: blocking for operator answer (reason: " + dec.Reason + ")"
+			pendingRow.Enforced = false
+			pendingDecisionID, recErr := f.srv.store.RecordDecision(pendingRow)
+			if recErr != nil {
+				BumpLookupErrors()
+				log.Warn().Err(recErr).Str("source", source).
+					Msg("dbounce: record sync-prompt pending decision failed; falling back to plain deny")
+			} else {
+				psv := &parsedStatementView{
+					StatementType:   row.StatementType,
+					TablesTouched:   row.TablesTouched,
+					FunctionsCalled: row.FunctionsCalled,
+				}
+				outcome, promptID, waitID := f.srv.awaitSyncPromptDecision(psv, pendingDecisionID, dec.Reason)
+				if outcome == store.PromptDecisionAllow {
+					row.DecisionVerdict = string(VerdictAllow)
+					row.DecisionReason = fmt.Sprintf(
+						"sync-prompt-on-deny allowed by operator (rule engine wanted DENY: %s; sync_wait_id=%s, prompt_id=%d)",
+						dec.Reason, waitID, promptID)
+					row.DecisionSource = "sync-prompt.allow"
+					syncFlippedToAllow = true
+				} else {
+					// PromptDecisionDeny (operator said ignore) OR
+					// PromptDecisionTimeout-projected-to-deny.
+					row.DecisionReason = fmt.Sprintf(
+						"%s (sync prompt %d: %s; sync_wait_id=%s)",
+						dec.Reason, promptID, string(outcome), waitID)
+				}
 			}
 		}
-		return nil
+		if !syncFlippedToAllow {
+			row.Forwarded = false
+			row.UpstreamStatus = upstreamStatusNotForwarded
+			row.UpstreamResponseSummary = "transparent-mode deny: " + row.DecisionReason
+			row.Enforced = true
+			f.recordDecision(row, source)
+			if err := f.writeErrorToClient(sqlStateInsufficientPrivilege,
+				fmt.Sprintf("dbounce: denied: %s", row.DecisionReason)); err != nil {
+				return fmt.Errorf("write transparent-deny ErrorResponse: %w", err)
+			}
+			if msgType == msgQuery {
+				if err := writeReadyForQuery(f.in); err != nil {
+					return fmt.Errorf("write RFQ after deny: %w", err)
+				}
+			}
+			return nil
+		}
+		// syncFlippedToAllow=true: fall through into the forward path
+		// below — the operator's "allow" answer turns this into the
+		// equivalent of cooperative-mode forwarding.
 	}
 
 	row.Forwarded = true

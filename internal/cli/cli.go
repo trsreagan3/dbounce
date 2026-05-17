@@ -381,6 +381,15 @@ func newRunCmd() *cobra.Command {
 		// decisions enqueue a pending_prompts row for `dbounce prompts
 		// answer` to drain. Default false preserves D-Slice 3 behavior.
 		promptOnDeny bool
+		// #203 synchronous deny-prompt v1.1: opt-in companion to
+		// --prompt-on-deny. Blocks the SQL request goroutine for up to
+		// --sync-prompt-timeout waiting for an operator answer; on
+		// allow the proxy forwards + returns the real result. Mutually
+		// exclusive with --prompt-on-deny (different UX shape; running
+		// both creates per-request ambiguity).
+		syncPromptOnDeny     bool
+		syncPromptTimeoutStr string
+		syncPromptDefaultStr string
 		// MED-D8-09 (AUDIT-WB-DSLICES-1-8.md): when true, the audit
 		// row's persisted Statement field has quoted string literals
 		// swapped for [REDACTED] before insertion. Default false
@@ -495,6 +504,73 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 					mgmtHost)
 			}
 
+			// #203 sync-prompt validation — fail-fast at parse before
+			// any listeners bind:
+			//
+			//   - --sync-prompt-on-deny + --prompt-on-deny on the
+			//     same invocation: rejected (mutually exclusive UX).
+			//   - --sync-prompt-on-deny without --upstream: rejected
+			//     (observation-only mode has nowhere to forward an
+			//     allow answer to; the block would always resolve
+			//     to its default).
+			//   - --sync-prompt-on-deny + --mode cooperative: warn
+			//     (cooperative DENYs are advisory; sync-blocking on
+			//     them would block a request the proxy was about to
+			//     forward anyway). Treated as a no-op at runtime.
+			//   - --sync-prompt-timeout outside 5s-300s: rejected
+			//     (5s = minimum credible operator-reaction window;
+			//     300s = beyond any sane SQL client timeout).
+			//   - --sync-prompt-default must be allow|deny.
+			var syncPromptTimeout time.Duration
+			var syncPromptDefault proxy.SyncPromptDefault
+			if syncPromptOnDeny {
+				if promptOnDeny {
+					return fmt.Errorf(
+						"dbounce: --sync-prompt-on-deny and --prompt-on-deny " +
+							"are mutually exclusive (different UX shapes — " +
+							"sync blocks the request goroutine; async returns " +
+							"a SQL error immediately + queues for review). " +
+							"Pick one.")
+				}
+				if upstreamURL == "" {
+					return fmt.Errorf(
+						"dbounce: --sync-prompt-on-deny requires --upstream " +
+							"(observation-only mode has nowhere to forward an " +
+							"'allow' answer to). Set --upstream or drop the " +
+							"flag.")
+				}
+				d, err := time.ParseDuration(syncPromptTimeoutStr)
+				if err != nil {
+					return fmt.Errorf(
+						"dbounce: --sync-prompt-timeout: parse %q: %w",
+						syncPromptTimeoutStr, err)
+				}
+				if d < 5*time.Second || d > 300*time.Second {
+					return fmt.Errorf(
+						"dbounce: --sync-prompt-timeout must be in 5s-300s "+
+							"(got %s). 5s is the minimum credible operator-"+
+							"reaction window; 300s is beyond any sane SQL "+
+							"client timeout.", d)
+				}
+				syncPromptTimeout = d
+				sd, err := proxy.ParseSyncPromptDefault(syncPromptDefaultStr)
+				if err != nil {
+					return err
+				}
+				syncPromptDefault = sd
+				if mode == proxy.ModeCooperative {
+					// Warning, not error. The flag is harmless in
+					// cooperative mode because the deny is advisory
+					// (no block applied), but operators who set it
+					// expecting a block should know the gate didn't
+					// fire.
+					fmt.Fprintln(os.Stderr,
+						"dbounce: --sync-prompt-on-deny has no effect in "+
+							"cooperative mode (advisory DENYs are not "+
+							"blocked); the flag is being ignored at runtime.")
+				}
+			}
+
 			// D-Slice 2: resolve the upstream forwarding target. Empty
 			// --upstream preserves D-Slice 1 observation-only mode.
 			var resolvedUpstream *upstream.Upstream
@@ -593,6 +669,9 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				ActiveProfile:     activeProfile,
 				ActiveProfileName: activeProfile.Name,
 				PromptOnDeny:      promptOnDeny,
+				SyncPromptOnDeny:  syncPromptOnDeny,
+				SyncPromptTimeout: syncPromptTimeout,
+				SyncPromptDefault: syncPromptDefault,
 				RedactLiterals:    redactLiterals,
 			}.Normalize()
 
@@ -754,6 +833,29 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"Has no effect in cooperative mode (advisory verdicts aren't "+
 			"prompted) or during an active pause window (operator already "+
 			"said allow).")
+	// #203 synchronous deny-prompt v1.1.
+	cmd.Flags().BoolVar(&syncPromptOnDeny, "sync-prompt-on-deny", false,
+		"Synchronous companion to --prompt-on-deny (mutually exclusive). "+
+			"In transparent mode, every DENY BLOCKS the SQL request for up "+
+			"to --sync-prompt-timeout waiting for an operator answer via "+
+			"`dbounce prompts answer ID --kind {ignore|always|profile}`. "+
+			"Answer kind=always/profile → forwards the original SQL to "+
+			"--upstream + returns the actual upstream result rows. Answer "+
+			"kind=ignore (or timeout with --sync-prompt-default=deny) → "+
+			"returns the DENY SQL error. Requires --upstream "+
+			"(observation-only mode has nowhere to forward to). Pause "+
+			"window supersedes. Per [[ibounce-honest-positioning]]: this "+
+			"is a deterrent UX for legitimate human-in-loop, not "+
+			"adversarial defense.")
+	cmd.Flags().StringVar(&syncPromptTimeoutStr, "sync-prompt-timeout", "30s",
+		"How long --sync-prompt-on-deny blocks waiting for an operator "+
+			"answer before applying --sync-prompt-default. Range 5s-300s; "+
+			"default 30s.")
+	cmd.Flags().StringVar(&syncPromptDefaultStr, "sync-prompt-default", "deny",
+		"Verdict --sync-prompt-on-deny applies on timeout: allow | deny. "+
+			"Default deny matches the operator's likely posture ('if I'm "+
+			"not here to approve, refuse'); allow suits the rarer 'fail-"+
+			"open if I'm asleep' stance.")
 	cmd.Flags().BoolVar(&quietBanner, "quiet-banner", false,
 		"Reduce the startup banner to listener address + dialect only. "+
 			"Suppresses the mode / default-policy / profile / upstream / "+

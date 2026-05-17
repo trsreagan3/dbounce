@@ -486,19 +486,58 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 	}
 
 	if dec.Verdict == VerdictDeny && f.srv.cfg.Mode == ModeTransparent {
-		row.Forwarded = false
-		row.UpstreamStatus = upstreamStatusNotForwarded
-		row.UpstreamResponseSummary = "transparent-mode deny: " + dec.Reason
-		row.Enforced = true
-		if _, err := f.srv.store.RecordDecision(row); err != nil {
-			BumpLookupErrors()
+		// #203 sync-prompt-on-deny — parallel to forward.go's PG path.
+		// See that file's commentary for the audit-row double-record
+		// pattern + the syncPromptActive gate.
+		syncFlippedToAllow := false
+		if f.srv.syncPromptActive() {
+			pendingRow := row
+			pendingRow.Forwarded = false
+			pendingRow.UpstreamStatus = upstreamStatusNotForwarded
+			pendingRow.UpstreamResponseSummary = "sync-prompt-on-deny: blocking for operator answer (reason: " + dec.Reason + ")"
+			pendingRow.Enforced = false
+			pendingDecisionID, recErr := f.srv.store.RecordDecision(pendingRow)
+			if recErr != nil {
+				BumpLookupErrors()
+				log.Warn().Err(recErr).
+					Msg("dbounce: record mysql sync-prompt pending decision failed; falling back to plain deny")
+			} else {
+				psv := &parsedStatementView{
+					StatementType:   row.StatementType,
+					TablesTouched:   row.TablesTouched,
+					FunctionsCalled: row.FunctionsCalled,
+				}
+				outcome, promptID, waitID := f.srv.awaitSyncPromptDecision(psv, pendingDecisionID, dec.Reason)
+				if outcome == store.PromptDecisionAllow {
+					row.DecisionVerdict = string(VerdictAllow)
+					row.DecisionReason = fmt.Sprintf(
+						"sync-prompt-on-deny allowed by operator (rule engine wanted DENY: %s; sync_wait_id=%s, prompt_id=%d)",
+						dec.Reason, waitID, promptID)
+					row.DecisionSource = "sync-prompt.allow"
+					syncFlippedToAllow = true
+				} else {
+					row.DecisionReason = fmt.Sprintf(
+						"%s (sync prompt %d: %s; sync_wait_id=%s)",
+						dec.Reason, promptID, string(outcome), waitID)
+				}
+			}
 		}
-		if err := writeMySQLErr(f.in, seq+1, mysqlErrSpecificAccessDenied,
-			mysqlSQLStateAccessDenied,
-			"dbounce: denied: "+dec.Reason); err != nil {
-			return fmt.Errorf("write transparent-deny ErrPacket: %w", err)
+		if !syncFlippedToAllow {
+			row.Forwarded = false
+			row.UpstreamStatus = upstreamStatusNotForwarded
+			row.UpstreamResponseSummary = "transparent-mode deny: " + row.DecisionReason
+			row.Enforced = true
+			if _, err := f.srv.store.RecordDecision(row); err != nil {
+				BumpLookupErrors()
+			}
+			if err := writeMySQLErr(f.in, seq+1, mysqlErrSpecificAccessDenied,
+				mysqlSQLStateAccessDenied,
+				"dbounce: denied: "+row.DecisionReason); err != nil {
+				return fmt.Errorf("write transparent-deny ErrPacket: %w", err)
+			}
+			return nil
 		}
-		return nil
+		// syncFlippedToAllow=true — fall through to forward path.
 	}
 
 	row.Forwarded = true

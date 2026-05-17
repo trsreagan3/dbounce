@@ -61,7 +61,16 @@ import (
 //	    stored SQL had its quoted string literals swapped for
 //	    [REDACTED] before persistence — they MUST NOT trust the row's
 //	    SQL for replay when this column is true.
-const SchemaVersion = 3
+//	4 — #203 synchronous deny-prompt v1.1: pending_prompts table gains
+//	    sync_wait_id TEXT column (nullable; UNIQUE when set) so the
+//	    proxy can correlate an in-flight blocked request with the
+//	    operator's eventual `dbounce prompts answer ID` call. The
+//	    wakeup channel itself is in-memory (lost on restart — the
+//	    blocked request goroutine is dead too); the UUID is the
+//	    persistence-side handle. Crash-safe: a restart returns the
+//	    blocked client an SQL error via TCP-close, and the prompt row
+//	    survives so the operator still sees it in `prompts list`.
+const SchemaVersion = 4
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors DBOUNCE_DB for tests and CI sandboxes that want
@@ -80,8 +89,14 @@ func DefaultDBPath() (string, error) {
 // Store wraps a sql.DB plus migration state. Safe for concurrent use
 // from multiple goroutines (sql.DB handles its own pooling).
 type Store struct {
-	db   *sql.DB
-	path string
+	db       *sql.DB
+	path     string
+	// syncReg is the #203 in-memory registry of sync-prompt wakeup
+	// channels keyed by sync_wait_id UUID. Populated by
+	// AddSyncPendingPrompt; drained by WakeSyncPendingPrompt /
+	// CancelSyncPendingPrompt. Lost on process restart by design —
+	// the request goroutine that owned the channel is also dead.
+	syncReg *syncWaiterRegistry
 }
 
 // Open initializes (creating if needed) the SQLite database at path.
@@ -146,7 +161,7 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 
-	s := &Store{db: db, path: path}
+	s := &Store{db: db, path: path, syncReg: newSyncWaiterRegistry()}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -281,6 +296,15 @@ func (s *Store) migrate() error {
 		// Existing pre-MED-D8-08 databases retain the pre-FK table
 		// shape (SQLite can't ALTER TABLE to add an FK); fresh
 		// installations (the v1.0 launch case) get the constraint.
+		// #203 (synchronous deny-prompt v1.1): sync_wait_id is a
+		// nullable TEXT column carrying the UUID the proxy goroutine
+		// uses to find its wakeup channel when an operator answers a
+		// prompt via `dbounce prompts answer`. NULL = async-style
+		// prompt (existing D-Slice 8 --prompt-on-deny behavior — fire-
+		// and-forget). Non-NULL = a request goroutine is currently
+		// blocked on the wakeup. The UNIQUE constraint applies only
+		// when populated (partial index below) so multiple async
+		// prompts with NULL sync_wait_id coexist.
 		`CREATE TABLE IF NOT EXISTS pending_prompts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			created_at TEXT NOT NULL,
@@ -293,10 +317,17 @@ func (s *Store) migrate() error {
 			answer_kind TEXT,
 			answer_target TEXT,
 			answered_by TEXT,
-			answered_at TEXT
+			answered_at TEXT,
+			sync_wait_id TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_prompts_status ON pending_prompts(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_prompts_created_at ON pending_prompts(created_at)`,
+		// #203: partial UNIQUE index on sync_wait_id (only when populated).
+		// SQLite supports partial indexes — this enforces uniqueness on
+		// the in-flight sync prompts without disturbing the existing
+		// async prompts (which leave sync_wait_id NULL).
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_prompts_sync_wait_id
+			ON pending_prompts(sync_wait_id) WHERE sync_wait_id IS NOT NULL`,
 		// MED-D8-07 (AUDIT-WB-DSLICES-1-8.md) closure: enforce append-only
 		// semantics on `decisions` via BEFORE UPDATE / BEFORE DELETE
 		// triggers. The audit log is dbounce's gating invariant — a
@@ -334,6 +365,13 @@ func (s *Store) migrate() error {
 		if err := s.addColumnIfMissing("decisions", col.name, col.decl); err != nil {
 			return err
 		}
+	}
+
+	// #203 additive migration for pre-v4 databases: add sync_wait_id
+	// column to pending_prompts (NULL = legacy async-style prompt; no
+	// in-flight blocked goroutine waiting on a wakeup).
+	if err := s.addColumnIfMissing("pending_prompts", "sync_wait_id", "TEXT"); err != nil {
+		return err
 	}
 
 	// Stamp / bump schema_version.

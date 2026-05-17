@@ -32,12 +32,109 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
+
+// PromptDecision is the wakeup signal a sync-prompt-blocked request
+// goroutine receives from `dbounce prompts answer`. Drives the proxy's
+// "forward to upstream OR return SQL error" branch on the unblock.
+//
+// #203 (synchronous deny-prompt v1.1) — three values:
+//
+//   - PromptDecisionAllow  — answer was 'always' or 'profile' (the
+//     operator approved); proxy forwards the original SQL bytes to
+//     the upstream + relays the response.
+//   - PromptDecisionDeny   — answer was 'ignore' (the operator chose
+//     not to allow); proxy emits the original deny ErrorResponse.
+//   - PromptDecisionTimeout — no answer arrived inside the timeout;
+//     proxy applies --sync-prompt-default (allow|deny). Distinct from
+//     Deny so audit-log analytics can ask "how often does timeout
+//     fire?" without parsing reason text.
+type PromptDecision string
+
+const (
+	PromptDecisionAllow   PromptDecision = "allow"
+	PromptDecisionDeny    PromptDecision = "deny"
+	PromptDecisionTimeout PromptDecision = "timeout"
+)
+
+// syncWaiters is the in-memory map from sync_wait_id UUID → wakeup
+// channel. Populated by AddSyncPendingPrompt; drained by
+// WakeSyncPendingPrompt. Lost on process restart — the request
+// goroutine that owned the channel is also dead, so the loss is
+// symmetric (no orphan channels, no zombie waiters). Mutex-guarded so
+// the answer path can safely race the request path.
+type syncWaiter struct {
+	ch        chan PromptDecision
+	promptID  int64
+	createdAt time.Time
+}
+
+// syncWaiterRegistry is per-Store so multiple Open() calls in the same
+// process (rare; tests use it) don't share runtime state.
+type syncWaiterRegistry struct {
+	mu       sync.Mutex
+	waiters  map[string]*syncWaiter
+}
+
+func newSyncWaiterRegistry() *syncWaiterRegistry {
+	return &syncWaiterRegistry{waiters: make(map[string]*syncWaiter)}
+}
+
+func (r *syncWaiterRegistry) add(waitID string, w *syncWaiter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.waiters[waitID] = w
+}
+
+func (r *syncWaiterRegistry) remove(waitID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.waiters, waitID)
+}
+
+// take atomically retrieves + removes a waiter. Returns nil when the
+// id is unknown (already removed by timeout/cancel, or never existed).
+func (r *syncWaiterRegistry) take(waitID string) *syncWaiter {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w := r.waiters[waitID]
+	if w != nil {
+		delete(r.waiters, waitID)
+	}
+	return w
+}
+
+// snapshotIDs returns the currently-waiting wait IDs. Used by the MCP
+// tool `dbounce_pending_sync_prompts` to JOIN against pending_prompts.
+func (r *syncWaiterRegistry) snapshotIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.waiters))
+	for id := range r.waiters {
+		out = append(out, id)
+	}
+	return out
+}
+
+// randomSyncWaitID returns a hex-encoded 16-byte random id. Good enough
+// for in-flight correlation; not a security token (the registry is
+// process-local + the id never traverses the wire — operators look up
+// prompts by their integer id, not by sync_wait_id).
+func randomSyncWaitID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // PromptStatus is the lifecycle state of a pending_prompts row.
 type PromptStatus string
@@ -67,6 +164,12 @@ type PendingPrompt struct {
 	AnswerTarget  string
 	AnsweredBy    string
 	AnsweredAt    string
+	// SyncWaitID, when non-empty, names the in-memory wakeup channel a
+	// proxy request goroutine is blocked on, waiting for an operator
+	// answer. Set by AddSyncPendingPrompt; nil for legacy async
+	// prompts (existing --prompt-on-deny behavior). #203 (synchronous
+	// deny-prompt v1.1).
+	SyncWaitID string
 }
 
 // AddPendingPrompt enqueues a prompt referencing the decision row that
@@ -122,7 +225,8 @@ func (s *Store) ListPendingPrompts(status PromptStatus, limit int) ([]PendingPro
 	base := `SELECT id, created_at, decision_id, statement_type,
 	                tables_json, functions_json, deny_reason, status,
 	                COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
-	                COALESCE(answered_by, ''), COALESCE(answered_at, '')
+	                COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+	                COALESCE(sync_wait_id, '')
 	         FROM pending_prompts`
 	if status != "" {
 		query = base + ` WHERE status = ? ORDER BY id DESC LIMIT ?`
@@ -156,7 +260,8 @@ func (s *Store) GetPendingPrompt(id int64) (*PendingPrompt, error) {
 		`SELECT id, created_at, decision_id, statement_type,
 		        tables_json, functions_json, deny_reason, status,
 		        COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
-		        COALESCE(answered_by, ''), COALESCE(answered_at, '')
+		        COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+		        COALESCE(sync_wait_id, '')
 		 FROM pending_prompts WHERE id = ?`, id)
 	p, err := scanPromptRow(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -212,13 +317,179 @@ func scanPromptRow(sc scanner) (PendingPrompt, error) {
 	)
 	if err := sc.Scan(&p.ID, &p.CreatedAt, &p.DecisionID, &p.StatementType,
 		&tablesJSON, &funcsJSON, &p.DenyReason, &status,
-		&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt); err != nil {
+		&p.AnswerKind, &p.AnswerTarget, &p.AnsweredBy, &p.AnsweredAt,
+		&p.SyncWaitID); err != nil {
 		return PendingPrompt{}, err
 	}
 	p.Status = PromptStatus(status)
 	p.TablesTouched = unmarshalStrings(tablesJSON)
 	p.FunctionsCalled = unmarshalStrings(funcsJSON)
 	return p, nil
+}
+
+// AddSyncPendingPrompt enqueues a SYNCHRONOUS deny-prompt (#203 — the
+// v1.1 follow-up to D-Slice 8's async --prompt-on-deny). The returned
+// channel fires exactly once when an operator answers via
+// `dbounce prompts answer` (or the caller cancels via
+// CancelSyncPendingPrompt — the proxy timeout path does this).
+//
+// Lifecycle:
+//
+//  1. Caller (proxy request goroutine) calls AddSyncPendingPrompt;
+//     receives (promptID, waitID, ch, err).
+//  2. Caller `select`s on ch + a timeout + ctx.Done().
+//  3. When the operator runs `dbounce prompts answer ID --kind X`, the
+//     answer handler calls WakeSyncPendingPrompt(waitID, decision).
+//     That send-on-channel + close fires the caller's select.
+//  4. The caller MUST call CancelSyncPendingPrompt(waitID) when its
+//     select fires on timeout / ctx.Done() — otherwise the registry
+//     map leaks the channel (best-effort; the process restarting
+//     also clears it).
+//
+// Returned channel is buffered size 1 so WakeSyncPendingPrompt never
+// blocks even when the caller has already moved on.
+//
+// Crash-safety: the channel is in-memory only; on restart the proxy
+// goroutine that owned this channel is also dead, so the wakeup
+// signal would have nowhere to go anyway. The DB row survives the
+// restart so `dbounce prompts list` still surfaces the prompt — the
+// operator can answer it, the wakeup will no-op (registry empty),
+// and the row's status stamps as answered. The originally-blocked
+// SQL client received its connection-close (or upstream timeout) at
+// the same instant the proxy crashed, so there's no "ghost waiter."
+func (s *Store) AddSyncPendingPrompt(p PendingPrompt) (int64, string, <-chan PromptDecision, error) {
+	if p.DecisionID <= 0 {
+		return 0, "", nil, fmt.Errorf("dbounce: AddSyncPendingPrompt: decision_id required")
+	}
+	waitID, err := randomSyncWaitID()
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("dbounce: generate sync_wait_id: %w", err)
+	}
+	createdAt := p.CreatedAt
+	if createdAt == "" {
+		createdAt = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	}
+	tablesJSON, err := marshalStrings(p.TablesTouched)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("dbounce: marshal prompt tables: %w", err)
+	}
+	funcsJSON, err := marshalStrings(p.FunctionsCalled)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("dbounce: marshal prompt functions: %w", err)
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO pending_prompts(
+			created_at, decision_id, statement_type,
+			tables_json, functions_json, deny_reason, status, sync_wait_id
+		) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+		createdAt, p.DecisionID, p.StatementType,
+		tablesJSON, funcsJSON, p.DenyReason, waitID,
+	)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("dbounce: insert sync prompt: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("dbounce: sync prompt last insert id: %w", err)
+	}
+	ch := make(chan PromptDecision, 1)
+	s.syncReg.add(waitID, &syncWaiter{
+		ch:        ch,
+		promptID:  id,
+		createdAt: time.Now(),
+	})
+	return id, waitID, ch, nil
+}
+
+// WakeSyncPendingPrompt delivers a decision to the goroutine blocked
+// on the wakeup channel for waitID. Returns (true, nil) when a waiter
+// was woken; (false, nil) when no waiter exists for waitID (timed-out,
+// canceled, or never existed — all equivalent at this layer).
+//
+// Non-blocking: the channel is buffered size 1 + we take ownership of
+// the waiter atomically before sending, so this never blocks even if
+// the answer side races the timeout side.
+func (s *Store) WakeSyncPendingPrompt(waitID string, decision PromptDecision) (bool, error) {
+	if waitID == "" {
+		return false, fmt.Errorf("dbounce: WakeSyncPendingPrompt: waitID required")
+	}
+	w := s.syncReg.take(waitID)
+	if w == nil {
+		return false, nil
+	}
+	// Buffered chan + we just removed the waiter, so send-then-close
+	// is race-free even if the caller already gave up (closing a
+	// non-empty buffered channel is legal in Go).
+	w.ch <- decision
+	close(w.ch)
+	return true, nil
+}
+
+// CancelSyncPendingPrompt removes a waiter from the in-memory registry
+// without sending a decision. Called by the proxy goroutine when its
+// select fires on timeout / ctx.Done() so the registry doesn't leak
+// the channel. Idempotent (no-op when waitID is unknown).
+func (s *Store) CancelSyncPendingPrompt(waitID string) {
+	if waitID == "" {
+		return
+	}
+	s.syncReg.remove(waitID)
+}
+
+// ListWaitingSyncPrompts returns the pending_prompts rows whose
+// sync_wait_id corresponds to a currently-in-memory waiter. Used by
+// the MCP tool `dbounce_pending_sync_prompts` so an agent can answer
+// "which sync prompts are blocking a request RIGHT NOW?" without
+// surfacing answered/timed-out historical rows.
+//
+// DETERMINISTIC: SQL JOIN of pending_prompts against the in-memory
+// registry snapshot. No LLM call, no advisory inference.
+func (s *Store) ListWaitingSyncPrompts() ([]PendingPrompt, error) {
+	waitIDs := s.syncReg.snapshotIDs()
+	if len(waitIDs) == 0 {
+		return nil, nil
+	}
+	// Build an IN-clause with one parameter per id. Bound the slice
+	// at a generous 500 so a runaway map can't generate a multi-MB
+	// query; in practice the registry stays small (one entry per
+	// in-flight blocked request).
+	if len(waitIDs) > 500 {
+		waitIDs = waitIDs[:500]
+	}
+	placeholders := make([]byte, 0, len(waitIDs)*2)
+	params := make([]any, 0, len(waitIDs))
+	for i, id := range waitIDs {
+		if i > 0 {
+			placeholders = append(placeholders, ',')
+		}
+		placeholders = append(placeholders, '?')
+		params = append(params, id)
+	}
+	query := `SELECT id, created_at, decision_id, statement_type,
+	                 tables_json, functions_json, deny_reason, status,
+	                 COALESCE(answer_kind, ''), COALESCE(answer_target, ''),
+	                 COALESCE(answered_by, ''), COALESCE(answered_at, ''),
+	                 COALESCE(sync_wait_id, '')
+	          FROM pending_prompts
+	          WHERE sync_wait_id IN (` + string(placeholders) + `)
+	          ORDER BY id DESC`
+	rows, err := s.db.Query(query, params...)
+	if err != nil {
+		return nil, fmt.Errorf("dbounce: list waiting sync prompts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]PendingPrompt, 0, len(waitIDs))
+	for rows.Next() {
+		p, err := scanPromptRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("dbounce: list waiting sync prompts iterate: %w", err)
+	}
+	return out, nil
 }
 
 // Silence unused-import diagnostics for json when no other prompts.go

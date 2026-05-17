@@ -277,11 +277,48 @@ func newPromptsAnswerCmd(profileWriter ProfileWriter) *cobra.Command {
 			by := resolveActor(actor)
 			targetSet := cmd.Flags().Changed("target")
 
+			// #203 sync-prompt wakeup helper. Closes over `p` + `st` +
+			// `cmd` so each kind branch can fire it after persisting
+			// the answer. Kind mapping:
+			//   - "ignore"            → PromptDecisionDeny
+			//   - "always" / "profile"→ PromptDecisionAllow
+			// When the prompt has no SyncWaitID (legacy async-only
+			// row), the wake is a no-op + nothing else changes.
+			wakeSync := func(decision store.PromptDecision) {
+				if p == nil || p.SyncWaitID == "" {
+					return
+				}
+				woke, werr := st.WakeSyncPendingPrompt(p.SyncWaitID, decision)
+				if werr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"dbounce: warning: WakeSyncPendingPrompt failed for "+
+							"prompt %d (sync_wait_id=%s): %v\n",
+						id, p.SyncWaitID, werr)
+					return
+				}
+				if !woke {
+					// Waiter already gone — timed out, the proxy
+					// goroutine cancelled, or the proxy restarted.
+					// The answer still persisted; the SQL client
+					// already received its outcome. Informational
+					// only.
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"dbounce: note: sync prompt %d had no live waiter "+
+							"(likely timed out or the proxy restarted); "+
+							"answer recorded for audit.\n", id)
+					return
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"sync-prompt waiter for prompt %d resumed with %s.\n",
+					id, decision)
+			}
+
 			switch kind {
 			case "ignore":
 				if _, err := st.AnswerPendingPrompt(id, "ignore", "", by); err != nil {
 					return err
 				}
+				wakeSync(store.PromptDecisionDeny)
 				fmt.Fprintf(cmd.OutOrStdout(),
 					"prompt %d ignored by %s.\n", id, by)
 				return nil
@@ -311,6 +348,7 @@ func newPromptsAnswerCmd(profileWriter ProfileWriter) *cobra.Command {
 				if _, err := st.AnswerPendingPrompt(id, "always", pattern, by); err != nil {
 					return err
 				}
+				wakeSync(store.PromptDecisionAllow)
 				fmt.Fprintf(cmd.OutOrStdout(),
 					"prompt %d answered with 'always'; added rule %d (pattern=%s)\n",
 					id, ruleID, pattern)
@@ -393,6 +431,7 @@ func newPromptsAnswerCmd(profileWriter ProfileWriter) *cobra.Command {
 				if _, err := st.AnswerPendingPrompt(id, "profile", resolved, by); err != nil {
 					return err
 				}
+				wakeSync(store.PromptDecisionAllow)
 				fmt.Fprintf(cmd.OutOrStdout(),
 					"prompt %d answered with 'profile'; created profile %q.\n",
 					id, resolved)

@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -58,14 +59,17 @@ type decideResult struct {
 
 func newDecideCmd() *cobra.Command {
 	var (
-		dialectStr    string
-		statement     string
-		readStdin     bool
-		dbPath        string
-		profileName   string
-		profilesPath  string
-		defaultPolStr string
-		asJSON        bool
+		dialectStr           string
+		statement            string
+		readStdin            bool
+		dbPath               string
+		profileName          string
+		profilesPath         string
+		defaultPolStr        string
+		asJSON               bool
+		syncPromptOnDeny     bool
+		syncPromptTimeoutStr string
+		syncPromptDefaultStr string
 	)
 	cmd := &cobra.Command{
 		Use:   "decide",
@@ -164,6 +168,91 @@ Exit code:
 			if err != nil {
 				return err
 			}
+
+			// #203 — sync-prompt-on-deny for the JDBC-shim path.
+			// `dbounce decide` is the supported invocation path for
+			// Snowflake/BigQuery (no wire-protocol proxy). When the
+			// operator sets --sync-prompt-on-deny + the verdict is
+			// deny, BLOCK on the wakeup channel exactly as the
+			// PG/MySQL forwarders do; resolved-allow flips the
+			// verdict so the shim wrapper sees exit code 0 +
+			// forwards to the real driver.
+			if syncPromptOnDeny && res.Verdict == "deny" {
+				d, perr := time.ParseDuration(syncPromptTimeoutStr)
+				if perr != nil {
+					return fmt.Errorf(
+						"--sync-prompt-timeout: parse %q: %w",
+						syncPromptTimeoutStr, perr)
+				}
+				if d < 5*time.Second || d > 300*time.Second {
+					return fmt.Errorf(
+						"--sync-prompt-timeout must be in 5s-300s (got %s)", d)
+				}
+				sd, perr := proxy.ParseSyncPromptDefault(syncPromptDefaultStr)
+				if perr != nil {
+					return perr
+				}
+				// Persist a real decision row so the prompt's FK is
+				// valid. The decide path normally writes NOTHING; we
+				// make the explicit exception here because the sync
+				// prompt requires an FK-anchored pending_prompts row.
+				decisionID, recErr := st.RecordDecision(store.DecisionRow{
+					Dialect:         res.Dialect,
+					Statement:       sql,
+					StatementType:   res.StatementType,
+					TablesTouched:   res.Tables,
+					FunctionsCalled: res.Functions,
+					IsDML:           res.IsDML,
+					IsDDL:           res.IsDDL,
+					HasMutatingNode: res.HasMutatingNode,
+					DecisionVerdict: "DENY",
+					DecisionReason: fmt.Sprintf(
+						"decide-path sync-prompt block (reason: %s)",
+						res.Reason),
+					ModeAtDecision: "transparent",
+					DecisionSource: res.DecisionSource,
+				})
+				if recErr != nil {
+					return fmt.Errorf(
+						"record sync-prompt decision: %w", recErr)
+				}
+				_, waitID, ch, addErr := st.AddSyncPendingPrompt(store.PendingPrompt{
+					DecisionID:      decisionID,
+					StatementType:   res.StatementType,
+					TablesTouched:   res.Tables,
+					FunctionsCalled: res.Functions,
+					DenyReason:      res.Reason,
+				})
+				if addErr != nil {
+					return fmt.Errorf(
+						"enqueue sync prompt: %w", addErr)
+				}
+				timer := time.NewTimer(d)
+				defer timer.Stop()
+				var outcome store.PromptDecision
+				select {
+				case decision := <-ch:
+					outcome = decision
+				case <-timer.C:
+					st.CancelSyncPendingPrompt(waitID)
+					if sd == proxy.SyncPromptDefaultAllow {
+						outcome = store.PromptDecisionAllow
+					} else {
+						outcome = store.PromptDecisionDeny
+					}
+				}
+				if outcome == store.PromptDecisionAllow {
+					res.Verdict = "allow"
+					res.DecisionSource = "sync-prompt.allow"
+					res.Reason = fmt.Sprintf(
+						"sync-prompt-on-deny allowed (was deny: %s; sync_wait_id=%s)",
+						res.Reason, waitID)
+				} else {
+					res.Reason = fmt.Sprintf(
+						"%s (sync prompt %s; sync_wait_id=%s)",
+						res.Reason, outcome, waitID)
+				}
+			}
 			if asJSON {
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				if eerr := enc.Encode(res); eerr != nil {
@@ -214,6 +303,20 @@ Exit code:
 		"Emit one JSON object instead of human-readable lines. The schema "+
 			"matches dbounce_decide MCP tool output so shim code can share "+
 			"a parser across CLI + JSON-RPC transports.")
+	// #203 synchronous deny-prompt v1.1 — JDBC-shim equivalent of the
+	// wire-protocol path.
+	cmd.Flags().BoolVar(&syncPromptOnDeny, "sync-prompt-on-deny", false,
+		"When the verdict is deny, BLOCK for up to --sync-prompt-timeout "+
+			"waiting for `dbounce prompts answer ID --kind ...`. Answer "+
+			"kind=always/profile → verdict flips to allow + decide exits 0 "+
+			"so the shim wrapper forwards the SQL to the real driver. "+
+			"Answer kind=ignore (or timeout with --sync-prompt-default=deny) "+
+			"→ verdict stays deny + decide exits 1.")
+	cmd.Flags().StringVar(&syncPromptTimeoutStr, "sync-prompt-timeout", "30s",
+		"How long --sync-prompt-on-deny blocks before applying "+
+			"--sync-prompt-default. Range 5s-300s; default 30s.")
+	cmd.Flags().StringVar(&syncPromptDefaultStr, "sync-prompt-default", "deny",
+		"Verdict --sync-prompt-on-deny applies on timeout: allow | deny.")
 	return cmd
 }
 

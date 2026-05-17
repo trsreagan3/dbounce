@@ -218,6 +218,8 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolDecide(args)
 	case "dbounce_tail_decisions":
 		return s.toolTailDecisions(args)
+	case "dbounce_pending_sync_prompts":
+		return s.toolPendingSyncPrompts(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
@@ -632,6 +634,41 @@ func (s *Server) toolTailDecisions(args map[string]any) (map[string]any, error) 
 	return map[string]any{
 		"decisions": out,
 		"count":     len(out),
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_pending_sync_prompts — #203 synchronous deny-prompt v1.1.
+// Returns the LIST of prompts whose request goroutine is currently
+// blocked waiting for `dbounce prompts answer`. DETERMINISTIC: a SQL
+// query of pending_prompts JOINed against the in-memory wait-channel
+// registry (waiters lost on restart are filtered out automatically).
+// ---------------------------------------------------------------------
+
+func (s *Server) toolPendingSyncPrompts(_ map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	prompts, err := s.cfg.Store.ListWaitingSyncPrompts()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(prompts))
+	for _, p := range prompts {
+		out = append(out, map[string]any{
+			"id":             p.ID,
+			"created_at":     p.CreatedAt,
+			"decision_id":    p.DecisionID,
+			"statement_type": p.StatementType,
+			"tables":         p.TablesTouched,
+			"functions":      p.FunctionsCalled,
+			"deny_reason":    p.DenyReason,
+			"sync_wait_id":   p.SyncWaitID,
+		})
+	}
+	return map[string]any{
+		"waiting": out,
+		"count":   len(out),
 	}, nil
 }
 

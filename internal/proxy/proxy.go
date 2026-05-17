@@ -53,6 +53,30 @@ func (m Mode) IsValid() bool {
 	return m == ModeCooperative || m == ModeTransparent
 }
 
+// SyncPromptDefault names the fallback verdict for #203 sync-prompt
+// timeouts. Two values (parallel to DefaultPolicy on purpose — the
+// shape is "what if nobody answers?", same question, different layer).
+type SyncPromptDefault string
+
+const (
+	SyncPromptDefaultAllow SyncPromptDefault = "allow"
+	SyncPromptDefaultDeny  SyncPromptDefault = "deny"
+)
+
+// IsValid reports whether d is one of the recognized values.
+func (d SyncPromptDefault) IsValid() bool {
+	return d == SyncPromptDefaultAllow || d == SyncPromptDefaultDeny
+}
+
+// ParseSyncPromptDefault parses a CLI flag value.
+func ParseSyncPromptDefault(s string) (SyncPromptDefault, error) {
+	d := SyncPromptDefault(s)
+	if d.IsValid() {
+		return d, nil
+	}
+	return "", fmt.Errorf("dbounce: unknown sync-prompt-default %q (want allow | deny)", s)
+}
+
 // DefaultPolicy names what dbounce does when no rule matches a
 // statement in transparent mode. D-Slice 3 consults it at the end of
 // the composition order.
@@ -217,6 +241,40 @@ type Config struct {
 	// D-Slice 3 transparent-mode behavior.
 	PromptOnDeny bool
 
+	// SyncPromptOnDeny — #203 (synchronous deny-prompt v1.1). When
+	// true AND mode=transparent AND an upstream is configured AND no
+	// pause is active, every DENY enqueues a sync prompt + BLOCKS the
+	// request goroutine waiting for `dbounce prompts answer`. Answer
+	// allow → forward upstream + relay actual result rows. Answer
+	// deny or timeout → emit the existing DENY ErrorResponse (PG) /
+	// ERR_Packet (MySQL).
+	//
+	// Mutually exclusive with PromptOnDeny (the CLI rejects both flags
+	// on the same `dbounce run`). Has no effect in cooperative mode
+	// (advisory DENYs don't merit a sync block) or observation-only
+	// mode (no upstream to forward to — CLI rejects at parse).
+	//
+	// Per [[ibounce-honest-positioning]]: deterrent UX for legitimate
+	// human-in-loop, NOT adversarial defense. An attacker who can
+	// reach the SQL listener can also reach pending_prompts via
+	// `dbounce prompts answer` (same-UID, by design — local laptop
+	// safety).
+	SyncPromptOnDeny bool
+
+	// SyncPromptTimeout bounds how long a SyncPromptOnDeny block
+	// waits for an operator answer. After expiry, SyncPromptDefault
+	// fires. CLI clamps to 5s-300s; the in-band default (Normalize)
+	// is 30s.
+	SyncPromptTimeout time.Duration
+
+	// SyncPromptDefault — the fallback verdict applied when the sync
+	// block times out without an operator answer. "deny" (the default)
+	// matches the operator's likely posture ("if I'm not here to
+	// approve, refuse"); "allow" suits the rarer
+	// "approval-is-the-bottleneck, fail-open if I'm asleep" stance.
+	// Two values: store.PromptDecisionAllow / store.PromptDecisionDeny.
+	SyncPromptDefault SyncPromptDefault
+
 	// RedactLiterals — MED-D8-09 (AUDIT-WB-DSLICES-1-8.md) closure.
 	// When true, every audit row's Statement field has its quoted
 	// string literals swapped for [REDACTED] BEFORE persistence, and
@@ -275,6 +333,18 @@ func (c Config) Normalize() Config {
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
+	}
+	// #203 sync-prompt defaults. Timeout defaults to 30s (long enough
+	// that an operator at the terminal has a real window to answer +
+	// short enough that an inattentive operator doesn't pin a SQL
+	// session for minutes). SyncPromptDefault defaults to deny — the
+	// safer "I'm not here, refuse" posture; operators who want fail-
+	// open opt in explicitly via --sync-prompt-default=allow.
+	if c.SyncPromptTimeout == 0 {
+		c.SyncPromptTimeout = 30 * time.Second
+	}
+	if c.SyncPromptDefault == "" {
+		c.SyncPromptDefault = SyncPromptDefaultDeny
 	}
 	return c
 }
