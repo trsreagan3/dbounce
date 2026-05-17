@@ -40,6 +40,17 @@ import (
 	"github.com/trsreagan3/dbounce/internal/store"
 )
 
+// stubProfileWriter (formerly in this file) was removed per INFO-D8-14
+// (AUDIT-WB-DSLICES-1-8.md). With #245's profileWriterAdapter wiring
+// landed in the root command, ProfileWriter is non-nullable across all
+// production code paths — the stub's error message ("not configured")
+// would never reach an operator at runtime and was misleading when it
+// did fire in tests. Tests now pass a real ProfileWriter (the
+// recordingProfileWriter test double in prompts_test.go); newPromptsCmd
+// + newPresetsCmd + newRulesCmd + newRulesRecommendCmd panic on nil so
+// any future caller forgetting to wire one fails loudly at construction
+// time, NOT at the next operator-visible CLI invocation.
+
 // ProfileWriter is the minimal contract `prompts answer --kind profile`
 // needs from D-Slice 7's profile package. Defining it here keeps this
 // branch independent of D-Slice 7's package layout; at merge time
@@ -60,23 +71,12 @@ type ProfileWriter interface {
 	ExistingProfileNames() (map[string]struct{}, error)
 }
 
-// stubProfileWriter is the default ProfileWriter the CLI uses when no
-// real writer is injected (the typical D-Slice 8 standalone test
-// path). Surfaces a clear error rather than silently no-op'ing — the
-// operator should know `--kind profile` requires the profile package
-// (which lands in D-Slice 7).
-type stubProfileWriter struct{}
-
-func (stubProfileWriter) CreateProfile(string, string, []dbrules.ProxyRule, []dbrules.ProxyRule) error {
-	return errors.New("dbounce: profile creation requires the D-Slice 7 profile package (not wired in this build)")
-}
-func (stubProfileWriter) ExistingProfileNames() (map[string]struct{}, error) {
-	return map[string]struct{}{}, nil
-}
-
 func newPromptsCmd(profileWriter ProfileWriter) *cobra.Command {
 	if profileWriter == nil {
-		profileWriter = stubProfileWriter{}
+		// INFO-D8-14: ProfileWriter is non-nullable. A nil writer means
+		// a wiring bug at construction time — fail loudly here so the
+		// regression is caught before any operator runs the binary.
+		panic("dbounce cli: newPromptsCmd requires a non-nil ProfileWriter (INFO-D8-14)")
 	}
 	cmd := &cobra.Command{
 		Use:   "prompts",
@@ -228,7 +228,7 @@ func newPromptsShowCmd() *cobra.Command {
 
 func newPromptsAnswerCmd(profileWriter ProfileWriter) *cobra.Command {
 	if profileWriter == nil {
-		profileWriter = stubProfileWriter{}
+		panic("dbounce cli: newPromptsAnswerCmd requires a non-nil ProfileWriter (INFO-D8-14)")
 	}
 	var (
 		dbPath string

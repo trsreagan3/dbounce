@@ -13,8 +13,21 @@ import (
 	"github.com/trsreagan3/dbounce/internal/store"
 )
 
+// INFO-D8-14: newRulesCmd + newRulesRecommendCmd MUST panic on nil
+// ProfileWriter so a regression that drops the wiring fails loudly
+// at construction time.
+func TestRulesCmd_NilWriter_Panics(t *testing.T) {
+	assert.Panics(t, func() { _ = newRulesCmd(nil) },
+		"newRulesCmd MUST panic on nil ProfileWriter (INFO-D8-14)")
+}
+
+func TestRulesRecommendCmd_NilWriter_Panics(t *testing.T) {
+	assert.Panics(t, func() { _ = newRulesRecommendCmd(nil) },
+		"newRulesRecommendCmd MUST panic on nil ProfileWriter (INFO-D8-14)")
+}
+
 func TestRulesCmd_TreeWired(t *testing.T) {
-	c := newRulesCmd(nil)
+	c := newRulesCmd(&recordingProfileWriter{})
 	assert.Equal(t, "rules", c.Name())
 	subs := map[string]bool{}
 	for _, s := range c.Commands() {
@@ -153,7 +166,7 @@ func TestRulesRecommend_CLIEndToEnd(t *testing.T) {
 	}
 	require.NoError(t, st.Close())
 
-	cmd := newRulesRecommendCmd(nil)
+	cmd := newRulesRecommendCmd(&recordingProfileWriter{})
 	out := &bytes.Buffer{}
 	cmd.SetOut(out)
 	cmd.SetErr(out)
@@ -238,7 +251,7 @@ func TestRulesRecommend_SaveAsProfile_NoRecsErrors(t *testing.T) {
 
 func TestRulesRecommend_RejectsBadScan(t *testing.T) {
 	db := dbAt(t)
-	cmd := newRulesRecommendCmd(nil)
+	cmd := newRulesRecommendCmd(&recordingProfileWriter{})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	cmd.SetArgs([]string{"--db", db, "--scan", "0"})

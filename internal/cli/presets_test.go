@@ -9,8 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// INFO-D8-14: newPresetsCmd MUST panic on nil ProfileWriter.
+func TestPresetsCmd_NilWriter_Panics(t *testing.T) {
+	assert.Panics(t, func() { _ = newPresetsCmd(nil) },
+		"newPresetsCmd MUST panic on nil ProfileWriter (INFO-D8-14)")
+}
+
 func TestPresetsCmd_TreeWired(t *testing.T) {
-	c := newPresetsCmd(nil)
+	c := newPresetsCmd(&recordingProfileWriter{})
 	assert.Equal(t, "presets", c.Name())
 	subs := map[string]bool{}
 	for _, s := range c.Commands() {
@@ -91,7 +97,7 @@ func TestPresetsApply_ExplicitTarget(t *testing.T) {
 }
 
 func TestPresetsApply_UnknownPreset(t *testing.T) {
-	cmd := newPresetsApplyCmd(nil)
+	cmd := newPresetsApplyCmd(&recordingProfileWriter{})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	cmd.SetArgs([]string{"no-such-preset"})
@@ -100,14 +106,13 @@ func TestPresetsApply_UnknownPreset(t *testing.T) {
 	assert.Contains(t, err.Error(), "no preset named")
 }
 
-func TestPresetsApply_StubWriterReturnsErrorFromStub(t *testing.T) {
-	// The default stub writer is wired when nil is passed; it surfaces
-	// a clear error rather than silently no-op'ing.
-	cmd := newPresetsApplyCmd(nil)
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-	cmd.SetArgs([]string{"schema-survey"})
-	err := cmd.Execute()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "profile creation requires")
+// INFO-D8-14 (AUDIT-WB-DSLICES-1-8.md): the stub-writer behavior was
+// removed. newPresetsApplyCmd now panics at construction on nil
+// ProfileWriter so a wiring regression is caught at build/test time
+// (rather than surfacing a confusing "not configured" error to the
+// operator at runtime, which was unreachable after #245 landed
+// production wiring anyway).
+func TestPresetsApplyCmd_NilWriter_Panics(t *testing.T) {
+	assert.Panics(t, func() { _ = newPresetsApplyCmd(nil) },
+		"newPresetsApplyCmd MUST panic on nil ProfileWriter (INFO-D8-14)")
 }

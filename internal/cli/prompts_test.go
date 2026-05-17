@@ -87,8 +87,19 @@ func enqueueTestPrompt(t *testing.T, db string) int64 {
 	return id
 }
 
+// INFO-D8-14 (AUDIT-WB-DSLICES-1-8.md): ProfileWriter is non-nullable.
+// The stub error message was never reachable in production after #245
+// landed the profileWriterAdapter wiring; replacing it with a panic
+// at construction time means a regression that drops the wiring would
+// fail loudly during test/build, NOT silently surface a confusing
+// "not configured" message to operators.
+func TestPromptsCmd_NilWriter_Panics(t *testing.T) {
+	assert.Panics(t, func() { _ = newPromptsCmd(nil) },
+		"newPromptsCmd MUST panic on nil ProfileWriter (INFO-D8-14)")
+}
+
 func TestPromptsCmd_TreeWired(t *testing.T) {
-	c := newPromptsCmd(nil)
+	c := newPromptsCmd(&recordingProfileWriter{})
 	assert.Equal(t, "prompts", c.Name())
 	subs := map[string]bool{}
 	for _, s := range c.Commands() {
@@ -150,7 +161,7 @@ func TestPromptsAnswer_Ignore(t *testing.T) {
 	db := dbAt(t)
 	id := enqueueTestPrompt(t, db)
 
-	cmd := newPromptsAnswerCmd(nil)
+	cmd := newPromptsAnswerCmd(&recordingProfileWriter{})
 	out := &bytes.Buffer{}
 	cmd.SetOut(out)
 	cmd.SetErr(out)
@@ -159,7 +170,7 @@ func TestPromptsAnswer_Ignore(t *testing.T) {
 	assert.Contains(t, out.String(), "ignored")
 
 	// Re-answer should fail (already ignored).
-	cmd2 := newPromptsAnswerCmd(nil)
+	cmd2 := newPromptsAnswerCmd(&recordingProfileWriter{})
 	cmd2.SetOut(&bytes.Buffer{})
 	cmd2.SetErr(&bytes.Buffer{})
 	cmd2.SetArgs([]string{"--db", db, intStr(id), "--kind", "ignore"})
@@ -172,7 +183,7 @@ func TestPromptsAnswer_Always_AddsRule(t *testing.T) {
 	db := dbAt(t)
 	id := enqueueTestPrompt(t, db)
 
-	cmd := newPromptsAnswerCmd(nil)
+	cmd := newPromptsAnswerCmd(&recordingProfileWriter{})
 	out := &bytes.Buffer{}
 	cmd.SetOut(out)
 	cmd.SetErr(out)
@@ -233,13 +244,19 @@ func TestPromptsAnswer_Profile_ExplicitTarget(t *testing.T) {
 func TestPromptsAnswer_RejectsUnknownKind(t *testing.T) {
 	db := dbAt(t)
 	id := enqueueTestPrompt(t, db)
-	cmd := newPromptsAnswerCmd(nil)
+	cmd := newPromptsAnswerCmd(&recordingProfileWriter{})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	cmd.SetArgs([]string{"--db", db, intStr(id), "--kind", "garbage"})
 	err := cmd.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--kind must be one of")
+}
+
+// INFO-D8-14: newPromptsAnswerCmd MUST panic on nil ProfileWriter.
+func TestPromptsAnswerCmd_NilWriter_Panics(t *testing.T) {
+	assert.Panics(t, func() { _ = newPromptsAnswerCmd(nil) },
+		"newPromptsAnswerCmd MUST panic on nil ProfileWriter (INFO-D8-14)")
 }
 
 func TestPromptsAnswer_ProfileWriterErrorSurfaces(t *testing.T) {

@@ -27,7 +27,7 @@ import (
 
 func newPresetsCmd(profileWriter ProfileWriter) *cobra.Command {
 	if profileWriter == nil {
-		profileWriter = stubProfileWriter{}
+		panic("dbounce cli: newPresetsCmd requires a non-nil ProfileWriter (INFO-D8-14)")
 	}
 	cmd := &cobra.Command{
 		Use:   "presets",
@@ -140,7 +140,7 @@ func newPresetsShowCmd() *cobra.Command {
 
 func newPresetsApplyCmd(profileWriter ProfileWriter) *cobra.Command {
 	if profileWriter == nil {
-		profileWriter = stubProfileWriter{}
+		panic("dbounce cli: newPresetsApplyCmd requires a non-nil ProfileWriter (INFO-D8-14)")
 	}
 	var (
 		target string

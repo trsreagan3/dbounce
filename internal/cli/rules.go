@@ -32,7 +32,7 @@ import (
 
 func newRulesCmd(profileWriter ProfileWriter) *cobra.Command {
 	if profileWriter == nil {
-		profileWriter = stubProfileWriter{}
+		panic("dbounce cli: newRulesCmd requires a non-nil ProfileWriter (INFO-D8-14)")
 	}
 	cmd := &cobra.Command{
 		Use:   "rules",
@@ -218,7 +218,7 @@ type recommendation struct {
 
 func newRulesRecommendCmd(profileWriter ProfileWriter) *cobra.Command {
 	if profileWriter == nil {
-		profileWriter = stubProfileWriter{}
+		panic("dbounce cli: newRulesRecommendCmd requires a non-nil ProfileWriter (INFO-D8-14)")
 	}
 	var (
 		dbPath        string
