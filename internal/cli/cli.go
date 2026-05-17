@@ -375,6 +375,11 @@ func newRunCmd() *cobra.Command {
 		// decisions enqueue a pending_prompts row for `dbounce prompts
 		// answer` to drain. Default false preserves D-Slice 3 behavior.
 		promptOnDeny bool
+		// MED-D8-09 (AUDIT-WB-DSLICES-1-8.md): when true, the audit
+		// row's persisted Statement field has quoted string literals
+		// swapped for [REDACTED] before insertion. Default false
+		// preserves the full-fidelity audit-reconstruction behavior.
+		redactLiterals bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -575,6 +580,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				ActiveProfile:     activeProfile,
 				ActiveProfileName: activeProfile.Name,
 				PromptOnDeny:      promptOnDeny,
+				RedactLiterals:    redactLiterals,
 			}.Normalize()
 			_ = profileFromFlag // reserved for the not-selected banner in newer slices
 
@@ -777,6 +783,17 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"Has no effect in cooperative mode (advisory verdicts aren't "+
 			"prompted) or during an active pause window (operator already "+
 			"said allow).")
+	cmd.Flags().BoolVar(&redactLiterals, "redact-literals", false,
+		"When true, the audit row's recorded SQL has its quoted string "+
+			"literals swapped for [REDACTED] before persistence (numeric "+
+			"literals + identifiers preserved). The row's "+
+			"statement_redacted column is also set so audit consumers "+
+			"know the SQL is not replayable. Recommended for deployments "+
+			"where audit data is exposed to MCP-connected agents or "+
+			"centralized observability — keeps secret-shaped string "+
+			"literals (passwords, API keys, PII) out of the log. Default "+
+			"false preserves full audit-reconstruction fidelity. "+
+			"MED-D8-09 from AUDIT-WB-DSLICES-1-8.md.")
 	return cmd
 }
 
@@ -852,29 +869,33 @@ func newAuditTailCmd() *cobra.Command {
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				for _, r := range rows {
 					rec := map[string]any{
-						"at":                r.At.UTC().Format(time.RFC3339),
-						"dialect":           r.Dialect,
-						"statement":         r.Statement,
-						"statement_type":    r.StatementType,
-						"tables":            r.TablesTouched,
-						"functions":         r.FunctionsCalled,
-						"is_dml":            r.IsDML,
-						"is_ddl":            r.IsDDL,
-						"has_mutating_node": r.HasMutatingNode,
+						"at":                 r.At.UTC().Format(time.RFC3339),
+						"dialect":            r.Dialect,
+						"statement":          r.Statement,
+						"statement_type":     r.StatementType,
+						"tables":             r.TablesTouched,
+						"functions":          r.FunctionsCalled,
+						"is_dml":             r.IsDML,
+						"is_ddl":             r.IsDDL,
+						"has_mutating_node":  r.HasMutatingNode,
 						"mutating_node_type": r.MutatingNodeType,
-						"is_explain":        r.IsExplain,
+						"is_explain":         r.IsExplain,
 						"is_explain_analyze": r.IsExplainAnalyze,
-						"impersonated_role": r.ImpersonatedRole,
-						"parse_errors":      r.ParseErrors,
-						"decision_verdict":  r.DecisionVerdict,
-						"decision_reason":   r.DecisionReason,
-						"mode_at_decision":  r.ModeAtDecision,
-						"enforced":          r.Enforced,
-						"decision_source":   r.DecisionSource,
-						"profile_name":      r.ProfileName,
-						"task_id":           r.TaskID,
-						"is_stream":         r.IsStream,
-						"stream_kind":       r.StreamKind,
+						"impersonated_role":  r.ImpersonatedRole,
+						"parse_errors":       r.ParseErrors,
+						"decision_verdict":   r.DecisionVerdict,
+						"decision_reason":    r.DecisionReason,
+						"mode_at_decision":   r.ModeAtDecision,
+						"enforced":           r.Enforced,
+						"decision_source":    r.DecisionSource,
+						"profile_name":       r.ProfileName,
+						"task_id":            r.TaskID,
+						"is_stream":          r.IsStream,
+						"stream_kind":        r.StreamKind,
+						// MED-D8-09: surface so audit consumers know
+						// the SQL has been [REDACTED] and is not
+						// replayable.
+						"statement_redacted": r.StatementRedacted,
 					}
 					if err := enc.Encode(rec); err != nil {
 						return err

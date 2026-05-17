@@ -56,7 +56,12 @@ import (
 //	    upstream_status / upstream_response_summary so audit reviewers
 //	    can distinguish forwarded vs not-forwarded vs upstream-errored
 //	    decisions without parsing the reason text.
-const SchemaVersion = 2
+//	3 — MED-D8-09 (AUDIT-WB-DSLICES-1-8.md): decisions table gains
+//	    statement_redacted boolean so audit consumers know when the
+//	    stored SQL had its quoted string literals swapped for
+//	    [REDACTED] before persistence — they MUST NOT trust the row's
+//	    SQL for replay when this column is true.
+const SchemaVersion = 3
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors DBOUNCE_DB for tests and CI sandboxes that want
@@ -201,7 +206,8 @@ func (s *Store) migrate() error {
 			stream_kind TEXT NOT NULL DEFAULT '',
 			forwarded INTEGER NOT NULL DEFAULT 0,
 			upstream_status TEXT NOT NULL DEFAULT '',
-			upstream_response_summary TEXT NOT NULL DEFAULT ''
+			upstream_response_summary TEXT NOT NULL DEFAULT '',
+			statement_redacted INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_decisions_at ON decisions(at)`,
 		`CREATE INDEX IF NOT EXISTS idx_decisions_verdict ON decisions(decision_verdict)`,
@@ -303,6 +309,9 @@ func (s *Store) migrate() error {
 		{"forwarded", "INTEGER NOT NULL DEFAULT 0"},
 		{"upstream_status", "TEXT NOT NULL DEFAULT ''"},
 		{"upstream_response_summary", "TEXT NOT NULL DEFAULT ''"},
+		// MED-D8-09 (AUDIT-WB-DSLICES-1-8.md): in-place upgrade for
+		// pre-v3 databases. Existing rows default to 0 (not redacted).
+		{"statement_redacted", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.addColumnIfMissing("decisions", col.name, col.decl); err != nil {
 			return err
@@ -423,6 +432,12 @@ type DecisionRow struct {
 	// relation 'foo' does not exist") for the audit reviewer. Bounded
 	// at ~256 chars by the writer.
 	UpstreamResponseSummary string
+	// StatementRedacted is true when the persisted Statement field has
+	// had its quoted string literals swapped for [REDACTED] (per
+	// MED-D8-09's --redact-literals flag). Audit consumers MUST NOT
+	// trust the SQL for replay when this is true — see RedactLiterals
+	// in the parser package.
+	StatementRedacted bool
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -464,8 +479,9 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			decision_source, profile_name,
 			matched_rule_id, task_id, pause_id,
 			is_stream, stream_kind,
-			forwarded, upstream_status, upstream_response_summary
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			forwarded, upstream_status, upstream_response_summary,
+			statement_redacted
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Dialect, d.Statement, d.StatementType,
 		tablesJSON, functionsJSON,
 		boolToInt(d.IsDML), boolToInt(d.IsDDL), boolToInt(d.HasMutatingNode), d.MutatingNodeType,
@@ -476,6 +492,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		nullableInt(d.MatchedRuleID), nullableString(d.TaskID), nullableInt(d.PauseID),
 		boolToInt(d.IsStream), d.StreamKind,
 		boolToInt(d.Forwarded), d.UpstreamStatus, upstreamSummary,
+		boolToInt(d.StatementRedacted),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("dbounce: record decision: %w", err)
@@ -518,7 +535,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		decision_source, profile_name,
 		matched_rule_id, task_id, pause_id,
 		is_stream, stream_kind,
-		forwarded, upstream_status, upstream_response_summary
+		forwarded, upstream_status, upstream_response_summary,
+		statement_redacted
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -546,6 +564,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			pauseID          sql.NullInt64
 			isStream         int
 			forwarded        int
+			stmtRedacted     int
 		)
 		if err := rows.Scan(
 			&atStr, &d.Dialect, &d.Statement, &d.StatementType,
@@ -558,6 +577,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&ruleID, &taskID, &pauseID,
 			&isStream, &d.StreamKind,
 			&forwarded, &d.UpstreamStatus, &d.UpstreamResponseSummary,
+			&stmtRedacted,
 		); err != nil {
 			return nil, fmt.Errorf("dbounce: recent decisions scan: %w", err)
 		}
@@ -589,6 +609,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		}
 		d.IsStream = isStream != 0
 		d.Forwarded = forwarded != 0
+		d.StatementRedacted = stmtRedacted != 0
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {

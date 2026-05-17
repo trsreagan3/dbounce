@@ -606,20 +606,23 @@ func (s *Server) toolTailDecisions(args map[string]any) (map[string]any, error) 
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		row := map[string]any{
-			"at":                r.At.UTC().Format("2006-01-02T15:04:05Z"),
-			"dialect":           r.Dialect,
-			"statement":         r.Statement,
-			"statement_type":    r.StatementType,
-			"tables":            r.TablesTouched,
-			"functions":         r.FunctionsCalled,
-			"is_dml":            r.IsDML,
-			"is_ddl":            r.IsDDL,
-			"has_mutating_node": r.HasMutatingNode,
-			"verdict":           r.DecisionVerdict,
-			"reason":            r.DecisionReason,
-			"decision_source":   r.DecisionSource,
-			"profile_name":      r.ProfileName,
-			"enforced":          r.Enforced,
+			"at":                 r.At.UTC().Format("2006-01-02T15:04:05Z"),
+			"dialect":            r.Dialect,
+			"statement":          r.Statement,
+			"statement_type":     r.StatementType,
+			"tables":             r.TablesTouched,
+			"functions":          r.FunctionsCalled,
+			"is_dml":             r.IsDML,
+			"is_ddl":             r.IsDDL,
+			"has_mutating_node":  r.HasMutatingNode,
+			"verdict":            r.DecisionVerdict,
+			"reason":             r.DecisionReason,
+			"decision_source":    r.DecisionSource,
+			"profile_name":       r.ProfileName,
+			"enforced":           r.Enforced,
+			// MED-D8-09: surface so agents know the SQL has been
+			// [REDACTED] and is not replayable.
+			"statement_redacted": r.StatementRedacted,
 		}
 		if r.TaskID != "" {
 			row["task_id"] = r.TaskID

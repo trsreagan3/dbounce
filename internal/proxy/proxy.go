@@ -217,6 +217,17 @@ type Config struct {
 	// D-Slice 3 transparent-mode behavior.
 	PromptOnDeny bool
 
+	// RedactLiterals — MED-D8-09 (AUDIT-WB-DSLICES-1-8.md) closure.
+	// When true, every audit row's Statement field has its quoted
+	// string literals swapped for [REDACTED] BEFORE persistence, and
+	// the row's statement_redacted column is set so downstream
+	// consumers know to NOT trust the SQL for replay. Default false
+	// preserves the audit-reconstruction-friendly behavior; operators
+	// who route audit data to MCP-connected agents or centralized
+	// observability should turn this on to keep secrets out of the
+	// log. See parser.RedactLiterals for the redaction contract.
+	RedactLiterals bool
+
 	// WireListener and MgmtListener let tests hand pre-bound listeners
 	// to Serve so the test process can reserve an ephemeral port (via
 	// net.Listen "127.0.0.1:0") and pass it through WITHOUT a
@@ -557,10 +568,22 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 			*pauseID, d.Reason)
 	}
 
+	// MED-D8-09 closure: optionally redact quoted string literals in
+	// the persisted Statement field. The original parser already ran
+	// on the raw SQL above (so the audit row still has accurate
+	// statement_type / tables / functions / parse_errors), but the
+	// row's recorded SQL is now stripped of credential-shaped content.
+	storedStatement := sql
+	statementRedacted := false
+	if s.cfg.RedactLiterals {
+		storedStatement = parser.RedactLiterals(sql)
+		statementRedacted = storedStatement != sql
+	}
+
 	row := store.DecisionRow{
 		At:               time.Now().UTC(),
 		Dialect:          ps.Dialect,
-		Statement:        sql,
+		Statement:        storedStatement,
 		StatementType:    ps.StatementType,
 		TablesTouched:    ps.TablesTouched,
 		FunctionsCalled:  ps.FunctionsCalled,
@@ -580,11 +603,12 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 		// active pause window demoting the DENY. D-Slice 3 sets
 		// (a)+(b); D-Slice 2's forwarding handler honors it.
 		Enforced:       enforced,
-		ProfileName:    s.cfg.ActiveProfileName,
-		DecisionSource: d.Source,
-		MatchedRuleID:  d.MatchedRuleID,
-		TaskID:         d.TaskID,
-		PauseID:        pauseID,
+		ProfileName:       s.cfg.ActiveProfileName,
+		DecisionSource:    d.Source,
+		MatchedRuleID:     d.MatchedRuleID,
+		TaskID:            d.TaskID,
+		PauseID:           pauseID,
+		StatementRedacted: statementRedacted,
 	}
 	decisionID, err := s.store.RecordDecision(row)
 	if err != nil {
