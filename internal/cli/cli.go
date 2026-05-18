@@ -820,6 +820,11 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			}
 
 			s := proxy.NewServer(cfg, st)
+			// [[bulk-prompt-answer-ux]] hot-swap: the burst sweeper
+			// loads the profiles file when applying a profile-swap
+			// override. Record the path the operator started with so
+			// the swap loads from the SAME source.
+			s.SetProfilesPath(resolvedProfilesPath)
 
 			// #252 Slice 1: build the audit-export fan-out from the
 			// transport flags. License gate fires BEFORE any IO so the

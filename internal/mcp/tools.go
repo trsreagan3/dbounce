@@ -206,6 +206,57 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "dbounce_prompts_bulk_pending",
+			"description": "Return the burst summary of all currently-pending " +
+				"prompts grouped by (dialect, statement_type, table) — per " +
+				"[[bulk-prompt-answer-ux]]. Read-only; agents call this to " +
+				"surface the bulk-answer affordance to the operator when many " +
+				"calls are being blocked in a short window. Returns " +
+				"{total_prompts, dialects, entries, burst_armed} where each " +
+				"entry is the tuple + count of pending prompts the bulk-answer " +
+				"would create one rule for. Composes with " +
+				"dbounce_prompts_bulk_answer (the mutating side, gated by an " +
+				"operator-set MCP token).",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			"name": "dbounce_prompts_bulk_answer",
+			"description": "Resolve all currently-pending prompts en masse — " +
+				"per [[bulk-prompt-answer-ux]]. Mutating; GATED behind an " +
+				"operator-set token (--bulk-answer-mcp-token at server " +
+				"start). When the token isn't configured (default), this tool " +
+				"returns {error: 'disabled'} so an adversarial agent calling " +
+				"on its own can't bulk-allow itself. Decision values: " +
+				"'10min' / '3h' / 'session' create time-bounded ALLOW rules " +
+				"covering the burst (one rule per dialect-aware tuple); " +
+				"'profile' requires `profile_name` + posts a hot-swap signal " +
+				"that the running proxy picks up within ~5s; 'none' is a " +
+				"no-op. The `token` arg MUST match the operator-set value " +
+				"or the call is refused.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"decision": map[string]any{
+						"type": "string",
+						"enum": []string{"10min", "3h", "session", "profile", "none"},
+						"description": "Which bulk-answer to apply across all pending prompts.",
+					},
+					"profile_name": map[string]any{
+						"type":        "string",
+						"description": "Required when decision='profile'. Name of the profile to hot-swap to.",
+					},
+					"token": map[string]any{
+						"type":        "string",
+						"description": "Operator-set MCP bulk-answer token. MUST match --bulk-answer-mcp-token.",
+					},
+				},
+				"required": []string{"decision", "token"},
+			},
+		},
+		{
 			"name": "dbounce_tail_decisions",
 			"description": "Inspect the recent decision audit log " +
 				"(every statement dbounce gated). Newest first. Useful " +

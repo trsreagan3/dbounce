@@ -105,7 +105,7 @@ func TestPromptsCmd_TreeWired(t *testing.T) {
 	for _, s := range c.Commands() {
 		subs[s.Name()] = true
 	}
-	for _, sub := range []string{"list", "show", "answer"} {
+	for _, sub := range []string{"list", "show", "answer", "bulk-pending", "bulk-answer"} {
 		assert.True(t, subs[sub], "prompts must wire %s subcommand", sub)
 	}
 }

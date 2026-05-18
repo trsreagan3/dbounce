@@ -37,8 +37,24 @@ import (
 var ErrInvalidRule = errors.New("dbounce: invalid rule")
 
 // AddRule persists a rule + returns its row id. Rejects malformed
-// patterns / effects via ErrInvalidRule wrapping.
+// patterns / effects via ErrInvalidRule wrapping. Persists with NULL
+// expires_at — the rule is permanent (legacy behavior). For time-
+// bounded rules (bulk-prompt-answer UX per [[bulk-prompt-answer-ux]])
+// callers use AddRuleWithExpiry.
 func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
+	return s.AddRuleWithExpiry(r, time.Time{})
+}
+
+// AddRuleWithExpiry persists a rule + returns its row id; when
+// expiresAt is non-zero, persists the ISO-8601 UTC timestamp into the
+// rules.expires_at column. LoadRuleSet filters out rules whose
+// expires_at < now-UTC. SweepExpiredRules deletes them lazily.
+//
+// Used by [[bulk-prompt-answer-ux]] when the operator picks
+// --decision={10min|3h|session}: a single time-bounded ALLOW rule
+// is synthesized per (dialect, statement_type, table) tuple in the
+// burst window.
+func (s *Store) AddRuleWithExpiry(r rules.ProxyRule, expiresAt time.Time) (rules.ID, error) {
 	if _, _, err := rules.ParsePattern(r.Pattern); err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrInvalidRule, err)
 	}
@@ -52,15 +68,20 @@ func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
 	if r.Origin == "" {
 		r.Origin = rules.OriginUser
 	}
+	var expiresAtArg any
+	if !expiresAt.IsZero() {
+		expiresAtArg = expiresAt.UTC().Format("2006-01-02T15:04:05Z")
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO rules(pattern, effect, schema_scope, table_scope,
-		                   function_scope, note, origin, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		                   function_scope, note, origin, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.Pattern, string(r.Effect),
 		nullableString(r.SchemaScope), nullableString(r.TableScope),
 		nullableString(r.FunctionScope), nullableString(r.Note),
 		r.Origin,
 		time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		expiresAtArg,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("dbounce: add rule: %w", err)
@@ -76,13 +97,24 @@ func (s *Store) AddRule(r rules.ProxyRule) (rules.ID, error) {
 // malformed effect column (e.g. corrupted via direct DB edit) are
 // skipped with a logged warning rather than crashing the listing —
 // same fix kbounce closed in WB23 MED-23-01.
+//
+// Expired rules (expires_at < now UTC) are filtered out per
+// [[bulk-prompt-answer-ux]]: the rule still lives in the table for
+// post-hoc audit until SweepExpiredRules reaps it, but the proxy + UI
+// SHOULD NOT see it as active. The audit log preserves WHEN the
+// time-bounded rule fired (the decisions table joins on
+// matched_rule_id) so a reviewer can reconstruct "what did the bulk
+// allow let through during its 10-minute window?"
 func (s *Store) ListRules() ([]rules.StoredRule, error) {
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	rs, err := s.db.Query(
 		`SELECT id, pattern, effect,
 		        COALESCE(schema_scope, ''), COALESCE(table_scope, ''),
 		        COALESCE(function_scope, ''), COALESCE(note, ''),
 		        COALESCE(origin, 'user')
-		 FROM rules ORDER BY id`)
+		 FROM rules
+		 WHERE expires_at IS NULL OR expires_at > ?
+		 ORDER BY id`, now)
 	if err != nil {
 		return nil, fmt.Errorf("dbounce: list rules: %w", err)
 	}
@@ -111,6 +143,30 @@ func (s *Store) ListRules() ([]rules.StoredRule, error) {
 		return nil, fmt.Errorf("dbounce: list rules iterate: %w", err)
 	}
 	return out, nil
+}
+
+// SweepExpiredRules deletes rules whose expires_at < now (UTC). Used
+// by the proxy's burst sweeper goroutine to keep the rules table
+// bounded. Per [[bulk-prompt-answer-ux]] "Don't delete from DB —
+// preserve for audit": the audit story comes via decisions.matched_rule_id
+// linking back to the rule WHILE it was active; once expired the rule
+// has no further effect on decision-making, so reaping it is safe.
+// The decisions table preserves the full chain regardless.
+//
+// Returns the number of rows deleted; never returns ErrNoRows.
+func (s *Store) SweepExpiredRules() (int64, error) {
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	res, err := s.db.Exec(
+		`DELETE FROM rules WHERE expires_at IS NOT NULL AND expires_at <= ?`,
+		now)
+	if err != nil {
+		return 0, fmt.Errorf("dbounce: sweep expired rules: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("dbounce: sweep expired rules rows affected: %w", err)
+	}
+	return n, nil
 }
 
 // GetRule fetches one rule by id; returns (nil, nil) when missing.

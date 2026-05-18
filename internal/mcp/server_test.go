@@ -109,6 +109,8 @@ func TestServer_ToolsList_AllToolsPresent(t *testing.T) {
 		"dbounce_decide",
 		"dbounce_tail_decisions",
 		"dbounce_pending_sync_prompts",
+		"dbounce_prompts_bulk_pending",
+		"dbounce_prompts_bulk_answer",
 	}
 	for _, n := range want {
 		assert.True(t, names[n], "tool %q must be in tools/list", n)

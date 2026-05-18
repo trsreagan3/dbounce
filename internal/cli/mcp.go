@@ -43,14 +43,15 @@ import (
 // invoke `dbounce mcp --db ...` keep working.
 func newMCPCmd() *cobra.Command {
 	var (
-		dbPath        string
-		profileName   string
-		profilesPath  string
-		modeStr       string
-		defaultPolStr string
-		dialectStr    string
-		owner         string
-		actor         string
+		dbPath           string
+		profileName      string
+		profilesPath     string
+		modeStr          string
+		defaultPolStr    string
+		dialectStr       string
+		owner            string
+		actor            string
+		bulkAnswerToken  string
 	)
 
 	runServe := func(cmd *cobra.Command, args []string) error {
@@ -89,14 +90,15 @@ func newMCPCmd() *cobra.Command {
 		activeProfile, _ := profiles.Active(profileName) // err on unknown; serve anyway
 
 		srv := mcp.NewServer(mcp.Config{
-			Store:         st,
-			ActiveProfile: activeProfile,
-			ProfilesPath:  resolvedProfilesPath,
-			Mode:          mode,
-			DefaultPolicy: defaultPol,
-			Dialect:       dialect,
-			TaskOwner:     owner,
-			Actor:         actor,
+			Store:           st,
+			ActiveProfile:   activeProfile,
+			ProfilesPath:    resolvedProfilesPath,
+			Mode:            mode,
+			DefaultPolicy:   defaultPol,
+			Dialect:         dialect,
+			TaskOwner:       owner,
+			Actor:           actor,
+			BulkAnswerToken: bulkAnswerToken,
 		})
 
 		fmt.Fprintf(os.Stderr,
@@ -132,6 +134,16 @@ func newMCPCmd() *cobra.Command {
 		cmd.Flags().StringVar(&actor, "actor", "",
 			"Actor name recorded in audit rows when MCP-initiated mutations land "+
 				"(default: 'dbounce-mcp').")
+		cmd.Flags().StringVar(&bulkAnswerToken, "bulk-answer-mcp-token", "",
+			"Per [[bulk-prompt-answer-ux]]: when set, gates the "+
+				"dbounce_prompts_bulk_answer MCP tool. Agents must include "+
+				"the same token in their tool-call args to bulk-resolve "+
+				"pending prompts. DEFAULT EMPTY — bulk-answer tool returns "+
+				"{error:'disabled'} so an adversarial agent calling "+
+				"unsupervised cannot bulk-allow itself. Set via "+
+				"`--bulk-answer-mcp-token=$(uuidgen)` + share with your "+
+				"agent out-of-band when you intentionally want it to be "+
+				"able to resolve bursts on your behalf.")
 	}
 
 	parent := &cobra.Command{

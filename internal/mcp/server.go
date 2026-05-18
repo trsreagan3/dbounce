@@ -126,6 +126,20 @@ type Config struct {
 	// empty — the MCP server doesn't bind a network listener so there
 	// is no real host:port; the constant identifies the transport.
 	Host string
+
+	// BulkAnswerToken gates the dbounce_prompts_bulk_answer MCP tool
+	// per [[bulk-prompt-answer-ux]] "Don't expose the burst-answer
+	// affordance to the AGENT without operator opt-in." When empty
+	// (default), the tool returns {error: 'disabled'}; when non-empty,
+	// the caller's `token` argument MUST match exactly or the call is
+	// refused. The operator sets this via `dbounce mcp serve
+	// --bulk-answer-mcp-token TOKEN`. Pre-launch invariant: an
+	// adversarial agent calling the MCP tool to bulk-allow itself
+	// MUST be refused by default. Composes with
+	// [[ibounce-honest-positioning]] (deterrent UX, not adversarial
+	// boundary — but the default-disabled posture closes the
+	// trivially-exploitable case).
+	BulkAnswerToken string
 }
 
 // Server is the MCP-over-stdio server.
@@ -381,6 +395,10 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolPendingSyncPrompts(args)
 	case "dbounce_audit_export_status":
 		return s.toolAuditExportStatus(args)
+	case "dbounce_prompts_bulk_pending":
+		return s.toolPromptsBulkPending(args)
+	case "dbounce_prompts_bulk_answer":
+		return s.toolPromptsBulkAnswer(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }

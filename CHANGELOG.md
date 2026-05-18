@@ -5,6 +5,48 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Bulk-prompt-answer UX (2026-05-18)
+
+Closes the "block-happy = uninstalled" failure mode per
+[[safety-mode-lean-permissive]] + [[bulk-prompt-answer-ux]]. When the
+proxy is blocking many calls in a short window (typically because the
+wrong profile is active, or the work is exploratory), the operator
+gets a one-shot escape hatch instead of a wall of per-call prompts:
+
+- **Burst detector** (`internal/proxy/burst.go`) — sliding-window
+  pending-prompt counter; arms at threshold (default N=5 in T=60s);
+  re-arms after operator answer or 5-minute cool-down. Mutex-guarded
+  for the per-conn goroutines that call Record from arbitrary threads.
+- **Time-bounded rules** — rules table gains `expires_at` (schema v5);
+  `LoadRuleSet` filters past-expiry rows; new `SweepExpiredRules` reaps
+  lazily. Audit chain preserved via `decisions.matched_rule_id`.
+- **`dbounce prompts bulk-pending`** — read-only burst summary grouped
+  by (dialect, statement_type, table). Previews which rules
+  `bulk-answer` would synthesize.
+- **`dbounce prompts bulk-answer --decision X`** — resolves all
+  pending prompts en masse. `10min` / `3h` / `session` create
+  time-bounded ALLOW rules; `profile --profile NAME` posts a hot-swap
+  signal (cross-process via the new `profile_overrides` table); `none`
+  is a no-op. Per-dialect rule synthesis: a mixed PG+MySQL burst
+  creates separate rules per dialect so PG-shaped allows never spill
+  into MySQL traffic.
+- **Profile hot-swap** — `Server.SwapProfile` swaps the running
+  active profile under an RWMutex without a restart; the burst
+  sweeper goroutine polls `profile_overrides` every ~5s and applies
+  the swap.
+- **Burst sweeper goroutine** — long-lived background tick that
+  reaps expired rules + applies pending profile-swap signals. Joins
+  via `Server.connWG`; canceled BEFORE `connWG.Wait` in `Shutdown` so
+  the drain ordering matches the heartbeater pattern closed in
+  276298f.
+- **MCP `dbounce_prompts_bulk_pending`** — read-only burst summary
+  for agents.
+- **MCP `dbounce_prompts_bulk_answer`** — mutating bulk-answer tool.
+  GATED behind the operator-set `--bulk-answer-mcp-token` flag;
+  default empty so adversarial agents cannot bulk-allow themselves
+  unsupervised per [[bulk-prompt-answer-ux]] "Don't expose the
+  burst-answer affordance to the AGENT without operator opt-in."
+
 ### Audit-export failure visibility (2026-05-18)
 
 Closes the stealth-bypass gap flagged in the Slice 1 BB+WB audit per

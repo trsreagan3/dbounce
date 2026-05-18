@@ -416,16 +416,122 @@ type Server struct {
 	// sending to Write BEFORE calling Shutdown" invariant races with
 	// the per-connection defer chain. Bumped at the top of every
 	// per-conn handler, decremented in the same defer chain.
+	//
+	// The burst sweeper goroutine (runBurstSweeper, per
+	// [[bulk-prompt-answer-ux]]) also joins via connWG so Shutdown
+	// drains it on the same wait — mirrors the heartbeater shutdown
+	// ordering closed in 276298f.
 	connWG sync.WaitGroup
+
+	// burst is the bulk-prompt-answer burst detector per
+	// [[bulk-prompt-answer-ux]]. nil when disabled (zero threshold);
+	// non-nil + Record-called by evaluateAndAuditWithAgent when a
+	// pending prompt is enqueued. Reset by `dbounce prompts
+	// bulk-answer` after the operator has resolved the burst.
+	burst *BurstDetector
+
+	// profileMu guards activeProfile + activeProfileName for the
+	// hot-swap path per [[bulk-prompt-answer-ux]]. decide() takes a
+	// read-lock per evaluation; SwapProfile takes a write-lock. RWMutex
+	// because the read path is hot + the swap path is rare (operator
+	// answers a burst).
+	profileMu         sync.RWMutex
+	activeProfile     *profile.Profile
+	activeProfileName string
+
+	// profilesPath is the on-disk profiles.yaml the proxy was started
+	// with; the burst sweeper reads it when applying a profile-swap
+	// signal (so the hot-swap loads from the SAME source the operator
+	// invoked `dbounce run --profiles-path X` with — not whatever
+	// path a parallel CLI happens to point at). Empty = the
+	// profile.DefaultProfilesPath() lookup runs.
+	profilesPath string
+
+	// burstSweeperCancel is the context.CancelFunc the burst sweeper
+	// goroutine listens on. Set in Serve when the sweeper is started;
+	// invoked by Shutdown BEFORE waiting on connWG so the sweeper
+	// stops promptly (per the heartbeater shutdown ordering closed in
+	// 276298f). nil-safe.
+	burstSweeperCancel context.CancelFunc
 }
 
 // NewServer constructs a Server without starting it.
 func NewServer(cfg Config, st *store.Store) *Server {
-	return &Server{
-		cfg:           cfg.Normalize(),
-		store:         st,
-		agentRegistry: audit.NewAgentRegistry(),
+	nc := cfg.Normalize()
+	s := &Server{
+		cfg:               nc,
+		store:             st,
+		agentRegistry:     audit.NewAgentRegistry(),
+		activeProfile:     nc.ActiveProfile,
+		activeProfileName: nc.ActiveProfileName,
 	}
+	// Bulk-prompt-answer UX per [[bulk-prompt-answer-ux]]: detector
+	// always-on by default. Operators who explicitly want to disable
+	// the burst flow can build with a custom BurstDetector (future
+	// config knob); v1.0 ships with sane defaults to make the safety
+	// valve discoverable.
+	s.burst = NewBurstDetector(DefaultBurstThreshold, DefaultBurstWindow, DefaultBurstCooldown)
+	return s
+}
+
+// SetProfilesPath records the on-disk profiles.yaml path so the burst
+// sweeper goroutine can reload + hot-swap the active profile when a
+// bulk-answer override is posted per [[bulk-prompt-answer-ux]]. Empty
+// string is valid (resolver falls back to profile.DefaultProfilesPath).
+// Idempotent; safe to call before Serve.
+func (s *Server) SetProfilesPath(path string) { s.profilesPath = path }
+
+// ProfilesPath returns the on-disk profiles.yaml path the proxy was
+// started with. Exposed so tests can verify the path was wired through
+// + so future introspection can surface it.
+func (s *Server) ProfilesPath() string { return s.profilesPath }
+
+// BurstDetector returns the bulk-prompt-answer burst detector. May be
+// nil when explicitly disabled. Exposed so tests + the CLI / MCP
+// surfaces can render the snapshot.
+func (s *Server) BurstDetector() *BurstDetector { return s.burst }
+
+// SwapProfile atomically replaces the active profile per
+// [[bulk-prompt-answer-ux]] hot-swap. Safe for concurrent callers
+// (write-lock). The next decide() call sees the new profile. Nil is
+// accepted (resets to full-user equivalent).
+func (s *Server) SwapProfile(p *profile.Profile) {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	s.activeProfile = p
+	if p != nil {
+		s.activeProfileName = p.Name
+	} else {
+		s.activeProfileName = ""
+	}
+}
+
+// loadActiveProfile is the hot-path read for decide() + healthz +
+// audit. Read-locks the profile mutex so SwapProfile can race
+// uncoordinated. Returns the pointer (no copy — Profile is
+// effectively-immutable post-construction; loader-level edits go via
+// a fresh *Profile that SwapProfile installs).
+func (s *Server) loadActiveProfile() (*profile.Profile, string) {
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.activeProfile, s.activeProfileName
+}
+
+// ActiveProfileName returns the currently-active profile name (after
+// any hot-swap). Used by the burst sweeper to compare against the
+// pending override + by /healthz to render the current state. Empty
+// when no profile bound (full-user equivalent).
+func (s *Server) ActiveProfileName() string {
+	_, name := s.loadActiveProfile()
+	return name
+}
+
+// activeProfileNameSnapshot is the audit-write companion. Same as
+// ActiveProfileName but kept internal to make grep'ing audit-row
+// projections easier.
+func (s *Server) activeProfileNameSnapshot() string {
+	_, name := s.loadActiveProfile()
+	return name
 }
 
 // AgentRegistry returns the per-process agent-session registry. Surfaced
@@ -620,6 +726,17 @@ func (s *Server) Serve() error {
 	}
 	s.listener = l
 
+	// [[bulk-prompt-answer-ux]]: start the burst sweeper. Goroutine
+	// joins via connWG so Shutdown drains it on the same wait as the
+	// per-conn handlers. The cancel func is invoked by Shutdown BEFORE
+	// connWG.Wait so the sweeper drains its final tick promptly,
+	// mirroring the heartbeater shutdown-ordering pattern closed in
+	// 276298f. When the store is nil (rare test path) the sweeper
+	// still runs but its work paths short-circuit harmlessly.
+	sweepCtx, sweepCancel := context.WithCancel(context.Background())
+	s.burstSweeperCancel = sweepCancel
+	go s.runBurstSweeper(sweepCtx)
+
 	mgmtAddr := fmt.Sprintf("%s:%d", s.cfg.MgmtHost, s.cfg.MgmtPort)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
@@ -685,6 +802,14 @@ func (s *Server) Serve() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.listener != nil {
 		_ = s.listener.Close()
+	}
+	// [[bulk-prompt-answer-ux]]: cancel the burst sweeper BEFORE
+	// waiting on connWG so its for-loop exits + its connWG.Done fires.
+	// Same shutdown-ordering pattern the heartbeater follows
+	// (276298f) — without this, connWG.Wait would block on the
+	// sweeper's ticker indefinitely.
+	if s.burstSweeperCancel != nil {
+		s.burstSweeperCancel()
 	}
 	done := make(chan struct{})
 	go func() {
@@ -971,7 +1096,7 @@ func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 		// active pause window demoting the DENY. D-Slice 3 sets
 		// (a)+(b); D-Slice 2's forwarding handler honors it.
 		Enforced:       enforced,
-		ProfileName:       s.cfg.ActiveProfileName,
+		ProfileName:       s.activeProfileNameSnapshot(),
 		DecisionSource:    d.Source,
 		MatchedRuleID:     d.MatchedRuleID,
 		TaskID:            d.TaskID,
@@ -1023,6 +1148,16 @@ func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 			log.Warn().Err(perr).
 				Int64("decision_id", decisionID).
 				Msg("dbounce: enqueue pending prompt failed")
+		} else if s.burst != nil {
+			// [[bulk-prompt-answer-ux]]: record the enqueue in the
+			// burst detector. When the threshold is crossed, the
+			// detector arms + the next `dbounce prompts bulk-pending`
+			// (CLI / MCP) surfaces the bulk-answer affordance.
+			if armed := s.burst.Record(time.Now()); armed {
+				log.Info().Int("count_in_window", DefaultBurstThreshold).
+					Dur("window", DefaultBurstWindow).
+					Msg("dbounce: BURST_DETECTED — bulk-answer affordance armed (see `dbounce prompts bulk-answer`)")
+			}
 		}
 	}
 }
@@ -1072,7 +1207,14 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 	// a profile allow short-circuits with Source=profile.allow so a
 	// permissive task scope can't lower the bar further. Abstain →
 	// fall through to the task / global rules below.
-	if s.cfg.ActiveProfile != nil && s.cfg.ActiveProfile.Name != profile.FullUserProfileName {
+	//
+	// [[bulk-prompt-answer-ux]]: read the active profile through the
+	// RWMutex-guarded accessor so SwapProfile can swap it mid-flight
+	// without racing the decision loop. The pointer is taken once per
+	// decide() call; subsequent Evaluate calls below see a consistent
+	// snapshot even if the burst sweeper hot-swaps between iterations.
+	activeProfile, _ := s.loadActiveProfile()
+	if activeProfile != nil && activeProfile.Name != profile.FullUserProfileName {
 		profileView := &profile.ParsedStatement{
 			StatementType:    ps.StatementType,
 			TablesTouched:    ps.TablesTouched,
@@ -1083,7 +1225,7 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 			IsExplain:        ps.IsExplain,
 			IsExplainAnalyze: ps.IsExplainAnalyze,
 		}
-		pv := s.cfg.ActiveProfile.Evaluate(profileView)
+		pv := activeProfile.Evaluate(profileView)
 		if pv.Denied {
 			return Decision{
 				Verdict: VerdictDeny,
@@ -1284,7 +1426,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Mode:                string(s.cfg.Mode),
 		DefaultPolicy:       string(s.cfg.DefaultPolicy),
 		Dialect:             string(s.cfg.Dialect),
-		ActiveProfile:       s.cfg.ActiveProfileName,
+		ActiveProfile:       s.ActiveProfileName(),
 		LookupErrorsCounter: LookupErrorsCount(),
 	}
 	if s.store != nil {

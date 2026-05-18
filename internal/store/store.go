@@ -70,7 +70,21 @@ import (
 //	    persistence-side handle. Crash-safe: a restart returns the
 //	    blocked client an SQL error via TCP-close, and the prompt row
 //	    survives so the operator still sees it in `prompts list`.
-const SchemaVersion = 4
+//	5 — bulk-prompt-answer UX per [[bulk-prompt-answer-ux]]: rules
+//	    table gains `expires_at` TEXT column (nullable; ISO-8601 UTC).
+//	    Non-null + past-now → rule is expired + filtered out of every
+//	    LoadRuleSet snapshot + sweep-removed by SweepExpiredRules.
+//	    Closes "block-happy = uninstalled" failure mode per
+//	    [[safety-mode-lean-permissive]]: when a burst of denies hits,
+//	    operator can opt into a time-bounded blanket allow via
+//	    `dbounce prompts bulk-answer --decision {10min|3h|session}`.
+//	    `profile_overrides` (single-row) table added for the
+//	    hot-swap path: when bulk-answer-with --decision profile fires,
+//	    the CLI / MCP tool writes the new profile name + the running
+//	    proxy's burst sweeper picks it up on its next tick + calls
+//	    Server.SwapProfile. Cross-process safe because both the proxy
+//	    and the CLI / MCP server share this SQLite DB.
+const SchemaVersion = 5
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors DBOUNCE_DB for tests and CI sandboxes that want
@@ -248,6 +262,11 @@ func (s *Store) migrate() error {
 		// Rules: scaffolded for D-Slice 3. Pattern shape will be
 		// "statement_type:table_glob" (e.g. "DELETE:public.*",
 		// "*:secrets_*"). Empty in D-Slice 1.
+		// `expires_at` (v5; bulk-prompt-answer UX per
+		// [[bulk-prompt-answer-ux]]) is nullable ISO-8601 UTC. Non-null +
+		// past-now → rule treated as expired (filtered out of
+		// LoadRuleSet + ListRules; reaped by SweepExpiredRules). NULL =
+		// permanent rule (legacy behavior).
 		`CREATE TABLE IF NOT EXISTS rules (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			pattern TEXT NOT NULL,
@@ -257,7 +276,25 @@ func (s *Store) migrate() error {
 			function_scope TEXT,
 			note TEXT,
 			origin TEXT NOT NULL DEFAULT 'user',
-			created_at TEXT NOT NULL
+			created_at TEXT NOT NULL,
+			expires_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rules_expires_at ON rules(expires_at)`,
+		// profile_overrides: bulk-prompt-answer UX per
+		// [[bulk-prompt-answer-ux]] hot-swap path. Single-row design
+		// (row id is always 1; UPSERT on conflict). When non-empty +
+		// set_at <= now, the running proxy's burst-sweeper goroutine
+		// picks it up + calls Server.SwapProfile to hot-swap the
+		// running profile WITHOUT a restart. CLEARED by the proxy on
+		// successful swap so a stale value can't pin the override.
+		// Cross-process correct because every dbounce process consults
+		// the same SQLite DB.
+		`CREATE TABLE IF NOT EXISTS profile_overrides (
+			id INTEGER PRIMARY KEY,
+			profile_name TEXT NOT NULL,
+			set_at TEXT NOT NULL,
+			set_by TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT ''
 		)`,
 		// Tasks: scaffolded for D-Slice 3 (per-task scope composition).
 		`CREATE TABLE IF NOT EXISTS tasks (
@@ -371,6 +408,14 @@ func (s *Store) migrate() error {
 	// column to pending_prompts (NULL = legacy async-style prompt; no
 	// in-flight blocked goroutine waiting on a wakeup).
 	if err := s.addColumnIfMissing("pending_prompts", "sync_wait_id", "TEXT"); err != nil {
+		return err
+	}
+
+	// v5 additive migration per [[bulk-prompt-answer-ux]]: add
+	// expires_at to rules (NULL = permanent rule, legacy behavior).
+	// Fresh installs already have the column inline via the v5 CREATE
+	// TABLE above; this branch handles pre-v5 upgrade-in-place.
+	if err := s.addColumnIfMissing("rules", "expires_at", "TEXT"); err != nil {
 		return err
 	}
 
