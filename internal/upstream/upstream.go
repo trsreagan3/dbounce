@@ -244,7 +244,7 @@ func Resolve(opts Options) (*Upstream, error) {
 	// intranet-DB case behind an explicit operator acknowledgement.
 	hostname := parsed.Hostname()
 	if !opts.AllowInternal {
-		if err := guardInternalHost(hostname, opts.LookupHost); err != nil {
+		if err := GuardInternalHost(hostname, opts.LookupHost, GuardKindUpstream); err != nil {
 			return nil, err
 		}
 	}
@@ -326,42 +326,84 @@ var internalRanges = func() []*net.IPNet {
 // mDNS / Bonjour territory. Both are common SSRF targets.
 var internalTLDSuffixes = []string{".internal", ".local"}
 
-// guardInternalHost rejects host strings that resolve to (or textually
-// match) internal-network ranges unless the operator passed
-// --allow-internal-upstream. Hostname-suffix checks fire BEFORE DNS so
-// `.internal` / `.local` lookups never leave the process when blocked.
-// The actual IP allowlist uses net.LookupHost — not URL string parsing —
-// so a DNS-rebinding probe like `attacker.com` resolving to 10.0.0.1
-// is also caught.
+// GuardKind names the operator-facing surface a GuardInternalHost call
+// is defending. Drives the error-message text + the --allow-internal-*
+// flag name surfaced to the operator so an error coming from the audit
+// webhook gate points at --allow-internal-webhook (not the unrelated
+// --allow-internal-upstream).
+type GuardKind string
+
+const (
+	// GuardKindUpstream is the original D-Slice 2 MED-D8-06 callsite:
+	// the operator-configured --upstream URL that the proxy dials per
+	// connection.
+	GuardKindUpstream GuardKind = "upstream"
+	// GuardKindWebhook is the audit-export Slice 1 callsite: the
+	// operator-configured --audit-webhook-url that the WebhookPusher
+	// POSTs JSONL events to. Same SSRF threat model — operator-supplied
+	// URL that the proxy reaches out to from the loopback-only process.
+	GuardKindWebhook GuardKind = "audit webhook"
+)
+
+// allowFlagName returns the --allow-internal-* flag the operator passes
+// to opt into internal-range hosts for this guard kind. Keeps the error
+// message honest per [[v1-scope-bar]] — the operator gets pointed at
+// the EXACT flag that unlocks the surface they were trying to use.
+func (k GuardKind) allowFlagName() string {
+	switch k {
+	case GuardKindWebhook:
+		return "--allow-internal-webhook"
+	default:
+		return "--allow-internal-upstream"
+	}
+}
+
+// GuardInternalHost rejects host strings that resolve to (or textually
+// match) internal-network ranges unless the caller opted in. Hostname-
+// suffix checks fire BEFORE DNS so `.internal` / `.local` lookups never
+// leave the process when blocked. The actual IP allowlist uses
+// net.LookupHost — not URL string parsing — so a DNS-rebinding probe
+// like `attacker.com` resolving to 10.0.0.1 is also caught.
 //
-// MED-D8-06 (AUDIT-WB-DSLICES-1-8.md) closure.
-func guardInternalHost(host string, lookup func(string) ([]string, error)) error {
+// kind tunes the error-message wording so the operator sees the EXACT
+// flag (and surface name) that would unlock the host they tried to
+// configure. Both the original --upstream callsite + the audit-export
+// --audit-webhook-url callsite share the IP/CIDR/TLD-suffix table.
+//
+// MED-D8-06 (AUDIT-WB-DSLICES-1-8.md) closure + the #252 audit-export
+// webhook gate reuse.
+func GuardInternalHost(host string, lookup func(string) ([]string, error), kind GuardKind) error {
 	if host == "" {
 		// Caller has already rejected empty-host URLs upstream of this
 		// call. Defensive return-OK for the empty case so this helper
 		// never spuriously rejects a URL the parser already accepted.
 		return nil
 	}
+	flag := kind.allowFlagName()
+	surface := string(kind)
+	if surface == "" {
+		surface = "upstream"
+	}
 	lower := strings.ToLower(host)
 	for _, suf := range internalTLDSuffixes {
 		if strings.HasSuffix(lower, suf) {
 			return fmt.Errorf(
-				"dbounce: upstream host %q matches internal TLD suffix %q; "+
+				"dbounce: %s host %q matches internal TLD suffix %q; "+
 					"this is rejected by default to prevent SSRF-shaped abuse "+
-					"of operator-influenced upstream URLs (MED-D8-06). Pass "+
-					"--allow-internal-upstream on `dbounce run` to opt in "+
-					"for a legitimate intranet DB.",
-				host, suf)
+					"of operator-influenced URLs (MED-D8-06). Pass "+
+					"%s on `dbounce run` to opt in for a legitimate "+
+					"intranet endpoint.",
+				surface, host, suf, flag)
 		}
 	}
 	// If the host is already a literal IP, no DNS lookup is needed.
 	if ip := net.ParseIP(host); ip != nil {
 		if name, ok := matchInternalRange(ip); ok {
 			return fmt.Errorf(
-				"dbounce: upstream host %q resolves to %s which is inside "+
+				"dbounce: %s host %q resolves to %s which is inside "+
 					"internal range %s; rejected by default (MED-D8-06 SSRF "+
-					"gate). Pass --allow-internal-upstream on `dbounce run` "+
-					"to opt in.", host, ip.String(), name)
+					"gate). Pass %s on `dbounce run` to opt in.",
+				surface, host, ip.String(), name, flag)
 		}
 		return nil
 	}
@@ -375,9 +417,10 @@ func guardInternalHost(host string, lookup func(string) ([]string, error)) error
 	addrs, err := resolver(host)
 	if err != nil {
 		return fmt.Errorf(
-			"dbounce: lookup upstream host %q: %w (refused by SSRF gate "+
+			"dbounce: lookup %s host %q: %w (refused by SSRF gate "+
 				"because we can't confirm the host is public; pass "+
-				"--allow-internal-upstream if this is intentional)", host, err)
+				"%s if this is intentional)",
+			surface, host, err, flag)
 	}
 	for _, a := range addrs {
 		ip := net.ParseIP(a)
@@ -386,10 +429,10 @@ func guardInternalHost(host string, lookup func(string) ([]string, error)) error
 		}
 		if name, ok := matchInternalRange(ip); ok {
 			return fmt.Errorf(
-				"dbounce: upstream host %q resolves to %s which is inside "+
+				"dbounce: %s host %q resolves to %s which is inside "+
 					"internal range %s; rejected by default (MED-D8-06 SSRF "+
-					"gate). Pass --allow-internal-upstream on `dbounce run` "+
-					"to opt in.", host, ip.String(), name)
+					"gate). Pass %s on `dbounce run` to opt in.",
+				surface, host, ip.String(), name, flag)
 		}
 	}
 	return nil

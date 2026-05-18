@@ -710,11 +710,19 @@ func (f *Forwarder) writeErrorToClient(code, msg string) error {
 }
 
 func (f *Forwarder) recordDecision(row store.DecisionRow, source string) {
-	if _, err := f.srv.store.RecordDecision(row); err != nil {
+	decisionID, err := f.srv.store.RecordDecision(row)
+	if err != nil {
 		BumpLookupErrors()
 		log.Warn().Err(err).Str("source", source).
 			Msg("dbounce: record decision failed")
+		return
 	}
+	// #252 Slice 1 audit-export fan-out. See proxy.go
+	// exportDecisionRow for the rationale. The PG forwarder records
+	// multiple rows per gated message (sync-prompt pending + final
+	// outcome); each row exports separately so the downstream consumer
+	// sees the full state machine in JSONL order.
+	f.srv.exportDecisionRow(row, decisionID)
 }
 
 // extractErrorMessage pulls the 'M' field out of an ErrorResponse

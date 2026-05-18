@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -31,12 +32,40 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	dbrules "github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
+
+// licensedForAuditWebhook is the #252 Slice 1 placeholder license
+// gate. The audit-webhook transport is an Enterprise-tier feature per
+// the [[security-team-audit-export]] memo + [[enterprise-self-host-
+// only]]. dbounce does NOT yet have license-file plumbing (tracked as
+// issue #235); until that lands, --audit-webhook-url is rejected at
+// CLI parse time with an actionable error pointing the operator at
+// the JSONL log path (the FREE-tier transport that ships now) +
+// the future license-file path.
+//
+// When #235 lands, this function reads the Ed25519-signed license
+// file + returns nil iff the license includes the
+// "audit-export-webhook" entitlement. Until then, it always returns a
+// not-licensed error. The function is exported via a package-level
+// var so tests can override it without depending on a real license
+// file on disk.
+var licensedForAuditWebhook = func() error {
+	return errors.New(
+		"--audit-webhook-url requires an Enterprise license " +
+			"(placeholder: dbounce's license-file plumbing has not yet " +
+			"landed — tracked as #235). The JSONL log file transport " +
+			"--audit-log-path PATH is the FREE-tier audit-export channel " +
+			"and is available on all tiers. Ship the JSONL file to your " +
+			"collector via Fluent Bit / Vector / logrotate until the " +
+			"webhook gate unlocks. See [[security-team-audit-export]] " +
+			"for the full transport-tier matrix.")
+}
 
 // loopbackHosts mirrors kbounce + ibounce's CRIT-32-02 closure:
 // dbounce will hold inbound client SCRAM challenges + bearer tokens
@@ -402,6 +431,23 @@ func newRunCmd() *cobra.Command {
 		// configuration remains available via /healthz for operators
 		// who want introspection through the management endpoint.
 		quietBanner bool
+		// #252 Slice 1 audit-export transport flags. See
+		// [[security-team-audit-export]] memo for the full design.
+		// auditLogPath enables the FREE-tier JSONL transport.
+		auditLogPath  string
+		auditLogFsync bool
+		// auditWebhookURL + Token enable the Enterprise webhook
+		// transport. License-gated (placeholder until #235 lands the
+		// real license-file plumbing). batchSize defaults to 1 (one
+		// event per POST). allowInternalWebhook mirrors
+		// --allow-internal-upstream — same SSRF gate, separate opt-in
+		// so an operator who needs intranet upstream connectivity
+		// doesn't accidentally relax the webhook surface (or vice
+		// versa).
+		auditWebhookURL       string
+		auditWebhookToken     string
+		auditWebhookBatchSize int
+		allowInternalWebhook  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -677,6 +723,34 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 
 			s := proxy.NewServer(cfg, st)
 
+			// #252 Slice 1: build the audit-export fan-out from the
+			// transport flags. License gate fires BEFORE any IO so the
+			// operator's license-rejected case never opens a webhook
+			// connection / log file. Both transports are optional;
+			// neither configured = no audit-export (FREE-tier default).
+			auditExporter, exporterErr := buildAuditExporter(
+				auditLogPath, auditLogFsync,
+				auditWebhookURL, auditWebhookToken,
+				auditWebhookBatchSize, allowInternalWebhook,
+				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+				upstreamURL,
+			)
+			if exporterErr != nil {
+				return exporterErr
+			}
+			if auditExporter != nil {
+				s.SetAuditExporter(auditExporter)
+				// Close the exporter AFTER the proxy shuts down so any
+				// in-flight final-decision events get drained to disk +
+				// flushed to webhook. 5s is the same shutdown budget the
+				// proxy uses for its other transports.
+				defer func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_ = auditExporter.Shutdown(ctx)
+				}()
+			}
+
 			// Banner per the agent-parity requirement + the read-write
 			// framing the safe-default profile (D-Slice 7) will hook
 			// into. Goes to stderr so stdout stays clean.
@@ -694,6 +768,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				ProfileFromFlag:      profileFromFlag,
 				ProfileEnvSet:        os.Getenv(envProfileVar) != "",
 				Quiet:                quietBanner,
+				AuditExporter:        auditExporter,
 			})
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -876,7 +951,140 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"literals (passwords, API keys, PII) out of the log. Default "+
 			"false preserves full audit-reconstruction fidelity. "+
 			"MED-D8-09 from AUDIT-WB-DSLICES-1-8.md.")
+	// #252 Slice 1 audit-export flags. See
+	// [[security-team-audit-export]] memo for the full design + cross-
+	// product schema.
+	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "",
+		"Path to a JSONL audit-export file. When set, every decision is "+
+			"appended (O_APPEND|O_CREAT|O_WRONLY perm 0600) for security-"+
+			"team consumption. Append-only; rotation via logrotate / "+
+			"Fluent Bit / Vector / fluentd (NOT built in — bundling "+
+			"rotation here would duplicate well-trodden tools). FREE tier "+
+			"(all license tiers). Pairs with --audit-log-fsync for "+
+			"compliance-grade durability. #252 Slice 1.")
+	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false,
+		"Opt-in: fdatasync the audit log after every line. Default false "+
+			"batches at OS page-cache for throughput (risks losing the "+
+			"trailing few microseconds of events on a hard kill). True "+
+			"flushes per-line for compliance-grade durability at ~hundreds "+
+			"of microseconds of additional latency per decision. Has no "+
+			"effect when --audit-log-path is unset.")
+	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
+		"HTTPS webhook URL to POST audit-export events to. ENTERPRISE tier "+
+			"(license-gated; #235 will land the license-file plumbing — "+
+			"until then the flag fails at parse with the FREE-tier "+
+			"JSONL fallback documented). Bounded queue + exponential "+
+			"backoff retry + drop-on-overflow with synthetic AUDIT_DROPPED "+
+			"events. SSRF gate REUSES the --upstream SSRF closure (MED-D8-"+
+			"06) — internal-range hosts rejected unless "+
+			"--allow-internal-webhook is set. Pair with --audit-webhook-"+
+			"token for the Bearer credential.")
+	cmd.Flags().StringVar(&auditWebhookToken, "audit-webhook-token", "",
+		"Bearer credential the webhook POST sends as Authorization. "+
+			"Required when --audit-webhook-url is set. NEVER appears in "+
+			"the startup banner, /healthz, audit log file, retry-failure "+
+			"messages, or the MCP status tool — masked at every emission "+
+			"point. Prefer reading from a file via $(cat /path/to/token) "+
+			"on launch rather than echoing into shell history.")
+	cmd.Flags().IntVar(&auditWebhookBatchSize, "audit-webhook-batch-size", 1,
+		"How many decisions fit in one webhook POST body (newline-delimited "+
+			"JSON). Default 1 emits every decision. ≥2 reduces request "+
+			"overhead for high-throughput orgs at the cost of retry "+
+			"granularity (one failed batch loses N events). Max 1000.")
+	cmd.Flags().BoolVar(&allowInternalWebhook, "allow-internal-webhook", false,
+		"Opt-in: permit --audit-webhook-url hosts that resolve to internal "+
+			"IP ranges (127.0.0.0/8, 169.254.0.0/16 incl. AWS/GCP/Azure "+
+			"metadata, 10/8, 172.16/12, 192.168/16, ::1, fe80::/10, "+
+			"fc00::/7) or .internal / .local TLDs. Default false rejects "+
+			"these to defend against SSRF-shaped abuse of operator-"+
+			"influenced webhook URLs (same gate as MED-D8-06 closure on "+
+			"--upstream). Pass only when the webhook collector is a "+
+			"legitimate intranet endpoint.")
 	return cmd
+}
+
+// buildAuditExporter constructs the #252 Slice 1 audit-export fan-out
+// from CLI flags. Returns nil + nil err when no transports are
+// configured (FREE-tier default). License gate fires BEFORE any IO so
+// a rejected license never opens a webhook connection / creates a log
+// file.
+//
+// listenerHost is the proxy listener "host:port" the exporter stamps
+// onto Event.Host; upstreamURL is the upstream's "host:port" stamped
+// onto Event.Upstream (or empty when observation-only).
+func buildAuditExporter(
+	logPath string, logFsync bool,
+	webhookURL, webhookToken string, webhookBatchSize int,
+	allowInternalWebhook bool,
+	listenerHost, upstreamURL string,
+) (*audit.Exporter, error) {
+	var logWriter *audit.LogWriter
+	if logPath != "" {
+		w, err := audit.NewLogWriter(audit.LogOptions{
+			Path:  logPath,
+			Fsync: logFsync,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("audit-log writer: %w", err)
+		}
+		logWriter = w
+	}
+
+	var webhookPusher *audit.WebhookPusher
+	if webhookURL != "" {
+		// License gate FIRST — before any URL parsing / SSRF check /
+		// IO. Per [[deliberate-feature-completion]]: the operator
+		// gets a single clear error pointing at the FREE-tier
+		// alternative + the future-fix issue, not a stack of
+		// validation errors that mask the actual gate.
+		if err := licensedForAuditWebhook(); err != nil {
+			// Close the log writer if one was opened above so we
+			// don't leak a partial-init goroutine on the rejection
+			// path.
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			return nil, err
+		}
+		p, err := audit.NewWebhookPusher(audit.WebhookOptions{
+			URL:           webhookURL,
+			Token:         webhookToken,
+			BatchSize:     webhookBatchSize,
+			Host:          listenerHost,
+			AllowInternal: allowInternalWebhook,
+		})
+		if err != nil {
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			return nil, fmt.Errorf("audit-webhook pusher: %w", err)
+		}
+		webhookPusher = p
+	} else if webhookToken != "" {
+		// Token without a URL is almost certainly a typo / forgotten
+		// --audit-webhook-url. Fail-fast rather than silently ignore.
+		if logWriter != nil {
+			_ = logWriter.Shutdown(context.Background())
+		}
+		return nil, errors.New(
+			"--audit-webhook-token set but --audit-webhook-url is empty; " +
+				"either pair them or drop both flags")
+	}
+
+	if logWriter == nil && webhookPusher == nil {
+		return nil, nil
+	}
+	upstreamHost := ""
+	if upstreamURL != "" {
+		// Best-effort: pull the host out for the Event.Upstream stamp.
+		// Parsing failure here is non-fatal because upstream.Resolve
+		// already validated; the worst case is an empty Upstream field
+		// in the emitted events.
+		if u, err := url.Parse(upstreamURL); err == nil {
+			upstreamHost = u.Host
+		}
+	}
+	return audit.NewExporter(logWriter, webhookPusher, listenerHost, upstreamHost), nil
 }
 
 // newAuditCmd implements `dbounce audit ...`. D-Slice 1 ships `tail`

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
@@ -42,6 +43,12 @@ type bannerOpts struct {
 	ProfileEnvSet bool
 	// Quiet drives the LOW-D8-13 fingerprint-suppressed mode.
 	Quiet bool
+	// AuditExporter, when non-nil, drives the #252 Slice 1
+	// audit-export banner lines. The banner shows the FILE PATH +
+	// the REDACTED webhook URL — the token is NEVER printed (the
+	// WebhookPusher's RedactedURL helper guarantees the bearer
+	// header never leaks via the banner path).
+	AuditExporter *audit.Exporter
 }
 
 // writeStartupBanner writes the post-startup banner to w. Returns no
@@ -117,5 +124,21 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 		"                        D-Slice 7 safe-default profile can default to reads-fine +")
 	fmt.Fprintln(w,
 		"                        writes-layered-checks (the readonly-admin-minus shape).")
+	// #252 Slice 1: audit-export banner lines. Token NEVER appears —
+	// the file path is operator-supplied (no secret) and the webhook
+	// URL goes through WebhookPusher.RedactedURL which strips userinfo.
+	if opts.AuditExporter != nil && opts.AuditExporter.Enabled() {
+		st := opts.AuditExporter.Status()
+		if st.Log != nil {
+			fmt.Fprintf(w,
+				"audit-export log     : %s  (fsync=%v, queue=%d)\n",
+				st.Log.Path, st.Log.Fsync, st.Log.QueueLimit)
+		}
+		if st.Webhook != nil {
+			fmt.Fprintf(w,
+				"audit-export webhook : %s  (batch=%d, queue=%d; ENTERPRISE — token masked)\n",
+				st.Webhook.URLRedacted, st.Webhook.BatchSize, st.Webhook.QueueLimit)
+		}
+	}
 	fmt.Fprintln(w, "Ctrl+C to stop.")
 }

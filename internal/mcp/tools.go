@@ -181,6 +181,24 @@ func ToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name": "dbounce_audit_export_status",
+			"description": "#252 Slice 1: return the status of the security-team " +
+				"audit-export transports (JSONL log file + HTTPS webhook). " +
+				"Read-only. Returns total_events (written/delivered), " +
+				"dropped_events (with per-transport breakdown), webhook_in_flight, " +
+				"last_error (per transport, bounded), plus configured booleans for " +
+				"both transports + the webhook URL (REDACTED — userinfo masked; " +
+				"the Bearer token is NEVER surfaced). Use this to verify the " +
+				"audit-export is healthy before relying on its output for " +
+				"compliance / security-team review. Composes with " +
+				"[[security-team-audit-export]] + [[ibounce-honest-positioning]] " +
+				"(operator-visibility, not adversary defense).",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name": "dbounce_tail_decisions",
 			"description": "Inspect the recent decision audit log " +
 				"(every statement dbounce gated). Newest first. Useful " +

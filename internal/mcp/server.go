@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/parser"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
@@ -91,6 +92,14 @@ type Config struct {
 	// Actor is the string recorded in audit rows when MCP-initiated
 	// mutations land. Defaults to "dbounce-mcp" when empty.
 	Actor string
+
+	// AuditExporter, when non-nil, surfaces the #252 Slice 1
+	// audit-export transport status via the dbounce_audit_export_status
+	// tool. Nil = the tool reports {configured: false}. The MCP server
+	// reads the exporter's Stats() snapshot; it NEVER calls Emit
+	// itself (the proxy owns the per-decision write path; this is
+	// read-only introspection only).
+	AuditExporter *audit.Exporter
 }
 
 // Server is the MCP-over-stdio server.
@@ -220,6 +229,8 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolTailDecisions(args)
 	case "dbounce_pending_sync_prompts":
 		return s.toolPendingSyncPrompts(args)
+	case "dbounce_audit_export_status":
+		return s.toolAuditExportStatus(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
@@ -670,6 +681,88 @@ func (s *Server) toolPendingSyncPrompts(_ map[string]any) (map[string]any, error
 		"waiting": out,
 		"count":   len(out),
 	}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_audit_export_status — #252 Slice 1 security-team audit-export
+// transport health. Returns per-transport counters + last_error +
+// configured booleans. The webhook URL is REDACTED (userinfo masked);
+// the Bearer token is NEVER surfaced — tested invariant. Read-only.
+// ---------------------------------------------------------------------
+
+func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error) {
+	out := map[string]any{
+		"configured":      false,
+		"total_events":    int64(0),
+		"dropped_events":  int64(0),
+		"webhook_in_flight": int64(0),
+		"log": map[string]any{
+			"configured": false,
+		},
+		"webhook": map[string]any{
+			"configured": false,
+		},
+	}
+	if s.cfg.AuditExporter == nil || !s.cfg.AuditExporter.Enabled() {
+		return out, nil
+	}
+	st := s.cfg.AuditExporter.Status()
+	out["configured"] = true
+	out["host"] = st.Host
+	out["upstream"] = st.Upstream
+
+	totalEvents := int64(0)
+	totalDropped := int64(0)
+	var lastErr string
+
+	if st.Log != nil {
+		// Per the spec docstring: never surface the token. The
+		// LogStats has no token field; only Path, Written, Dropped,
+		// LastError, Fsync, QueueDepth, QueueLimit.
+		out["log"] = map[string]any{
+			"configured":  st.Log.Configured,
+			"path":        st.Log.Path,
+			"written":     st.Log.Written,
+			"dropped":     st.Log.Dropped,
+			"fsync":       st.Log.Fsync,
+			"last_error":  st.Log.LastError,
+			"queue_depth": st.Log.QueueDepth,
+			"queue_limit": st.Log.QueueLimit,
+		}
+		totalEvents += st.Log.Written
+		totalDropped += st.Log.Dropped
+		if st.Log.LastError != "" {
+			lastErr = "log: " + st.Log.LastError
+		}
+	}
+	if st.Webhook != nil {
+		// URLRedacted is the userinfo-masked URL; the token lives in
+		// the Authorization header only + is NEVER in WebhookStats.
+		out["webhook"] = map[string]any{
+			"configured":   st.Webhook.Configured,
+			"url_redacted": st.Webhook.URLRedacted,
+			"delivered":    st.Webhook.Delivered,
+			"dropped":      st.Webhook.Dropped,
+			"in_flight":    st.Webhook.InFlight,
+			"last_error":   st.Webhook.LastError,
+			"batch_size":   st.Webhook.BatchSize,
+			"queue_depth":  st.Webhook.QueueDepth,
+			"queue_limit":  st.Webhook.QueueLimit,
+		}
+		totalEvents += st.Webhook.Delivered
+		totalDropped += st.Webhook.Dropped
+		out["webhook_in_flight"] = st.Webhook.InFlight
+		if st.Webhook.LastError != "" {
+			if lastErr != "" {
+				lastErr += "; "
+			}
+			lastErr += "webhook: " + st.Webhook.LastError
+		}
+	}
+	out["total_events"] = totalEvents
+	out["dropped_events"] = totalDropped
+	out["last_error"] = lastErr
+	return out, nil
 }
 
 // ---------------------------------------------------------------------

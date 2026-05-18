@@ -31,6 +31,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/parser"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	dbrules "github.com/trsreagan3/dbounce/internal/rules"
@@ -370,11 +371,54 @@ type Server struct {
 	store    *store.Store
 	listener net.Listener
 	mgmtSrv  *http.Server
+
+	// auditExporter is the #252 Slice 1 audit-export fan-out. May be
+	// nil when neither --audit-log-path nor --audit-webhook-url is
+	// configured (FREE-tier dev-laptop default). Always called via
+	// recordDecisionAndExport so the per-decision projection happens
+	// AFTER the existing SQLite RecordDecision (so the row already has
+	// its assigned id + the existing audit-row write is the cross-cut
+	// invariant — the export is additive, never substitutive).
+	auditExporter *audit.Exporter
 }
 
 // NewServer constructs a Server without starting it.
 func NewServer(cfg Config, st *store.Store) *Server {
 	return &Server{cfg: cfg.Normalize(), store: st}
+}
+
+// SetAuditExporter wires the #252 Slice 1 audit-export fan-out. May be
+// called once after NewServer + before Serve; nil is permitted (no-op
+// at decision time). Not goroutine-safe by design — only the CLI's
+// pre-Serve sequence calls it. Tests that need a custom exporter
+// construct a fresh Server.
+func (s *Server) SetAuditExporter(e *audit.Exporter) {
+	s.auditExporter = e
+}
+
+// AuditExporter returns the wired exporter (may be nil). Surfaced for
+// the MCP status tool + /healthz. Read-only — callers must not mutate
+// the returned pointer's fields.
+func (s *Server) AuditExporter() *audit.Exporter {
+	return s.auditExporter
+}
+
+// exportDecisionRow is the load-bearing fan-out call. Invoked AFTER
+// the existing store.RecordDecision succeeds + the row has its
+// decisionID. Per the spec: never blocks the proxy hot-path (each
+// transport's Push/Write is non-blocking with drop-on-overflow).
+//
+// The exporter is nil-safe; callers can invoke unconditionally.
+func (s *Server) exportDecisionRow(row store.DecisionRow, decisionID int64) {
+	if s.auditExporter == nil || !s.auditExporter.Enabled() {
+		return
+	}
+	// context.Background() — the exporter has its own bounded queue;
+	// honoring a request ctx here would tear down a per-request
+	// goroutine BEFORE the export had a chance to enqueue. The
+	// per-transport workers have their own Shutdown contexts surfaced
+	// via Server.Shutdown.
+	_ = s.auditExporter.EmitDecision(context.Background(), row, decisionID)
 }
 
 // Serve binds the wire-protocol listener + the management HTTP
@@ -688,6 +732,15 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 		return
 	}
 
+	// #252 Slice 1: fan out to configured audit-export transports
+	// (JSONL log file + HTTPS webhook). No-op when neither is
+	// configured. Bounded queue + drop-on-overflow inside the exporter
+	// so this never blocks the proxy hot-path. Audit row remains the
+	// source of truth in SQLite; this export is ADDITIVE for security-
+	// team consumption. Per [[scorer-is-ground-truth]] the exporter
+	// projects the row faithfully — no re-scoring, no LLM enrichment.
+	s.exportDecisionRow(row, decisionID)
+
 	// D-Slice 8 prompt-on-deny enqueue. We only enqueue when:
 	//   - prompt-on-deny is enabled
 	//   - the decision was a DENY
@@ -934,15 +987,24 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		EndsAt    string `json:"ends_at"`
 		Reason    string `json:"reason,omitempty"`
 	}
+	// #252 Slice 1: surface the audit-export transport status on
+	// /healthz so monitors can alert on drop spikes / persistent
+	// webhook failures. The Stats() snapshot is race-free + NEVER
+	// contains the bearer token (WebhookStats.URLRedacted is the
+	// userinfo-masked URL; the token is in the Authorization header
+	// only). Per the spec docstring: token absence from /healthz is
+	// a tested invariant.
+	type HealthzAuditExport = audit.ExporterStatus
 	payload := struct {
-		Status              string        `json:"status"`
-		Mode                string        `json:"mode"`
-		DefaultPolicy       string        `json:"default_policy"`
-		Dialect             string        `json:"dialect"`
-		ActiveProfile       string        `json:"active_profile"`
-		DecisionsCount      int64         `json:"decisions_count"`
-		LookupErrorsCounter int64         `json:"lookup_errors_counter"`
-		Pause               *HealthzPause `json:"pause"`
+		Status              string             `json:"status"`
+		Mode                string             `json:"mode"`
+		DefaultPolicy       string             `json:"default_policy"`
+		Dialect             string             `json:"dialect"`
+		ActiveProfile       string             `json:"active_profile"`
+		DecisionsCount      int64              `json:"decisions_count"`
+		LookupErrorsCounter int64              `json:"lookup_errors_counter"`
+		Pause               *HealthzPause      `json:"pause"`
+		AuditExport         *HealthzAuditExport `json:"audit_export,omitempty"`
 	}{
 		Status:              "ok",
 		Mode:                string(s.cfg.Mode),
@@ -965,6 +1027,10 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 				Reason:    active.Reason,
 			}
 		}
+	}
+	if s.auditExporter != nil && s.auditExporter.Enabled() {
+		st := s.auditExporter.Status()
+		payload.AuditExport = &st
 	}
 	w.WriteHeader(http.StatusOK)
 	if err := writeJSON(w, payload); err != nil {

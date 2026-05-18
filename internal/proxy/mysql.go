@@ -502,6 +502,8 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 				log.Warn().Err(recErr).
 					Msg("dbounce: record mysql sync-prompt pending decision failed; falling back to plain deny")
 			} else {
+				// #252 Slice 1: also fan out to audit-export transports.
+				f.srv.exportDecisionRow(pendingRow, pendingDecisionID)
 				psv := &parsedStatementView{
 					StatementType:   row.StatementType,
 					TablesTouched:   row.TablesTouched,
@@ -527,9 +529,7 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 			row.UpstreamStatus = upstreamStatusNotForwarded
 			row.UpstreamResponseSummary = "transparent-mode deny: " + row.DecisionReason
 			row.Enforced = true
-			if _, err := f.srv.store.RecordDecision(row); err != nil {
-				BumpLookupErrors()
-			}
+			f.recordMySQLDecision(row)
 			if err := writeMySQLErr(f.in, seq+1, mysqlErrSpecificAccessDenied,
 				mysqlSQLStateAccessDenied,
 				"dbounce: denied: "+row.DecisionReason); err != nil {
@@ -548,26 +548,34 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 	if err := writeMySQLPacket(f.out, seq, payload); err != nil {
 		row.UpstreamStatus = upstreamStatusError
 		row.UpstreamResponseSummary = "upstream write failed: " + err.Error()
-		if _, recErr := f.srv.store.RecordDecision(row); recErr != nil {
-			BumpLookupErrors()
-		}
+		f.recordMySQLDecision(row)
 		return err
 	}
 	summary, drainErr := f.drainUpstreamResultSet()
 	if drainErr != nil {
 		row.UpstreamStatus = upstreamStatusError
 		row.UpstreamResponseSummary = "upstream drain failed: " + drainErr.Error()
-		if _, recErr := f.srv.store.RecordDecision(row); recErr != nil {
-			BumpLookupErrors()
-		}
+		f.recordMySQLDecision(row)
 		return drainErr
 	}
 	row.UpstreamStatus = summary.Status
 	row.UpstreamResponseSummary = summary.Text
-	if _, err := f.srv.store.RecordDecision(row); err != nil {
-		BumpLookupErrors()
-	}
+	f.recordMySQLDecision(row)
 	return nil
+}
+
+// recordMySQLDecision writes one audit row to the store + fans out to
+// the #252 Slice 1 audit-export transports. Centralizes the
+// store-write + export-emit pair so every MySQL gated-query exit path
+// goes through the same plumbing — matches the PG forwarder's
+// Forwarder.recordDecision shape.
+func (f *mysqlForwarder) recordMySQLDecision(row store.DecisionRow) {
+	decisionID, err := f.srv.store.RecordDecision(row)
+	if err != nil {
+		BumpLookupErrors()
+		return
+	}
+	f.srv.exportDecisionRow(row, decisionID)
 }
 
 // drainUpstreamResultSet shuttles every packet the upstream sends in
@@ -666,11 +674,17 @@ func (f *mysqlForwarder) recordPreparedReject(sql, source string) {
 		UpstreamStatus:          upstreamStatusNotForwarded,
 		UpstreamResponseSummary: "rejected at proxy: COM_STMT_PREPARE not supported",
 	}
-	if _, err := f.srv.store.RecordDecision(row); err != nil {
+	decisionID, err := f.srv.store.RecordDecision(row)
+	if err != nil {
 		BumpLookupErrors()
 		log.Warn().Err(err).Str("source", source).
 			Msg("dbounce: record prepared-stmt reject failed")
+		return
 	}
+	// #252 Slice 1: fan out to audit-export transports so a rejected
+	// prepared-statement attempt also surfaces in the security-team
+	// audit stream.
+	f.srv.exportDecisionRow(row, decisionID)
 }
 
 // mysqlExtractErrMessage pulls the human-readable message out of an
