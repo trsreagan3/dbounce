@@ -143,6 +143,12 @@ func newRootCmd() *cobra.Command {
 	// the cross-product "audit-export health" pattern shared with
 	// ibounce + kbounce.
 	root.AddCommand(newAuditExportCmd())
+	// [[basic-app-hygiene-features]] TIER 1 #1: `dbounce config
+	// export | import` ships a portable JSON bundle of the runtime
+	// configuration so an operator can back up, move, or change-
+	// manage a deployment without scraping state.db by hand. Sibling
+	// agents in ibounce + kbounce ship the same parent.
+	root.AddCommand(newConfigCmd())
 	root.AddCommand(newInitTLSCmd())
 	// D-Slice 7: environment profile + MCP server subcommand trees.
 	root.AddCommand(newProfileCmd())
