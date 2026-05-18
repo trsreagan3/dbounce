@@ -5,6 +5,44 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Investigate-with-Claude workflow (#273, 2026-05-18)
+
+`dbounce investigate` composes the existing `audit tail --export
+ocsf-bundle` (#268) and `diagnostics bundle` (#277) into a single
+"land a Claude-ready evidence pack" subcommand. Operator drops the
+two artifacts into THEIR local Claude client (Claude Code, Cursor's
+Claude integration, desktop Claude, the Anthropic console —
+whichever they use) and asks an investigative prompt; dbounce never
+calls Anthropic. Per `[[self-host-zero-billing-dependency]]` the
+only network call is the same local /healthz GET `diagnostics
+bundle` makes. Per `[[creates-never-mutates]]` it's read-only.
+
+Cross-product alignment per `[[cross-product-agent-parity]]` —
+ibounce / kbounce / gbounce ship the same subcommand shape with
+the same `--out-dir` / `--time-range` / `--filter` /
+`--print-prompts` flag set.
+
+- Writes `dbounce-investigation.ndjson` (OCSF v1.1.0 class 2004
+  Detection Finding bundle wrapping the filtered + redacted audit
+  events) + `dbounce-investigation-context.zip` (the standard
+  diagnostics bundle with `--no-audit` — the evidence file already
+  carries the audit content).
+- `--print-prompts` lists the 10 starter investigative prompts as a
+  paste-able block without writing artifact files. dbounce variants
+  include write-query bursts + DDL-outside-change-window prompts.
+- `--time-range 24h|7d|4w` filters the evidence to a recent window.
+- `--dialect postgres|mysql|snowflake|bigquery` labels the context
+  bundle's runtime dialect for the Claude analyst.
+- Per `[[don't-tailor-to-lighthouse]]` the prompts are generic — no
+  specific Claude surface is named.
+- Per `[[security-team-positioning-safety-not-surveillance]]` the
+  prompts stay in the "denial / scope mismatch / policy mismatch"
+  vocabulary; nothing reads as accusation.
+
+Docs: `docs/INVESTIGATE-WITH-CLAUDE.md` — workflow walkthrough,
+the 10 starter prompts, privacy story, and cross-bouncer parity
+notes.
+
 ### Cross-product config-export wire reconciliation (#288, 2026-05-18)
 
 Closes `[[cross-product-agent-parity]]`-#288. The `dbounce config

@@ -183,6 +183,12 @@ func newRootCmd() *cobra.Command {
 	// muscle-memory shortcut works across all three products.
 	root.AddCommand(newDiagnosticsCmd())
 	root.AddCommand(newDiagnosticsDiagAliasCmd())
+	// #273 investigate-with-Claude workflow. Composes #268
+	// audit-tail OCSF export + #277 diagnostics bundle into a single
+	// subcommand that lands a Claude-ready evidence pack on disk.
+	// Cross-product parity with ibounce / kbounce / gbounce per
+	// [[cross-product-agent-parity]].
+	root.AddCommand(newInvestigateCmd())
 	// #279 SQLite backup/restore. Top-level subcommands (NOT under
 	// `dbounce config`) — see internal/cli/backup.go for the verb-
 	// choice rationale + the cross-product alignment with kbounce +
