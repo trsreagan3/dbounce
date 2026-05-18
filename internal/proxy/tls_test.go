@@ -574,7 +574,8 @@ func TestPGHandshakeWithPreamble_PreReadStartupWorks(t *testing.T) {
 		}
 	}()
 
-	require.NoError(t, pgHandshakeWithPreamble(srv, preamble))
+	_, herr := pgHandshakeWithPreamble(srv, preamble)
+	require.NoError(t, herr)
 	<-clientDone
 }
 

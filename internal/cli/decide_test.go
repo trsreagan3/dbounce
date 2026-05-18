@@ -212,3 +212,48 @@ func TestDecideCmd_StatementAndStdinMutuallyExclusive(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "mutually exclusive")
 }
+
+// TestDecideCmd_AgentName_FlagSurfaceInJSON pins
+// [[agent-identity-in-audit]] Feature 1 JDBC-shim wiring: the
+// --agent-name flag MUST surface in the decideResult JSON so the shim
+// wrapper sees confirmation that the agent name flowed through.
+// Missing flag defaults to "unknown" per the memo.
+func TestDecideCmd_AgentName_FlagSurfaceInJSON(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	cmd := newDecideCmd()
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{
+		"--dialect=snowflake",
+		"--statement", "SELECT 1",
+		"--db", dbPath,
+		"--default-policy", "allow",
+		"--agent-name", "claude-code",
+		"--agent-version", "1.2.3",
+		"--json",
+	})
+	require.NoError(t, cmd.Execute())
+	text := out.String()
+	assert.Contains(t, text, `"agent_name":"claude-code"`)
+}
+
+func TestDecideCmd_AgentName_DefaultsToUnknown(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	cmd := newDecideCmd()
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{
+		"--dialect=snowflake",
+		"--statement", "SELECT 1",
+		"--db", dbPath,
+		"--default-policy", "allow",
+		"--json",
+	})
+	require.NoError(t, cmd.Execute())
+	text := out.String()
+	assert.Contains(t, text, `"agent_name":"unknown"`,
+		"--agent-name absent MUST default to 'unknown' per "+
+			"[[agent-identity-in-audit]] memo")
+}

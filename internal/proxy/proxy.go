@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -389,11 +390,48 @@ type Server struct {
 	// gate." A bug in the alert engine CANNOT change a decide()
 	// verdict.
 	alertEngine *audit.RuleEngine
+
+	// agentRegistry is the per-process registry of live agent-session
+	// fingerprints per [[agent-identity-in-audit]]. Each incoming PG /
+	// MySQL TCP connection mints a session id at handshake time + binds
+	// the detected agent (application_name / client attrs); each gated
+	// statement looks up the agent via the session id + projects it into
+	// unmapped.iam_jit.agent on the audit event. Retire fires on
+	// connection close + emits a SESSION_ENDED synthetic event so a SIEM
+	// consumer can JOIN every preceding event from that session id
+	// against this terminator.
+	//
+	// Initialized in NewServer (never nil) so call sites can call Mint /
+	// Lookup / Retire unconditionally. Process-wide single registry
+	// (small cardinality: O(10) live agents on a dev laptop, O(100) on
+	// a shared bouncer host) — sync.RWMutex inside the registry handles
+	// the concurrency.
+	agentRegistry *audit.AgentRegistry
+
+	// connWG tracks in-flight serveConn / serveMySQLConn goroutines so
+	// Shutdown can wait for them to complete + their deferred
+	// emitSessionEnded (per [[agent-identity-in-audit]] Feature 2) to
+	// drain into the AuditExporter BEFORE the caller closes the
+	// exporter. Without this, the LogWriter's "Caller MUST stop
+	// sending to Write BEFORE calling Shutdown" invariant races with
+	// the per-connection defer chain. Bumped at the top of every
+	// per-conn handler, decremented in the same defer chain.
+	connWG sync.WaitGroup
 }
 
 // NewServer constructs a Server without starting it.
 func NewServer(cfg Config, st *store.Store) *Server {
-	return &Server{cfg: cfg.Normalize(), store: st}
+	return &Server{
+		cfg:           cfg.Normalize(),
+		store:         st,
+		agentRegistry: audit.NewAgentRegistry(),
+	}
+}
+
+// AgentRegistry returns the per-process agent-session registry. Surfaced
+// for tests + the MCP introspection tool. Never nil after NewServer.
+func (s *Server) AgentRegistry() *audit.AgentRegistry {
+	return s.agentRegistry
 }
 
 // SetAuditExporter wires the #252 Slice 1 audit-export fan-out. May be
@@ -444,20 +482,52 @@ func (s *Server) AlertEngine() *audit.RuleEngine {
 // events rather than gating decisions. A bug in the alert engine
 // CANNOT change a decide() verdict — this composition order is the
 // invariant that keeps the safety story honest.
+//
+// Wrapper preserves the no-agent call-shape for code that doesn't yet
+// thread agent context (none after the [[agent-identity-in-audit]]
+// rollout — but kept for symmetry with FromDecisionRow's wrapper).
 func (s *Server) exportDecisionRow(row store.DecisionRow, decisionID int64) {
+	s.exportDecisionRowWithAgent(row, decisionID, "")
+}
+
+// exportDecisionRowWithAgent is the agent-aware variant per
+// [[agent-identity-in-audit]] Feature 1+2. sessionID, when non-empty,
+// is looked up against the per-process AgentRegistry; the resolved
+// Agent (with name, version, session_id, detected_from) is projected
+// onto unmapped.iam_jit.agent. An empty sessionID OR a registry miss
+// (rare — session retired mid-flight) results in no agent block in the
+// emitted event (the existing observation-only-no-agent shape).
+//
+// Per [[scorer-is-ground-truth]]: the agent fingerprint NEVER affects
+// the decision — it ONLY decorates the audit-export event for post-hoc
+// SIEM review.
+func (s *Server) exportDecisionRowWithAgent(row store.DecisionRow, decisionID int64, sessionID string) {
 	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
 	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
 	if !exporterOn && !alertsOn {
 		return
 	}
-	// Project once + reuse. FromDecisionRow is a pure projection (per
-	// [[scorer-is-ground-truth]]); the rule engine + the exporter
-	// both read the same OCSF Event so they see the same view. The
-	// host + upstream strings are immutable post-construction so we
-	// read s.cfg directly instead of round-tripping through the
-	// exporter's Status() (which would allocate a stats struct on
-	// every decision).
-	evt := audit.FromDecisionRow(row, decisionID, s.listenerAddr(), s.upstreamAddr())
+	var agent audit.Agent
+	if sessionID != "" && s.agentRegistry != nil {
+		if a, ok := s.agentRegistry.Lookup(sessionID); ok {
+			agent = a
+		} else {
+			// Registry miss is possible if the connection close ran
+			// concurrently with a final in-flight decision. Stamp
+			// session_id only — at least the SIEM has the correlation
+			// key even when the name is gone.
+			agent = audit.Agent{SessionID: sessionID, DetectedFrom: audit.DetectedFromUnknown}
+		}
+	}
+	// Project once + reuse. FromDecisionRowWithAgent is a pure
+	// projection (per [[scorer-is-ground-truth]]); the rule engine +
+	// the exporter both read the same OCSF Event so they see the same
+	// view. The host + upstream strings are immutable post-construction
+	// so we read s.cfg directly instead of round-tripping through the
+	// exporter's Status() (which would allocate a stats struct on every
+	// decision).
+	evt := audit.FromDecisionRowWithAgent(
+		row, decisionID, s.listenerAddr(), s.upstreamAddr(), agent)
 	// context.Background() — the exporter has its own bounded queue;
 	// honoring a request ctx here would tear down a per-request
 	// goroutine BEFORE the export had a chance to enqueue. The
@@ -470,6 +540,44 @@ func (s *Server) exportDecisionRow(row store.DecisionRow, decisionID int64) {
 	// engine NEVER gates; emit errors are intentionally swallowed
 	// here for the same reason the export side does — the proxy
 	// hot-path MUST NOT block on observability plumbing.
+	if alertsOn {
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+}
+
+// emitSessionEnded fires a SESSION_ENDED synthetic event for the
+// connection identified by sessionID. Called from the per-protocol
+// connection-close path (PG forwarder + observation-only PG loop +
+// MySQL forwarder + observation-only MySQL loop) so a SIEM consumer
+// can JOIN every preceding event from that session_id against the
+// terminator.
+//
+// Idempotent: Retire returns ok=false if the session was already
+// retired (defensive against double-close paths); when that happens we
+// don't emit a second SESSION_ENDED.
+//
+// Per [[agent-identity-in-audit]]: emit even when the agent was never
+// fully fingerprinted (clientInfo block was absent in MCP path or
+// application_name wasn't sent on PG StartupMessage). The retired
+// Agent still has the session_id; an absence of name is preserved as
+// "unknown" so the SIEM dashboard has a stable bucket.
+func (s *Server) emitSessionEnded(sessionID string) {
+	if sessionID == "" || s.agentRegistry == nil {
+		return
+	}
+	agent, ok := s.agentRegistry.Retire(sessionID)
+	if !ok {
+		return
+	}
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
+		return
+	}
+	evt := audit.NewSessionEndedEvent(agent, s.listenerAddr())
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
 	if alertsOn {
 		s.alertEngine.ObserveDecision(context.Background(), evt)
 	}
@@ -558,10 +666,35 @@ func (s *Server) Serve() error {
 	}
 }
 
-// Shutdown stops the listener + the management HTTP server.
+// Shutdown stops the listener + the management HTTP server + waits
+// for in-flight serveConn goroutines (including their deferred
+// emitSessionEnded calls per [[agent-identity-in-audit]]) to complete
+// so the caller can safely close the AuditExporter afterwards without
+// racing the LogWriter's "stop sending before Shutdown" invariant.
+//
+// Listener.Close() makes the Accept loop return + new connections get
+// refused; existing per-conn goroutines continue until their own
+// read loops detect EOF / timeout (clients dropping their connection
+// is the fast path). connWG.Wait blocks Shutdown until all per-conn
+// defers (which include the SESSION_ENDED emit) have drained.
+//
+// Honors ctx via a select against connWG completion; if ctx fires
+// first the function returns ctx.Err() without continuing to
+// mgmtSrv.Shutdown so the caller sees the original deadline-exceeded
+// signal.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.listener != nil {
 		_ = s.listener.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.connWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	if s.mgmtSrv != nil {
 		return s.mgmtSrv.Shutdown(ctx)
@@ -571,6 +704,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // serveConn is the per-client read loop.
 func (s *Server) serveConn(conn net.Conn) {
+	s.connWG.Add(1)
+	defer s.connWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Warn().Interface("panic", r).
@@ -627,12 +762,22 @@ func (s *Server) serveConn(conn net.Conn) {
 		consumed = nil
 	}
 
-	if err := pgHandshakeWithPreamble(working, consumed); err != nil {
+	startupBody, err := pgHandshakeWithPreamble(working, consumed)
+	if err != nil {
 		log.Debug().Err(err).Str("remote", conn.RemoteAddr().String()).
 			Msg("dbounce: handshake failed")
 		return
 	}
 	conn = working
+
+	// [[agent-identity-in-audit]] Feature 1+2: parse application_name
+	// from the StartupMessage body + mint a per-connection session id.
+	// Best-effort: a malformed body or missing application_name results
+	// in an "unknown" agent name + the session id still propagating
+	// through subsequent audit events so the SIEM has a correlation
+	// key even when the client identity wasn't declared.
+	sessionID := s.registerPGAgentFromBody(startupBody)
+	defer s.emitSessionEnded(sessionID)
 
 	for {
 		_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
@@ -649,7 +794,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			return
 		case msgQuery:
 			sql := readCString(payload)
-			s.evaluateAndAudit(sql, "Query")
+			s.evaluateAndAuditWithAgent(sql, "Query", sessionID)
 			if err := writeReadyForQuery(conn); err != nil {
 				return
 			}
@@ -657,7 +802,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = readCString(payload) // stmt name (discarded for now)
 			rest := payload[firstNullPlus1(payload):]
 			sql := readCString(rest)
-			s.evaluateAndAudit(sql, "Parse")
+			s.evaluateAndAuditWithAgent(sql, "Parse", sessionID)
 			if err := writeParseComplete(conn); err != nil {
 				return
 			}
@@ -717,7 +862,46 @@ func (s *Server) serveConn(conn net.Conn) {
 //     still gets the DENY (we can't keep the SQL client waiting on a
 //     human); the prompt is an out-of-band review channel for the
 //     operator to flip the rule shape via `dbounce prompts answer`.
+// registerPGAgentFromBody parses a PG StartupMessage body for
+// application_name, maps it to a known agent name (or stamps the
+// literal value for unknown clients), and mints a session id in the
+// per-process AgentRegistry. Returns the minted session id; an empty
+// return is reserved for a registry-not-wired test path.
+//
+// Per [[agent-identity-in-audit]] Feature 1: this is best-effort
+// detection. The session id ALWAYS gets minted (so SESSION_ENDED can
+// fire on close + audit rows have the correlation key) even when no
+// application_name was sent — name falls back to "unknown".
+func (s *Server) registerPGAgentFromBody(body []byte) string {
+	if s.agentRegistry == nil {
+		return ""
+	}
+	params := audit.ParsePGStartupParams(body)
+	name, rawAppName := audit.ParsePGStartupAppName(params)
+	agent := audit.Agent{
+		Name:         name,
+		DetectedFrom: audit.DetectedFromPGAppName,
+	}
+	if rawAppName == "" {
+		// No application_name sent. Mint anyway so the session id
+		// threads through the audit; name will be normalized to
+		// "unknown" inside Mint.
+		agent.Name = ""
+		agent.DetectedFrom = audit.DetectedFromUnknown
+	}
+	return s.agentRegistry.Mint(agent)
+}
+
+// evaluateAndAudit is preserved as the legacy 2-arg shape (existing
+// tests pre-date [[agent-identity-in-audit]] + don't care about the
+// session id). New callers — and the production serveConn path — go
+// through evaluateAndAuditWithAgent so the per-connection session id
+// threads onto the OCSF event.
 func (s *Server) evaluateAndAudit(sql, source string) {
+	s.evaluateAndAuditWithAgent(sql, source, "")
+}
+
+func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 	ps := parser.Parse(string(s.cfg.Dialect), sql)
 	d := s.decide(ps)
 
@@ -809,7 +993,14 @@ func (s *Server) evaluateAndAudit(sql, source string) {
 	// source of truth in SQLite; this export is ADDITIVE for security-
 	// team consumption. Per [[scorer-is-ground-truth]] the exporter
 	// projects the row faithfully — no re-scoring, no LLM enrichment.
-	s.exportDecisionRow(row, decisionID)
+	//
+	// [[agent-identity-in-audit]] Feature 1+2: thread sessionID so the
+	// per-connection agent fingerprint (parsed from PG application_name
+	// at handshake time) lands under unmapped.iam_jit.agent on every
+	// audit event. Empty sessionID falls through to the no-agent path —
+	// preserves the legacy event shape for callers that haven't yet
+	// threaded agent context.
+	s.exportDecisionRowWithAgent(row, decisionID, sessionID)
 
 	// D-Slice 8 prompt-on-deny enqueue. We only enqueue when:
 	//   - prompt-on-deny is enabled
@@ -1168,26 +1359,32 @@ const (
 // preamble, when non-nil + 8 bytes, is a pre-read startup header (used
 // after D-Slice 4's TLS upgrade path has already consumed bytes from
 // the wire). Nil = read fresh.
-func pgHandshakeWithPreamble(conn net.Conn, preamble []byte) error {
+//
+// Returns the StartupMessage body bytes (the parameters block after
+// the 4-byte protocol version) so the caller can parse
+// application_name + other params per [[agent-identity-in-audit]]
+// Feature 1. Empty body is valid (PG allows a connection with no
+// parameters); a nil return is reserved for the error case.
+func pgHandshakeWithPreamble(conn net.Conn, preamble []byte) ([]byte, error) {
 	hdr := preamble
 	if hdr == nil {
 		hdr = make([]byte, 8)
 		if _, err := io.ReadFull(conn, hdr); err != nil {
-			return fmt.Errorf("read startup header: %w", err)
+			return nil, fmt.Errorf("read startup header: %w", err)
 		}
 	} else if len(hdr) != 8 {
-		return fmt.Errorf("preamble must be 8 bytes (got %d)", len(hdr))
+		return nil, fmt.Errorf("preamble must be 8 bytes (got %d)", len(hdr))
 	}
 	length := binary.BigEndian.Uint32(hdr[0:4])
 	magic := binary.BigEndian.Uint32(hdr[4:8])
 
 	if magic == 80877103 {
 		if _, err := conn.Write([]byte{'N'}); err != nil {
-			return fmt.Errorf("write SSL-no: %w", err)
+			return nil, fmt.Errorf("write SSL-no: %w", err)
 		}
 		hdr = make([]byte, 8)
 		if _, err := io.ReadFull(conn, hdr); err != nil {
-			return fmt.Errorf("read second startup header: %w", err)
+			return nil, fmt.Errorf("read second startup header: %w", err)
 		}
 		length = binary.BigEndian.Uint32(hdr[0:4])
 		magic = binary.BigEndian.Uint32(hdr[4:8])
@@ -1195,48 +1392,49 @@ func pgHandshakeWithPreamble(conn net.Conn, preamble []byte) error {
 
 	if magic == 80877104 {
 		if _, err := conn.Write([]byte{'N'}); err != nil {
-			return fmt.Errorf("write GSS-no: %w", err)
+			return nil, fmt.Errorf("write GSS-no: %w", err)
 		}
 		hdr = make([]byte, 8)
 		if _, err := io.ReadFull(conn, hdr); err != nil {
-			return fmt.Errorf("read third startup header: %w", err)
+			return nil, fmt.Errorf("read third startup header: %w", err)
 		}
 		length = binary.BigEndian.Uint32(hdr[0:4])
 		magic = binary.BigEndian.Uint32(hdr[4:8])
 	}
 
 	if magic == 80877102 {
-		return errors.New("CancelRequest received; nothing to cancel in D-Slice 1")
+		return nil, errors.New("CancelRequest received; nothing to cancel in D-Slice 1")
 	}
 
 	if length < 8 || length > 1<<20 {
-		return fmt.Errorf("implausible startup length: %d", length)
+		return nil, fmt.Errorf("implausible startup length: %d", length)
 	}
 	body := make([]byte, length-8)
 	if _, err := io.ReadFull(conn, body); err != nil {
-		return fmt.Errorf("read startup body: %w", err)
+		return nil, fmt.Errorf("read startup body: %w", err)
 	}
 
 	if err := writeMessage(conn, 'R', []byte{0, 0, 0, 0}); err != nil {
-		return err
+		return nil, err
 	}
 	bkd := make([]byte, 8)
 	binary.BigEndian.PutUint32(bkd[0:4], 1)
 	binary.BigEndian.PutUint32(bkd[4:8], 0)
 	if err := writeMessage(conn, 'K', bkd); err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeMessage(conn, 'Z', []byte{'I'}); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return body, nil
 }
 
 // pgHandshake is the legacy entry point preserved for compatibility
 // with existing tests. New paths should call pgHandshakeWithPreamble
 // directly.
 func pgHandshake(conn net.Conn) error {
-	return pgHandshakeWithPreamble(conn, nil)
+	_, err := pgHandshakeWithPreamble(conn, nil)
+	return err
 }
 
 func readPGMessage(conn net.Conn) (byte, []byte, error) {

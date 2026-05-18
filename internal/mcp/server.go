@@ -29,6 +29,7 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,29 +97,96 @@ type Config struct {
 	// AuditExporter, when non-nil, surfaces the #252 Slice 1
 	// audit-export transport status via the dbounce_audit_export_status
 	// tool. Nil = the tool reports {configured: false}. The MCP server
-	// reads the exporter's Stats() snapshot; it NEVER calls Emit
-	// itself (the proxy owns the per-decision write path; this is
-	// read-only introspection only).
+	// reads the exporter's Stats() snapshot; the dbounce_decide MCP
+	// tool's [[agent-identity-in-audit]] wiring ALSO calls Emit on it
+	// to surface SESSION_ENDED on stdio close — the only write the MCP
+	// server makes against the exporter. The proxy owns the per-decision
+	// write path; this is the bookkeeping-event surface only.
 	AuditExporter *audit.Exporter
+
+	// AgentRegistry is the per-process registry of live agent sessions
+	// per [[agent-identity-in-audit]]. May be nil when MCP is run
+	// standalone (the install-* / show-config / list-tools subcommands
+	// + when no audit-export is wired); when non-nil, the server mints
+	// a session id at `initialize` time + retires it on Serve return,
+	// emitting SESSION_ENDED via AuditExporter.
+	//
+	// Wiring: the proxy.Server creates ONE AgentRegistry that both the
+	// SQL listener + the MCP server share, so a SIEM consumer joining
+	// on session_id can correlate MCP tool calls + SQL gated decisions
+	// from the same agent process. When MCP is standalone (`dbounce
+	// mcp serve` not invoked from inside a proxy), pass nil; the MCP
+	// server creates its own private registry so per-call session id
+	// + SESSION_ENDED still work, just without cross-process
+	// correlation.
+	AgentRegistry *audit.AgentRegistry
+
+	// Host is the listener-equivalent address stamped onto SESSION_ENDED
+	// events emitted by the MCP server. Defaults to "mcp-stdio" when
+	// empty — the MCP server doesn't bind a network listener so there
+	// is no real host:port; the constant identifies the transport.
+	Host string
 }
 
 // Server is the MCP-over-stdio server.
 type Server struct {
 	cfg Config
 	mu  sync.Mutex
+
+	// sessionID is the per-MCP-connection agent session id minted at
+	// initialize time per [[agent-identity-in-audit]] Feature 2. Bound
+	// to the connection's lifetime: mint on the first `initialize`
+	// request, retire on Serve() return (the stdio peer closed). The
+	// AgentRegistry binding stores the parsed clientInfo (name +
+	// version + DetectedFromMCPClientInfo) so subsequent audit events
+	// from the SAME stdio session can JOIN on the session id.
+	//
+	// Read by the test path only — production code threads sessionID
+	// through directly. Atomic-friendly access via mu.
+	sessionID string
 }
 
 // NewServer constructs an MCP server from the given config.
+//
+// [[agent-identity-in-audit]] wiring: when cfg.AgentRegistry is nil,
+// the server creates its own private registry so per-connection session
+// id minting + SESSION_ENDED still work in the standalone `dbounce mcp
+// serve` invocation. When the caller passes a shared registry (e.g. a
+// future deployment where MCP + proxy share a process), cross-channel
+// session correlation is preserved.
 func NewServer(cfg Config) *Server {
 	if cfg.Actor == "" {
 		cfg.Actor = "dbounce-mcp"
 	}
+	if cfg.AgentRegistry == nil {
+		cfg.AgentRegistry = audit.NewAgentRegistry()
+	}
+	if cfg.Host == "" {
+		cfg.Host = "mcp-stdio"
+	}
 	return &Server{cfg: cfg}
+}
+
+// SessionID returns the per-connection agent session id minted at MCP
+// `initialize` time. Returns empty until initialize fires. Exported
+// for test inspection — production callers route through the audit
+// pipeline.
+func (s *Server) SessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessionID
 }
 
 // Serve runs the JSON-RPC loop. One request per line on `in`; one
 // response per line on `out`. Blocks until `in` returns io.EOF.
+//
+// [[agent-identity-in-audit]] Feature 2: on return (the stdio peer
+// closed, which means the agent exited), retire the per-connection
+// session id from the AgentRegistry + emit a SESSION_ENDED synthetic
+// event via the configured AuditExporter so a SIEM consumer can JOIN
+// every preceding event from that session_id against this terminator.
 func (s *Server) Serve(in io.Reader, out io.Writer) error {
+	defer s.retireSessionAndEmit()
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	enc := json.NewEncoder(out)
@@ -143,6 +211,72 @@ func (s *Server) Serve(in io.Reader, out io.Writer) error {
 	return scanner.Err()
 }
 
+// retireSessionAndEmit removes this connection's session id from the
+// AgentRegistry + emits a SESSION_ENDED synthetic event via the
+// configured AuditExporter. Idempotent — calling twice (defer + an
+// explicit teardown) does not double-emit; Retire returns ok=false on
+// the second call so the emit branch short-circuits.
+//
+// No-op when AgentRegistry is nil OR sessionID is empty (initialize
+// never fired) OR AuditExporter is nil.
+func (s *Server) retireSessionAndEmit() {
+	s.mu.Lock()
+	sid := s.sessionID
+	s.sessionID = ""
+	s.mu.Unlock()
+	if sid == "" || s.cfg.AgentRegistry == nil {
+		return
+	}
+	agent, ok := s.cfg.AgentRegistry.Retire(sid)
+	if !ok || s.cfg.AuditExporter == nil || !s.cfg.AuditExporter.Enabled() {
+		return
+	}
+	host := s.cfg.Host
+	if host == "" {
+		host = "mcp-stdio"
+	}
+	evt := audit.NewSessionEndedEvent(agent, host)
+	_ = s.cfg.AuditExporter.Emit(context.Background(), evt)
+}
+
+// mintSessionFromClientInfo registers the MCP client's reported
+// clientInfo block in the AgentRegistry + binds the minted session id
+// to this Server. Called from the `initialize` handler.
+//
+// Per [[agent-identity-in-audit]] Feature 1: the MCP clientInfo block
+// is the HIGHEST-confidence agent signal — the MCP spec defines a
+// `clientInfo: {name, version}` block that honest clients always send.
+// detected_from is stamped as DetectedFromMCPClientInfo to distinguish
+// from the SQL-dialect heuristics. Idempotent: re-mint on a second
+// initialize (a peer that re-handshakes mid-session) is allowed +
+// rotates the session id (the new id is recorded as the active one;
+// the previous id is retired with a SESSION_ENDED event so SIEM
+// reviewers can trace the reset).
+func (s *Server) mintSessionFromClientInfo(name, version string) {
+	if s.cfg.AgentRegistry == nil {
+		return
+	}
+	agent := audit.MCPClientInfoToAgent(name, version)
+	newID := s.cfg.AgentRegistry.Mint(agent)
+	s.mu.Lock()
+	prev := s.sessionID
+	s.sessionID = newID
+	s.mu.Unlock()
+	// On re-init, fire the SESSION_ENDED for the previous id so the
+	// SIEM sees a clean state machine.
+	if prev != "" && prev != newID {
+		if oldAgent, ok := s.cfg.AgentRegistry.Retire(prev); ok &&
+			s.cfg.AuditExporter != nil && s.cfg.AuditExporter.Enabled() {
+			host := s.cfg.Host
+			if host == "" {
+				host = "mcp-stdio"
+			}
+			evt := audit.NewSessionEndedEvent(oldAgent, host)
+			_ = s.cfg.AuditExporter.Emit(context.Background(), evt)
+		}
+	}
+}
+
 type rawRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -153,6 +287,22 @@ type rawRequest struct {
 func (s *Server) dispatch(req rawRequest) any {
 	switch req.Method {
 	case "initialize":
+		// [[agent-identity-in-audit]] Feature 1: capture clientInfo
+		// from the initialize params + mint a per-connection session id.
+		// The MCP spec defines `clientInfo: {name, version}` as part of
+		// the InitializeParams payload; honest clients (Claude Code,
+		// Cursor, Codex, Devin) always send it. Per the memo we DON'T
+		// reject when clientInfo is missing — name falls back to
+		// "unknown" + the session id still mints so SESSION_ENDED
+		// still emits on close.
+		var p struct {
+			ClientInfo struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"clientInfo"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+		s.mintSessionFromClientInfo(p.ClientInfo.Name, p.ClientInfo.Version)
 		return okResponse(req.ID, map[string]any{
 			"protocolVersion": ProtocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{}},

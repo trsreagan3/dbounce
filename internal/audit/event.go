@@ -84,6 +84,16 @@ const (
 	// narrower profile; it never says "violation" / "unauthorized" /
 	// "attack." The security team interprets the alert in context.
 	EventTypeSecurityAlert EventType = "SECURITY_ALERT"
+
+	// EventTypeSessionEnded synthesizes when an MCP stdio connection
+	// closes OR a SQL TCP connection closes. Per
+	// [[agent-identity-in-audit]] Feature 2: "When the MCP connection
+	// closes (agent exits), the session ID retires + a SESSION_ENDED
+	// event emits." Lets a SIEM consumer answer "when did agent session
+	// X end?" without inferring from the absence of subsequent rows.
+	// activity_id=99 (Other); activity_name="session_ended"; severity
+	// Informational (this is bookkeeping, not an alert).
+	EventTypeSessionEnded EventType = "SESSION_ENDED"
 )
 
 // Product names the originating Bounce product. Stamped into
@@ -339,6 +349,15 @@ type Unmapped struct {
 //
 // EventType + DroppedCount + QueueSize are populated only on the
 // AUDIT_DROPPED synthetic.
+//
+// Agent (Feature 1 + 2 of [[agent-identity-in-audit]]) is the agent-
+// fingerprint + persistent session id block. Pointer-to-struct so an
+// event WITHOUT agent context (observation-only smoke test before any
+// real client connected) omits the field entirely from the JSONL wire
+// rather than emitting `"agent":{}`. Populated by the proxy +
+// MCP-server call paths via AgentRegistry.Lookup at projection time.
+// Sibling agents in ibounce + kbounce ship under the SAME JSON path
+// (unmapped.iam_jit.agent) so a single SIEM filter spans all three.
 type IAMJITExt struct {
 	Mode       string         `json:"mode,omitempty"`
 	Profile    string         `json:"profile,omitempty"`
@@ -346,6 +365,7 @@ type IAMJITExt struct {
 	DecisionID int64          `json:"decision_id,omitempty"`
 	Enforced   bool           `json:"enforced"`
 	Ext        map[string]any `json:"ext,omitempty"`
+	Agent      *Agent         `json:"agent,omitempty"`
 
 	// Synthetic-event-only fields (populated for AUDIT_DROPPED, omitted
 	// for DECISION events).
@@ -375,7 +395,37 @@ type IAMJITExt struct {
 //
 // upstream is the resolved upstream URL host:port, or empty when the
 // proxy is observation-only — projected onto dst_endpoint when set.
+//
+// For the agent-fingerprint variant (Feature 1 + 2 of
+// [[agent-identity-in-audit]]) callers go through FromDecisionRowWithAgent
+// below — this wrapper preserves backward-compatibility for the existing
+// kbounce/ibounce-symmetric callsites that don't yet thread agent
+// context.
 func FromDecisionRow(row store.DecisionRow, decisionID int64, host, upstream string) Event {
+	return FromDecisionRowWithAgent(row, decisionID, host, upstream, Agent{})
+}
+
+// FromDecisionRowWithAgent is the agent-aware projection. When agent
+// is non-empty, unmapped.iam_jit.agent is populated per the
+// [[agent-identity-in-audit]] schema:
+//
+//	"unmapped": {
+//	  "iam_jit": {
+//	    "agent": {
+//	      "name": "claude-code" | "cursor" | "psql" | "unknown",
+//	      "version": "1.2.3" | null,
+//	      "session_id": "<UUID v7>",
+//	      "detected_from": "mcp_clientinfo" | "pg_application_name" |
+//	                        "mysql_client_attrs" | "decide_flag" |
+//	                        "unknown"
+//	    }, ...
+//	  }
+//	}
+//
+// An empty Agent omits the agent block (the json:"agent,omitempty" tag
+// drops the field) — operators in observation-only mode without any
+// connected agent see the historical event shape unchanged.
+func FromDecisionRowWithAgent(row store.DecisionRow, decisionID int64, host, upstream string, agent Agent) Event {
 	at := row.At
 	if at.IsZero() {
 		at = time.Now().UTC()
@@ -431,10 +481,28 @@ func FromDecisionRow(row store.DecisionRow, decisionID int64, host, upstream str
 				DecisionID: decisionID,
 				Enforced:   row.Enforced,
 				Ext:        buildExt(row),
+				Agent:      agentPtrOrNil(agent),
 			},
 		},
 	}
 	return evt
+}
+
+// agentPtrOrNil returns &a when a has any populated field, otherwise
+// nil. The Unmapped.IAMJIT.Agent field uses json:"agent,omitempty" on
+// a pointer type so the JSON marshaller drops the entire block when
+// no agent context is available — observation-only smoke events stay
+// the same shape they had before [[agent-identity-in-audit]] landed.
+//
+// Normalize ensures empty Name → "unknown" + empty DetectedFrom →
+// DetectedFromUnknown so SIEM dashboards always see SOME value when an
+// agent block is present.
+func agentPtrOrNil(a Agent) *Agent {
+	if a.IsEmpty() {
+		return nil
+	}
+	norm := a.Normalize()
+	return &norm
 }
 
 // activityIDFromStatementType maps a SQL statement type to the OCSF
@@ -804,6 +872,65 @@ func NewSecurityAlertEvent(rule AlertRuleID, severity AlertSeverity, host, detai
 				EventType: string(EventTypeSecurityAlert),
 				Enforced:  false,
 				Ext:       ext,
+			},
+		},
+	}
+}
+
+// NewSessionEndedEvent constructs the synthetic event emitted when an
+// agent's stdio MCP connection OR a SQL TCP connection closes. Per
+// [[agent-identity-in-audit]] Feature 2: "When the MCP connection
+// closes (agent exits), the session ID retires + a SESSION_ENDED
+// event emits."
+//
+// The transport (PG forwarder / MySQL forwarder / observation-only PG
+// loop / MCP server) calls AgentRegistry.Retire to remove the session
+// + receives the previously-stored Agent, then hands that Agent here
+// for the synthetic event. The decisionID arg is 0 (this isn't a
+// decision); api.operation = "session_ended"; severity = Informational.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "session_ended", type_uid=600399, severity_id=1 (Informational),
+// status_id=99 (Other). The agent block under unmapped.iam_jit.agent
+// carries the retired session_id so a SIEM consumer can JOIN every
+// preceding event from that session_id against this terminator.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: this is
+// bookkeeping, not an alert — Informational severity keeps it below
+// the dashboard noise floor.
+func NewSessionEndedEvent(agent Agent, host string) Event {
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "session_ended",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: "agent session ended",
+		API: API{
+			Operation: "session_ended",
+		},
+		SrcEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeSessionEnded),
+				Enforced:  false,
+				Agent:     agentPtrOrNil(agent),
 			},
 		},
 	}

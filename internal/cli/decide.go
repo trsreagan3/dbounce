@@ -44,6 +44,13 @@ import (
 // decideResult is the shape `dbounce decide` writes to stdout. Mirrors
 // the dbounce_decide MCP tool's JSON shape so shim code can reuse the
 // same parsing across the CLI + JSON-RPC paths.
+//
+// AgentName + AgentSessionID echo back the [[agent-identity-in-audit]]
+// fields the shim passed in via --agent-name (per the memo: "the decide
+// CLI is invoked with explicit --agent-name flag (operator/agent
+// passes it) — fallback to 'unknown' if absent"). The shim wrapper sees
+// these fields surface so it can confirm the right agent was
+// fingerprinted.
 type decideResult struct {
 	Verdict         string   `json:"verdict"`
 	DecisionSource  string   `json:"decision_source"`
@@ -55,6 +62,8 @@ type decideResult struct {
 	IsDML           bool     `json:"is_dml"`
 	IsDDL           bool     `json:"is_ddl"`
 	HasMutatingNode bool     `json:"has_mutating_node"`
+	AgentName       string   `json:"agent_name,omitempty"`
+	AgentSessionID  string   `json:"agent_session_id,omitempty"`
 }
 
 func newDecideCmd() *cobra.Command {
@@ -70,6 +79,8 @@ func newDecideCmd() *cobra.Command {
 		syncPromptOnDeny     bool
 		syncPromptTimeoutStr string
 		syncPromptDefaultStr string
+		agentName            string
+		agentVersion         string
 	)
 	cmd := &cobra.Command{
 		Use:   "decide",
@@ -167,6 +178,16 @@ Exit code:
 			res, err := evalDecide(st, activeProfile, dialect, defaultPol, sql)
 			if err != nil {
 				return err
+			}
+			// [[agent-identity-in-audit]] Feature 1: surface the
+			// operator-declared --agent-name in the decideResult so the
+			// JDBC-shim wrapper sees confirmation that the agent name
+			// flowed through. Empty agent name normalizes to "unknown"
+			// per the memo's "fallback to unknown if absent" guidance.
+			if strings.TrimSpace(agentName) == "" {
+				res.AgentName = "unknown"
+			} else {
+				res.AgentName = strings.TrimSpace(agentName)
 			}
 
 			// #203 — sync-prompt-on-deny for the JDBC-shim path.
@@ -317,6 +338,22 @@ Exit code:
 			"--sync-prompt-default. Range 5s-300s; default 30s.")
 	cmd.Flags().StringVar(&syncPromptDefaultStr, "sync-prompt-default", "deny",
 		"Verdict --sync-prompt-on-deny applies on timeout: allow | deny.")
+	// [[agent-identity-in-audit]] Feature 1: --agent-name + --agent-
+	// version are the JDBC-shim path's equivalent of MCP clientInfo /
+	// PG application_name. The shim wrapper passes the agent name it
+	// was invoked by (e.g. --agent-name claude-code --agent-version
+	// 1.2.3) so the resulting decision row + sync-prompt audit event
+	// carries the fingerprint in unmapped.iam_jit.agent. Per the memo:
+	// "fallback to unknown if absent" — both flags are optional + the
+	// result surfaces "unknown" when not passed.
+	cmd.Flags().StringVar(&agentName, "agent-name", "",
+		"Agent name fingerprint for the audit trail (e.g. claude-code, "+
+			"cursor, devin, codex, custom). Surfaced in decideResult + "+
+			"persisted to unmapped.iam_jit.agent.name when the audit-"+
+			"export transport is wired. Defaults to 'unknown'.")
+	cmd.Flags().StringVar(&agentVersion, "agent-version", "",
+		"Agent version string accompanying --agent-name (e.g. 1.2.3). "+
+			"Optional; surfaced in unmapped.iam_jit.agent.version.")
 	return cmd
 }
 

@@ -57,6 +57,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/parser"
 	"github.com/trsreagan3/dbounce/internal/store"
 )
@@ -98,11 +99,22 @@ func (s *Server) serveMySQLConn(conn net.Conn) {
 		s.serveMySQLConnWithUpstream(conn)
 		return
 	}
-	if err := mysqlObservationHandshake(conn); err != nil {
+	handshakeResponse, err := mysqlObservationHandshake(conn)
+	if err != nil {
 		log.Debug().Err(err).Str("remote", conn.RemoteAddr().String()).
 			Msg("dbounce: mysql handshake failed")
 		return
 	}
+	// [[agent-identity-in-audit]] Feature 1+2: parse client connection
+	// attributes from the HandshakeResponse payload + mint a per-
+	// connection session id. The MySQL Initial Handshake we sent
+	// advertises CLIENT_CONNECT_ATTRS (0x00100000) in the upper-cap
+	// byte; honest clients (MySQL Connector/J, libmysql, mysql CLI)
+	// echo their _client_name + _client_version + _program_name in the
+	// response. Best-effort: missing attrs → name="unknown" + the
+	// session id still propagates.
+	sessionID := s.registerMySQLAgentFromHandshakeResponse(handshakeResponse)
+	defer s.emitSessionEnded(sessionID)
 	for {
 		_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
 		seq, payload, err := readMySQLPacket(conn)
@@ -130,7 +142,7 @@ func (s *Server) serveMySQLConn(conn net.Conn) {
 			}
 		case mysqlComQuery:
 			sql := string(payload[1:])
-			s.evaluateAndAudit(sql, "mysql.Query")
+			s.evaluateAndAuditWithAgent(sql, "mysql.Query", sessionID)
 			// Observation-only: send back a minimal OK (zero rows).
 			if err := writeMySQLOK(conn, seq+1, 0, 0); err != nil {
 				return
@@ -163,7 +175,13 @@ func (s *Server) serveMySQLConn(conn net.Conn) {
 // name + accept the auth response opaquely, then return an OK packet.
 // The connection isn't a real DB session; the client's first COM_QUERY
 // will be audit-logged + acked with an empty OK.
-func mysqlObservationHandshake(conn net.Conn) error {
+//
+// Returns the HandshakeResponse payload bytes so the caller can parse
+// the connection-attributes block per
+// [[agent-identity-in-audit]] Feature 1. A successful call always
+// returns a non-nil byte slice (may be empty when the client sent an
+// empty response); nil is reserved for the error case.
+func mysqlObservationHandshake(conn net.Conn) ([]byte, error) {
 	// Build Initial Handshake packet.
 	const serverVersion = "8.0.0-dbounce-observation\x00"
 
@@ -190,17 +208,22 @@ func mysqlObservationHandshake(conn net.Conn) error {
 	pkt = append(pkt, []byte("mysql_native_password\x00")...)
 
 	if err := writeMySQLPacket(conn, 0, pkt); err != nil {
-		return fmt.Errorf("write initial handshake: %w", err)
+		return nil, fmt.Errorf("write initial handshake: %w", err)
 	}
 
-	// Read client's HandshakeResponse — opaque to us.
-	_, _, err := readMySQLPacket(conn)
+	// Read client's HandshakeResponse — opaque to the auth path but
+	// fed back to the agent-fingerprint parser so we can pull the
+	// _client_name / _client_version / _program_name attrs.
+	_, response, err := readMySQLPacket(conn)
 	if err != nil {
-		return fmt.Errorf("read handshake response: %w", err)
+		return nil, fmt.Errorf("read handshake response: %w", err)
 	}
 
 	// Reply OK (auth accepted in observation mode).
-	return writeMySQLOK(conn, 2, 0, 0)
+	if err := writeMySQLOK(conn, 2, 0, 0); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 // readMySQLPacket reads one MySQL wire-protocol packet from the conn:
@@ -286,6 +309,169 @@ func writeMySQLErr(conn net.Conn, seq byte, code uint16, sqlState, msg string) e
 	return writeMySQLPacket(conn, seq, pkt)
 }
 
+// registerMySQLAgentFromHandshakeResponse parses a MySQL
+// HandshakeResponse41 payload for the connection-attributes block,
+// maps the standard attrs (_client_name / _client_version /
+// _program_name) to a known agent name (or stamps the literal client
+// name for unknown drivers), and mints a session id in the per-
+// process AgentRegistry. Returns the minted session id; empty when
+// the registry isn't wired.
+//
+// Per [[agent-identity-in-audit]] Feature 1: best-effort. Most clients
+// in practice (mysql-cli, Connector/J, libmysql, mysql2) DO send the
+// _client_name attr; a missing attrs block (older clients) → name
+// falls back to "unknown" but the session id still threads through so
+// SIEM correlation still works.
+//
+// Parse strategy: walk the HandshakeResponse41 layout — capabilities
+// (4) + max_packet (4) + charset (1) + reserved (23) + null-terminated
+// username, then the variable-length auth response, the optional
+// database, the optional auth plugin name, and FINALLY the optional
+// length-encoded attrs block (when CLIENT_CONNECT_ATTRS is set in
+// capabilities). Rather than re-implement the full HandshakeResponse41
+// parser (each branch depending on capability bits the client may or
+// may not have set), we use a defensive heuristic: scan the tail of
+// the response for a sequence of length-encoded string pairs that
+// match well-known attr keys (`_client_name` / `_pid` / `_client_
+// version` / `_program_name` / `_os` / `_platform`). The heuristic is
+// robust to caching_sha2_password vs mysql_native_password vs cleartext
+// + the various capability-flag layouts.
+//
+// Defensive: any parse failure surfaces as agent.name="" + the session
+// is still minted. Never breaks a connection.
+func (s *Server) registerMySQLAgentFromHandshakeResponse(payload []byte) string {
+	if s.agentRegistry == nil {
+		return ""
+	}
+	attrs := scanMySQLHandshakeAttrs(payload)
+	name, version := audit.ParseMySQLAgentFromAttrs(attrs)
+	agent := audit.Agent{
+		Name:         name,
+		Version:      version,
+		DetectedFrom: audit.DetectedFromMySQLAttrs,
+	}
+	if name == "" {
+		agent.DetectedFrom = audit.DetectedFromUnknown
+	}
+	return s.agentRegistry.Mint(agent)
+}
+
+// scanMySQLHandshakeAttrs finds the connection-attributes block in a
+// HandshakeResponse41 payload by scanning for the well-known attr key
+// prefix `_client_name` (or `_program_name`) preceded by its length-
+// encoded-string length byte. When found, parses backward from that
+// position to the start of the attrs block (the length-encoded total
+// block size) and forward to extract every key/value pair via
+// audit.ParseMySQLClientAttrs. Returns an empty map on no match.
+//
+// The scan is defensive: an empty payload, a payload without attrs,
+// or a corrupt attrs block all return an empty map rather than
+// surfacing an error.
+func scanMySQLHandshakeAttrs(payload []byte) map[string]string {
+	// Look for `_client_name`, `_program_name`, or `_client_version` —
+	// any of these is a strong signal the attrs block starts here.
+	probes := [][]byte{
+		[]byte("_client_name"),
+		[]byte("_program_name"),
+		[]byte("_client_version"),
+	}
+	for _, probe := range probes {
+		idx := indexBytes(payload, probe)
+		if idx <= 0 {
+			continue
+		}
+		// The byte BEFORE the key bytes is the key's length-encoded-
+		// string length prefix (single-byte for keys < 251 chars, which
+		// _client_name etc. always are). Walk back to that byte, then
+		// back one more for the value-pair structure's length-encoded
+		// total. The attrs block starts at the most recent length-
+		// encoded int that names a plausible total size.
+		keyLenIdx := idx - 1
+		if keyLenIdx < 0 || int(payload[keyLenIdx]) != len(probe) {
+			continue
+		}
+		// Walk back further for the total-attrs-len byte. The total
+		// block size is at most 64 KiB in practice; scan back up to 8
+		// bytes for a length prefix that matches the remainder.
+		for back := 1; back <= 8 && keyLenIdx-back >= 0; back++ {
+			start := keyLenIdx - back
+			n, consumed, ok := mysqlReadLenEncInt(payload[start:])
+			if !ok {
+				continue
+			}
+			blockStart := start + consumed
+			if blockStart > len(payload) {
+				continue
+			}
+			// Tolerate trailing padding by capping at the remainder.
+			end := blockStart + int(n)
+			if end > len(payload) {
+				end = len(payload)
+			}
+			attrs := audit.ParseMySQLClientAttrs(payload[blockStart:end])
+			if len(attrs) > 0 {
+				return attrs
+			}
+		}
+	}
+	return map[string]string{}
+}
+
+// mysqlReadLenEncInt mirrors audit.mysqlReadLenEncInt so the proxy
+// pkg's attrs scanner doesn't need to re-export the audit pkg helper.
+// Kept private to the proxy pkg; the audit pkg has its own copy used
+// by ParseMySQLClientAttrs.
+func mysqlReadLenEncInt(b []byte) (uint64, int, bool) {
+	if len(b) == 0 {
+		return 0, 0, false
+	}
+	first := b[0]
+	switch {
+	case first < 0xfb:
+		return uint64(first), 1, true
+	case first == 0xfc:
+		if len(b) < 3 {
+			return 0, 0, false
+		}
+		return uint64(b[1]) | uint64(b[2])<<8, 3, true
+	case first == 0xfd:
+		if len(b) < 4 {
+			return 0, 0, false
+		}
+		return uint64(b[1]) | uint64(b[2])<<8 | uint64(b[3])<<16, 4, true
+	case first == 0xfe:
+		if len(b) < 9 {
+			return 0, 0, false
+		}
+		return uint64(b[1]) | uint64(b[2])<<8 | uint64(b[3])<<16 | uint64(b[4])<<24 |
+			uint64(b[5])<<32 | uint64(b[6])<<40 | uint64(b[7])<<48 | uint64(b[8])<<56, 9, true
+	default:
+		return 0, 0, false
+	}
+}
+
+// indexBytes is the tiny stdlib-shim search; defensive against an
+// empty needle (returns -1) so callers don't false-positive on every
+// payload.
+func indexBytes(haystack, needle []byte) int {
+	if len(needle) == 0 || len(needle) > len(haystack) {
+		return -1
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
 // mysqlEncodeLengthInt encodes a uint64 as a MySQL length-encoded
 // integer (see MySQL docs §"Length-Encoded Integer").
 func mysqlEncodeLengthInt(v uint64) []byte {
@@ -315,6 +501,14 @@ type mysqlForwarder struct {
 	srv *Server
 	in  net.Conn
 	out net.Conn
+
+	// sessionID is the per-connection agent-session id per
+	// [[agent-identity-in-audit]] Feature 2. Minted in pumpMySQLAuthPhase
+	// from the parsed HandshakeResponse attrs (best-effort detection of
+	// the client driver / agent name). Threaded onto every audit-export
+	// event the forwarder emits + retired on connection close so a
+	// SESSION_ENDED synthetic fires.
+	sessionID string
 }
 
 // serveMySQLConnWithUpstream is the MySQL counterpart of
@@ -325,6 +519,10 @@ func (s *Server) serveMySQLConnWithUpstream(in net.Conn) {
 		if f.out != nil {
 			_ = f.out.Close()
 		}
+		// [[agent-identity-in-audit]] Feature 2: emit SESSION_ENDED on
+		// connection close (idempotent — emitSessionEnded short-circuits
+		// when the session was already retired).
+		s.emitSessionEnded(f.sessionID)
 	}()
 	if err := f.run(); err != nil {
 		log.Debug().Err(err).
@@ -394,6 +592,17 @@ func (f *mysqlForwarder) pumpMySQLAuthPhase() error {
 		cliSeq, cliPayload, err := readMySQLPacket(f.in)
 		if err != nil {
 			return fmt.Errorf("read client auth packet: %w", err)
+		}
+		// [[agent-identity-in-audit]] Feature 1+2: the FIRST client
+		// packet in the auth phase is the HandshakeResponse41 that
+		// carries the connection-attributes block. Capture client
+		// fingerprint + mint the per-connection session id BEFORE
+		// forwarding the packet so an upstream failure still leaves a
+		// minted session that SESSION_ENDED can retire. Subsequent hops
+		// (AuthMoreData / AuthSwitchResponse) are skipped — the attrs
+		// block is in the HandshakeResponse only.
+		if hop == 0 && f.sessionID == "" {
+			f.sessionID = f.srv.registerMySQLAgentFromHandshakeResponse(cliPayload)
 		}
 		// LOAD-BEARING: cliPayload carries the auth response. Passed
 		// straight to writeMySQLPacket without inspection or naming.
@@ -503,7 +712,8 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 					Msg("dbounce: record mysql sync-prompt pending decision failed; falling back to plain deny")
 			} else {
 				// #252 Slice 1: also fan out to audit-export transports.
-				f.srv.exportDecisionRow(pendingRow, pendingDecisionID)
+				// Thread sessionID per [[agent-identity-in-audit]].
+				f.srv.exportDecisionRowWithAgent(pendingRow, pendingDecisionID, f.sessionID)
 				psv := &parsedStatementView{
 					StatementType:   row.StatementType,
 					TablesTouched:   row.TablesTouched,
@@ -569,13 +779,17 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 // store-write + export-emit pair so every MySQL gated-query exit path
 // goes through the same plumbing — matches the PG forwarder's
 // Forwarder.recordDecision shape.
+//
+// Threads f.sessionID into the export call so unmapped.iam_jit.agent
+// carries the per-connection fingerprint per
+// [[agent-identity-in-audit]].
 func (f *mysqlForwarder) recordMySQLDecision(row store.DecisionRow) {
 	decisionID, err := f.srv.store.RecordDecision(row)
 	if err != nil {
 		BumpLookupErrors()
 		return
 	}
-	f.srv.exportDecisionRow(row, decisionID)
+	f.srv.exportDecisionRowWithAgent(row, decisionID, f.sessionID)
 }
 
 // drainUpstreamResultSet shuttles every packet the upstream sends in
@@ -683,8 +897,8 @@ func (f *mysqlForwarder) recordPreparedReject(sql, source string) {
 	}
 	// #252 Slice 1: fan out to audit-export transports so a rejected
 	// prepared-statement attempt also surfaces in the security-team
-	// audit stream.
-	f.srv.exportDecisionRow(row, decisionID)
+	// audit stream. Thread sessionID per [[agent-identity-in-audit]].
+	f.srv.exportDecisionRowWithAgent(row, decisionID, f.sessionID)
 }
 
 // mysqlExtractErrMessage pulls the human-readable message out of an

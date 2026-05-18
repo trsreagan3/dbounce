@@ -62,6 +62,21 @@ type Forwarder struct {
 	out          net.Conn
 	upstream     *upstream.Upstream
 	startupBytes []byte
+
+	// startupBody is the PG StartupMessage parameter block (everything
+	// after the protocol version), captured during handshakeAndAuth so
+	// the agent-fingerprint helper can pull application_name out of it
+	// per [[agent-identity-in-audit]] Feature 1. nil after handshake on
+	// connections that didn't carry params (which is unusual — a real
+	// PG client always sends at least user + database).
+	startupBody []byte
+
+	// sessionID is the per-connection agent-session id minted by
+	// registerPGAgentFromBody after handshakeAndAuth completes. Empty
+	// until set; threads onto every exportDecisionRowWithAgent call so
+	// unmapped.iam_jit.agent carries the per-connection fingerprint.
+	// Retired on connection close + emits a SESSION_ENDED synthetic.
+	sessionID string
 }
 
 // PG SQLSTATE codes used by the proxy.
@@ -267,6 +282,11 @@ func (s *Server) serveConnWithUpstream(in net.Conn) {
 		if f.out != nil {
 			_ = f.out.Close()
 		}
+		// [[agent-identity-in-audit]] Feature 2: emit SESSION_ENDED on
+		// connection close. emitSessionEnded is idempotent + handles an
+		// empty sessionID (handshake failed before mint) by short-
+		// circuiting.
+		s.emitSessionEnded(f.sessionID)
 	}()
 	if err := f.run(); err != nil {
 		log.Debug().Err(err).
@@ -282,6 +302,12 @@ func (f *Forwarder) run() error {
 	if err := f.handshakeAndAuth(); err != nil {
 		return fmt.Errorf("handshake/auth: %w", err)
 	}
+	// [[agent-identity-in-audit]] Feature 1+2: mint the per-connection
+	// agent session AFTER auth succeeds (handshakeAndAuth captures the
+	// StartupMessage body into f.startupBody) but BEFORE the command
+	// loop starts so the first audit-export event already carries the
+	// session id + the parsed application_name.
+	f.sessionID = f.srv.registerPGAgentFromBody(f.startupBody)
 	return f.commandLoop()
 }
 
@@ -404,6 +430,10 @@ func (f *Forwarder) handshakeAndAuth() error {
 			return fmt.Errorf("read inbound startup body: %w", err)
 		}
 	}
+	// [[agent-identity-in-audit]] Feature 1: stash the body so run()
+	// can pull application_name out of it after auth completes. The
+	// bytes themselves still forward to the upstream verbatim below.
+	f.startupBody = body
 
 	if _, err := f.out.Write(f.startupBytes); err != nil {
 		return fmt.Errorf("forward startup preamble: %w", err)
@@ -722,7 +752,12 @@ func (f *Forwarder) recordDecision(row store.DecisionRow, source string) {
 	// multiple rows per gated message (sync-prompt pending + final
 	// outcome); each row exports separately so the downstream consumer
 	// sees the full state machine in JSONL order.
-	f.srv.exportDecisionRow(row, decisionID)
+	//
+	// [[agent-identity-in-audit]] Feature 1+2: thread f.sessionID so
+	// the per-connection agent fingerprint (parsed from PG
+	// application_name) lands under unmapped.iam_jit.agent on every
+	// audit event.
+	f.srv.exportDecisionRowWithAgent(row, decisionID, f.sessionID)
 }
 
 // extractErrorMessage pulls the 'M' field out of an ErrorResponse
