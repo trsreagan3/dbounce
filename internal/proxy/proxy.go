@@ -380,6 +380,15 @@ type Server struct {
 	// its assigned id + the existing audit-row write is the cross-cut
 	// invariant — the export is additive, never substitutive).
 	auditExporter *audit.Exporter
+
+	// alertEngine is the #252 Slice 2 suspicious-activity rule
+	// engine. May be nil when alerts are disabled or never wired.
+	// Called AFTER the auditExporter.EmitDecision so the rule engine
+	// reacts to OBSERVED events rather than gating decisions — per
+	// the spec: "rule engine reacts to observed events; doesn't
+	// gate." A bug in the alert engine CANNOT change a decide()
+	// verdict.
+	alertEngine *audit.RuleEngine
 }
 
 // NewServer constructs a Server without starting it.
@@ -403,22 +412,83 @@ func (s *Server) AuditExporter() *audit.Exporter {
 	return s.auditExporter
 }
 
+// SetAlertEngine wires the #252 Slice 2 RuleEngine. May be called
+// once after NewServer + before Serve; nil is permitted (no-op at
+// decision time). Not goroutine-safe by design — only the CLI's
+// pre-Serve sequence calls it.
+//
+// Per the spec: the rule engine MUST observe AFTER the audit-export
+// emit so the decision is in flight before the engine reacts. The
+// engine NEVER gates the decision.
+func (s *Server) SetAlertEngine(e *audit.RuleEngine) {
+	s.alertEngine = e
+}
+
+// AlertEngine returns the wired rule engine (may be nil). Surfaced
+// for the MCP status tool + tests. Read-only — callers must not
+// mutate the returned pointer's fields.
+func (s *Server) AlertEngine() *audit.RuleEngine {
+	return s.alertEngine
+}
+
 // exportDecisionRow is the load-bearing fan-out call. Invoked AFTER
 // the existing store.RecordDecision succeeds + the row has its
 // decisionID. Per the spec: never blocks the proxy hot-path (each
 // transport's Push/Write is non-blocking with drop-on-overflow).
 //
-// The exporter is nil-safe; callers can invoke unconditionally.
+// The exporter + alert engine are both nil-safe; callers can invoke
+// unconditionally.
+//
+// Per the #252 Slice 2 spec: the rule engine observe call fires
+// AFTER the audit-export emit, so the rule engine reacts to OBSERVED
+// events rather than gating decisions. A bug in the alert engine
+// CANNOT change a decide() verdict — this composition order is the
+// invariant that keeps the safety story honest.
 func (s *Server) exportDecisionRow(row store.DecisionRow, decisionID int64) {
-	if s.auditExporter == nil || !s.auditExporter.Enabled() {
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
 		return
 	}
+	// Project once + reuse. FromDecisionRow is a pure projection (per
+	// [[scorer-is-ground-truth]]); the rule engine + the exporter
+	// both read the same OCSF Event so they see the same view. The
+	// host + upstream strings are immutable post-construction so we
+	// read s.cfg directly instead of round-tripping through the
+	// exporter's Status() (which would allocate a stats struct on
+	// every decision).
+	evt := audit.FromDecisionRow(row, decisionID, s.listenerAddr(), s.upstreamAddr())
 	// context.Background() — the exporter has its own bounded queue;
 	// honoring a request ctx here would tear down a per-request
 	// goroutine BEFORE the export had a chance to enqueue. The
 	// per-transport workers have their own Shutdown contexts surfaced
 	// via Server.Shutdown.
-	_ = s.auditExporter.EmitDecision(context.Background(), row, decisionID)
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	// Rule engine observe AFTER the export emit (per the spec). The
+	// engine NEVER gates; emit errors are intentionally swallowed
+	// here for the same reason the export side does — the proxy
+	// hot-path MUST NOT block on observability plumbing.
+	if alertsOn {
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+}
+
+// listenerAddr returns the "host:port" of the proxy wire listener
+// for the OCSF src_endpoint projection. Reads directly from Config so
+// the per-decision path doesn't allocate a stats struct.
+func (s *Server) listenerAddr() string {
+	return fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+}
+
+// upstreamAddr returns the "host:port" of the configured upstream for
+// the OCSF dst_endpoint projection. Empty when observation-only.
+func (s *Server) upstreamAddr() string {
+	if s.cfg.Upstream == nil {
+		return ""
+	}
+	return s.cfg.Upstream.Host()
 }
 
 // Serve binds the wire-protocol listener + the management HTTP

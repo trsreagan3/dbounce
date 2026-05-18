@@ -69,6 +69,21 @@ const (
 	// flag a drop spike as an alert. Per the spec: webhook backpressure
 	// MUST NOT silently lose events without a trace.
 	EventTypeAuditDropped EventType = "AUDIT_DROPPED"
+
+	// EventTypeSecurityAlert is synthesized by the #252 Slice 2 rule
+	// engine when an observed event matches a configured alert rule
+	// (non-org profile install, unusual high-risk SQL action, etc.).
+	// Carries severity_id >= 3 (Medium) so SIEM dashboards surface it
+	// above the Informational decision stream. activity_id=99 (Other);
+	// activity_name carries the rule's stable id so downstream
+	// consumers can branch per-rule without parsing free-form text.
+	//
+	// Per [[security-team-positioning-safety-not-surveillance]] the
+	// alert language is NEUTRAL: it NAMES what triggered (the pattern,
+	// the dialect, the table) and SUGGESTS the operator distribute a
+	// narrower profile; it never says "violation" / "unauthorized" /
+	// "attack." The security team interprets the alert in context.
+	EventTypeSecurityAlert EventType = "SECURITY_ALERT"
 )
 
 // Product names the originating Bounce product. Stamped into
@@ -685,6 +700,113 @@ func buildExt(row store.DecisionRow) map[string]any {
 		ext["upstream_response_summary"] = row.UpstreamResponseSummary
 	}
 	return ext
+}
+
+// AlertRuleID names a stable rule identifier stamped into both the
+// SECURITY_ALERT event's activity_name + unmapped.iam_jit.ext.rule_id.
+// Sibling agents in ibounce + kbounce ship the SAME rule ids so a
+// single cross-product SIEM correlation key (rule_id) works without
+// per-product translation.
+type AlertRuleID string
+
+const (
+	// AlertRuleNonOrgProfileInstall fires when a profile is installed
+	// from a source other than the operator-configured org-source
+	// allowlist. Catches the "engineer-installed-a-random-profile-from-
+	// the-internet" failure shape that bypasses IT's curated set.
+	AlertRuleNonOrgProfileInstall AlertRuleID = "non_org_profile_install"
+
+	// AlertRuleUnusualHighRiskAction fires when an observed decision
+	// matches a per-dialect high-risk SQL pattern (DROP TABLE / TRUNCATE
+	// / unscoped DELETE / EXPORT_DATA / COPY INTO stage / GRANT /
+	// UNDROP / un-allowlisted CALL / DML against a sensitive schema).
+	// The per-dialect verb table lives in alerts.go::highRiskByDialect.
+	AlertRuleUnusualHighRiskAction AlertRuleID = "unusual_high_risk_action"
+)
+
+// AlertSeverity names the SECURITY_ALERT severity level. Maps to OCSF
+// severity_id (3=Medium, 4=High). v1.0 emits only Medium for both
+// rules; future rules MAY emit High when the pattern is unambiguous
+// (e.g. a `GRANT ALL ON *.* TO 'public'`).
+type AlertSeverity int
+
+const (
+	AlertSeverityMedium AlertSeverity = ocsfSeverityMediumID // 3
+	AlertSeverityHigh   AlertSeverity = 4
+)
+
+// ocsfSeverityHighID + ocsfSeverityHigh are the OCSF v1.1.0 values
+// for severity_id=4. Named here (not next to the Medium constants) so
+// the alert-only severity isn't accidentally surfaced as a
+// per-decision default.
+const (
+	ocsfSeverityHighID = 4
+	ocsfSeverityHigh   = "High"
+)
+
+func severityName(s AlertSeverity) (int, string) {
+	switch s {
+	case AlertSeverityHigh:
+		return ocsfSeverityHighID, ocsfSeverityHigh
+	default:
+		return ocsfSeverityMediumID, ocsfSeverityMedium
+	}
+}
+
+// NewSecurityAlertEvent constructs the OCSF v1.1.0 class-6003
+// SECURITY_ALERT envelope shared by every alert rule. The rule-engine
+// per-rule constructors below populate ext with the rule-specific
+// payload; this helper centralizes the OCSF envelope so a future rule
+// can be added by writing one factory + one matcher, not by re-stating
+// the OCSF shape.
+//
+// Schema: class_uid=6003, activity_id=99 (Other),
+// activity_name=string(rule), type_uid=600399, severity_id per the
+// caller, status_id=99 (Other) because neither Success nor Failure
+// honestly describes "we observed a pattern."
+//
+// Per [[scorer-is-ground-truth]] the alert NEVER re-scores the
+// underlying decision — it pattern-matches against the already-emitted
+// OCSF event + records the match. The DecisionRow's verdict is the
+// single source of truth.
+func NewSecurityAlertEvent(rule AlertRuleID, severity AlertSeverity, host, detail string, ext map[string]any) Event {
+	sevID, sevName := severityName(severity)
+	if ext == nil {
+		ext = map[string]any{}
+	}
+	ext["rule_id"] = string(rule)
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: string(rule),
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   sevID,
+		Severity:     sevName,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		SrcEndpoint:  parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeSecurityAlert),
+				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
 }
 
 // NewAuditDroppedEvent constructs the synthetic event the WebhookPusher
