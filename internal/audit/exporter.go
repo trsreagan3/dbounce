@@ -52,6 +52,14 @@ type Exporter struct {
 	// walk the session. Synchronous + fail-soft inside Record so disk
 	// failures never propagate the proxy hot path.
 	Recorder *SessionRecorder
+	// #258 — optional AWS Security Lake parquet writer. Nil disables
+	// this channel. When wired, every event is also flushed (per-
+	// class) to the operator's S3 bucket in the Security-Lake-
+	// compatible partition layout. Per [[no-hosted-saas]] +
+	// [[self-host-zero-billing-dependency]] the bucket lives in the
+	// operator's AWS account; iam-jit-the-company never receives
+	// the data.
+	SecurityLake *SecurityLakeWriter
 
 	// host is the proxy listener address ("127.0.0.1:5433") stamped
 	// onto every event's Event.Host field. Provided at construction
@@ -89,7 +97,8 @@ func (e *Exporter) Enabled() bool {
 	if e == nil {
 		return false
 	}
-	return e.Log != nil || e.Webhook != nil || e.Recorder != nil
+	return e.Log != nil || e.Webhook != nil || e.Recorder != nil ||
+		e.SecurityLake != nil
 }
 
 // EmitDecision projects a store.DecisionRow into the cross-product
@@ -136,6 +145,12 @@ func (e *Exporter) emit(ctx context.Context, evt Event) error {
 	if e.Recorder != nil {
 		e.Recorder.Record(evt)
 	}
+	// #258 — Security Lake parquet writer. Synchronous in-memory
+	// append; the background rotator handles flushes. Fail-soft so
+	// an unreachable bucket never blocks the hot path.
+	if e.SecurityLake != nil {
+		e.SecurityLake.Write(ctx, evt)
+	}
 	if len(errs) == 0 {
 		return nil
 	}
@@ -180,6 +195,12 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 	if e.Recorder != nil {
 		e.Recorder.Stop()
 	}
+	// #258 — Security Lake teardown flushes every pending parquet
+	// batch synchronously (per the spec) so a shutdown doesn't drop
+	// in-memory rows.
+	if e.SecurityLake != nil {
+		e.SecurityLake.Close()
+	}
 	if len(errs) == 0 {
 		return nil
 	}
@@ -190,13 +211,14 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 // per-transport stats + a top-level "configured" flag so the tool can
 // answer "is anything wired up?" without inspecting nil fields.
 type ExporterStatus struct {
-	Configured bool                   `json:"configured"`
-	Log        *LogStats              `json:"log,omitempty"`
-	Webhook    *WebhookStats          `json:"webhook,omitempty"`
-	Heartbeat  *HeartbeatStats        `json:"heartbeat,omitempty"`
-	Recorder   *SessionRecorderStatus `json:"recorder,omitempty"`
-	Host       string                 `json:"host,omitempty"`
-	Upstream   string                 `json:"upstream,omitempty"`
+	Configured   bool                   `json:"configured"`
+	Log          *LogStats              `json:"log,omitempty"`
+	Webhook      *WebhookStats          `json:"webhook,omitempty"`
+	Heartbeat    *HeartbeatStats        `json:"heartbeat,omitempty"`
+	Recorder     *SessionRecorderStatus `json:"recorder,omitempty"`
+	SecurityLake *SecurityLakeStatus    `json:"security_lake,omitempty"`
+	Host         string                 `json:"host,omitempty"`
+	Upstream     string                 `json:"upstream,omitempty"`
 }
 
 // Status returns the current per-transport stats. Safe for concurrent
@@ -225,6 +247,10 @@ func (e *Exporter) Status() ExporterStatus {
 	if e.Recorder != nil {
 		s := e.Recorder.Status()
 		out.Recorder = &s
+	}
+	if e.SecurityLake != nil {
+		s := e.SecurityLake.Status()
+		out.SecurityLake = &s
 	}
 	return out
 }

@@ -139,6 +139,25 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 				"audit-export webhook : %s  (batch=%d, queue=%d; ENTERPRISE — token masked)\n",
 				st.Webhook.URLRedacted, st.Webhook.BatchSize, st.Webhook.QueueLimit)
 		}
+		// #258 — Security Lake banner. AWS account + caller ARN come
+		// from sts:GetCallerIdentity at the writer's Start(); printing
+		// here matches the "log AWS account + role at startup banner"
+		// requirement from the issue body.
+		if st.SecurityLake != nil && st.SecurityLake.Configured {
+			roleLabel := st.SecurityLake.RoleARN
+			if roleLabel == "" {
+				roleLabel = "(default-chain)"
+			}
+			fmt.Fprintf(w,
+				"audit-export security-lake : s3://%s/  (region=%s, account=%s, "+
+					"caller=%s, role=%s, rotation=%ds)\n",
+				st.SecurityLake.Bucket,
+				st.SecurityLake.Region,
+				st.SecurityLake.AccountID,
+				st.SecurityLake.CallerARN,
+				roleLabel,
+				st.SecurityLake.RotationSeconds)
+		}
 		// Heartbeat — per [[prompt-injection-disable-bouncer-threat]].
 		// Surfaces the cadence the SIEM should expect; absence detection
 		// works at the SIEM end. The in-process gap watchdog handles

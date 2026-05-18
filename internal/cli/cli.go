@@ -531,6 +531,14 @@ func newRunCmd() *cobra.Command {
 		// #285 — per-session NDJSON recordings directory. Empty disables
 		// the channel. Replayable via `iam-jit session replay <FILE>`.
 		recordSessionsDir string
+		// #258 — AWS Security Lake adapter. All four fields off by
+		// default. Per [[no-hosted-saas]] + [[self-host-zero-billing-
+		// dependency]] the bucket lives in the operator's AWS account;
+		// iam-jit-the-company never receives the data.
+		securityLakeBucket          string
+		securityLakeRegion          string
+		securityLakeRoleARN         string
+		securityLakeRotationSeconds int
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -969,6 +977,8 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 				upstreamURL,
 				recordSessionsDir,
+				securityLakeBucket, securityLakeRegion, securityLakeRoleARN,
+				securityLakeRotationSeconds,
 			)
 			if exporterErr != nil {
 				return exporterErr
@@ -1328,6 +1338,33 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"(one file per agent session). Replayable via `iam-jit session "+
 			"replay <FILE>`. File mode 0o600. Default off; the recorder "+
 			"captures agent identity + operation details so it ships opt-in.")
+	// #258 — AWS Security Lake audit-export adapter. Per [[no-hosted-
+	// saas]] + [[self-host-zero-billing-dependency]] the bucket lives
+	// in the operator's AWS account; iam-jit-the-company never
+	// receives the data.
+	cmd.Flags().StringVar(&securityLakeBucket, "security-lake-bucket", "",
+		"#258 — name of the operator-owned S3 bucket that AWS Security "+
+			"Lake auto-ingests from. When set, every OCSF event is also "+
+			"written as a parquet file at `s3://<bucket>/region=<r>/"+
+			"eventday=<YYYYMMDD>/eventhour=<HH>/api_activity-<unix-ms>."+
+			"parquet`. Requires --security-lake-region; honours "+
+			"--security-lake-role-arn if set otherwise uses the default "+
+			"AWS credential chain.")
+	cmd.Flags().StringVar(&securityLakeRegion, "security-lake-region", "",
+		"#258 — AWS region the Security Lake bucket lives in. Required "+
+			"when --security-lake-bucket is set. Becomes the `region=<r>` "+
+			"partition key on every parquet file.")
+	cmd.Flags().StringVar(&securityLakeRoleARN, "security-lake-role-arn", "",
+		"#258 — optional IAM role to assume for Security Lake writes "+
+			"(STS AssumeRole). When unset the default AWS credential chain "+
+			"is used. Recommended for cross-account deployments where the "+
+			"bucket lives in a dedicated security account.")
+	cmd.Flags().IntVar(&securityLakeRotationSeconds,
+		"security-lake-rotation-seconds", audit.SecurityLakeDefaultRotationSeconds,
+		"#258 — how often the in-memory parquet batch flushes to S3. "+
+			"Default 300 (5 minutes) matches the Security Lake custom-"+
+			"source ingest cadence. A 10 MiB size cap also forces a flush, "+
+			"whichever fires first.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more
@@ -1371,7 +1408,24 @@ func buildAuditExporter(
 	auditExportHealthInterval time.Duration,
 	listenerHost, upstreamURL string,
 	recordSessionsDir string,
+	securityLakeBucket, securityLakeRegion, securityLakeRoleARN string,
+	securityLakeRotationSeconds int,
 ) (*audit.Exporter, error) {
+	// #258 — Security Lake parse-time validation. Bucket without
+	// region (or vice versa) is a misconfiguration; fail-fast so the
+	// operator fixes it once rather than seeing a credential probe
+	// failure deep in startup.
+	if securityLakeBucket != "" && securityLakeRegion == "" {
+		return nil, errors.New(
+			"dbounce: --security-lake-bucket requires --security-lake-region " +
+				"(the region becomes the `region=<r>` partition key on every " +
+				"parquet file)")
+	}
+	if securityLakeRegion != "" && securityLakeBucket == "" {
+		return nil, errors.New(
+			"dbounce: --security-lake-region requires --security-lake-bucket " +
+				"(passing region without a target bucket has no effect)")
+	}
 	var logWriter *audit.LogWriter
 	if logPath != "" {
 		w, err := audit.NewLogWriter(audit.LogOptions{
@@ -1445,7 +1499,7 @@ func buildAuditExporter(
 	// no-op (FREE-tier default).
 	if logWriter == nil && webhookPusher == nil &&
 		heartbeatInterval == 0 && auditExportHealthInterval == 0 &&
-		recordSessionsDir == "" {
+		recordSessionsDir == "" && securityLakeBucket == "" {
 		return nil, nil
 	}
 	upstreamHost := ""
@@ -1490,8 +1544,51 @@ func buildAuditExporter(
 		}
 		sessRecorder = sr
 	}
+	// #258 — Security Lake parquet writer. Default OFF; only
+	// constructed when --security-lake-bucket is set. Start() probes
+	// credentials (default chain OR AssumeRole when --security-lake-
+	// role-arn is set) and refuses to start with a clear error if
+	// none are reachable. Per [[no-hosted-saas]] + [[self-host-zero-
+	// billing-dependency]] the bucket lives in the operator's AWS
+	// account; iam-jit-the-company never receives the data.
+	var securityLakeWriter *audit.SecurityLakeWriter
+	if securityLakeBucket != "" {
+		slw, err := audit.NewSecurityLakeWriter(audit.SecurityLakeWriterOptions{
+			Bucket:          securityLakeBucket,
+			Region:          securityLakeRegion,
+			RoleARN:         securityLakeRoleARN,
+			RotationSeconds: securityLakeRotationSeconds,
+		})
+		if err != nil {
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			if webhookPusher != nil {
+				_ = webhookPusher.Shutdown(context.Background())
+			}
+			if sessRecorder != nil {
+				sessRecorder.Stop()
+			}
+			return nil, err
+		}
+		if err := slw.Start(context.Background()); err != nil {
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			if webhookPusher != nil {
+				_ = webhookPusher.Shutdown(context.Background())
+			}
+			if sessRecorder != nil {
+				sessRecorder.Stop()
+			}
+			return nil, fmt.Errorf(
+				"dbounce: Security Lake writer failed to start: %w", err)
+		}
+		securityLakeWriter = slw
+	}
 	exp := audit.NewExporter(logWriter, webhookPusher, listenerHost, upstreamHost)
 	exp.Recorder = sessRecorder
+	exp.SecurityLake = securityLakeWriter
 	if heartbeatInterval > 0 {
 		hb := audit.NewHeartbeater(audit.HeartbeatOptions{
 			Interval:     heartbeatInterval,
