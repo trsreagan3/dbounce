@@ -47,7 +47,7 @@ func TestExporter_LogOnly(t *testing.T) {
 		Dialect:         "postgres",
 		StatementType:   "SELECT",
 		Statement:       "SELECT 1",
-		DecisionVerdict: "allow",
+		DecisionVerdict: "ALLOW",
 		ModeAtDecision:  "cooperative",
 	}
 	require.NoError(t, e.EmitDecision(context.Background(), row, 42))
@@ -57,9 +57,12 @@ func TestExporter_LogOnly(t *testing.T) {
 	require.NoError(t, err)
 	var got Event
 	require.NoError(t, json.Unmarshal(data[:len(data)-1], &got)) // drop trailing \n
-	assert.Equal(t, int64(42), got.DecisionID)
-	assert.Equal(t, "SELECT", got.Action)
-	assert.Equal(t, "127.0.0.1:5433", got.Host)
+	require.NotNil(t, got.Unmapped)
+	assert.Equal(t, int64(42), got.Unmapped.IAMJIT.DecisionID)
+	assert.Equal(t, "SELECT", got.API.Operation)
+	require.NotNil(t, got.SrcEndpoint)
+	assert.Equal(t, "127.0.0.1", got.SrcEndpoint.Hostname)
+	assert.Equal(t, 5433, got.SrcEndpoint.Port)
 }
 
 // TestExporter_BothTransports_ReceiveSameEvent: a single EmitDecision
@@ -73,7 +76,7 @@ func TestExporter_BothTransports_ReceiveSameEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	var (
-		mu      sync.Mutex
+		mu            sync.Mutex
 		webhookEvents []Event
 	)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +112,7 @@ func TestExporter_BothTransports_ReceiveSameEvent(t *testing.T) {
 		StatementType:   "DELETE",
 		IsDML:           true,
 		HasMutatingNode: true,
-		DecisionVerdict: "deny",
+		DecisionVerdict: "DENY",
 		ModeAtDecision:  "transparent",
 		Enforced:        true,
 		TablesTouched:   []string{"public.users"},
@@ -129,22 +132,28 @@ func TestExporter_BothTransports_ReceiveSameEvent(t *testing.T) {
 		fileEvents = append(fileEvents, got)
 	}
 	require.Len(t, fileEvents, 1)
-	assert.Equal(t, int64(7), fileEvents[0].DecisionID)
-	assert.Equal(t, "DELETE", fileEvents[0].Action)
+	require.NotNil(t, fileEvents[0].Unmapped)
+	assert.Equal(t, int64(7), fileEvents[0].Unmapped.IAMJIT.DecisionID)
+	assert.Equal(t, "DELETE", fileEvents[0].API.Operation)
 
 	// Webhook received it.
 	mu.Lock()
 	defer mu.Unlock()
 	require.Len(t, webhookEvents, 1)
-	assert.Equal(t, int64(7), webhookEvents[0].DecisionID)
-	assert.Equal(t, "DELETE", webhookEvents[0].Action)
+	require.NotNil(t, webhookEvents[0].Unmapped)
+	assert.Equal(t, int64(7), webhookEvents[0].Unmapped.IAMJIT.DecisionID)
+	assert.Equal(t, "DELETE", webhookEvents[0].API.Operation)
 
-	// Both transports saw the SAME shape (shared schema invariant).
-	assert.Equal(t, fileEvents[0].Action, webhookEvents[0].Action)
-	assert.Equal(t, fileEvents[0].Verdict, webhookEvents[0].Verdict)
-	assert.Equal(t, fileEvents[0].DecisionID, webhookEvents[0].DecisionID)
-	assert.Equal(t, fileEvents[0].Mode, webhookEvents[0].Mode)
-	assert.Equal(t, fileEvents[0].Product, webhookEvents[0].Product)
+	// Both transports saw the SAME OCSF shape (shared schema invariant).
+	assert.Equal(t, fileEvents[0].API.Operation, webhookEvents[0].API.Operation)
+	assert.Equal(t, fileEvents[0].Unmapped.IAMJIT.Verdict, webhookEvents[0].Unmapped.IAMJIT.Verdict)
+	assert.Equal(t, fileEvents[0].Unmapped.IAMJIT.DecisionID, webhookEvents[0].Unmapped.IAMJIT.DecisionID)
+	assert.Equal(t, fileEvents[0].Unmapped.IAMJIT.Mode, webhookEvents[0].Unmapped.IAMJIT.Mode)
+	assert.Equal(t, fileEvents[0].Metadata.Product.Name, webhookEvents[0].Metadata.Product.Name)
+	assert.Equal(t, fileEvents[0].ClassUID, webhookEvents[0].ClassUID)
+	// Enforced-DENY mapped to OCSF Failure on both transports.
+	assert.Equal(t, StatusIDFailure, fileEvents[0].StatusID)
+	assert.Equal(t, StatusIDFailure, webhookEvents[0].StatusID)
 }
 
 // TestExporter_StatusReflectsBothTransports verifies the MCP status

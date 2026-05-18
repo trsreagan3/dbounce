@@ -31,9 +31,9 @@ func TestLogWriter_CreatesFile_AppendsValidJSONL(t *testing.T) {
 	})
 
 	events := []Event{
-		{EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 1, Verdict: "allow", Action: "SELECT"},
-		{EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 2, Verdict: "deny", Action: "DELETE"},
-		{EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 3, Verdict: "allow", Action: "INSERT"},
+		testDecisionEvent(1),
+		testDecisionEvent(2),
+		testDecisionEvent(3),
 	}
 	for _, e := range events {
 		require.NoError(t, w.Write(context.Background(), e))
@@ -48,7 +48,9 @@ func TestLogWriter_CreatesFile_AppendsValidJSONL(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(),
 		"audit log file MUST be 0600 to keep operator's local secrets unreadable to other users")
 
-	// Verify lines parse + decision_id order is preserved.
+	// Verify lines parse + decision_id order is preserved + every line
+	// carries the OCSF cross-product invariants
+	// (metadata.product.{name,vendor_name}, class_uid=6003).
 	f, err := os.Open(path)
 	require.NoError(t, err)
 	defer f.Close()
@@ -57,9 +59,12 @@ func TestLogWriter_CreatesFile_AppendsValidJSONL(t *testing.T) {
 	for scanner.Scan() {
 		var got Event
 		require.NoError(t, json.Unmarshal(scanner.Bytes(), &got))
-		assert.Equal(t, Product, got.Product)
-		assert.Equal(t, SchemaVersion, got.Version)
-		gotIDs = append(gotIDs, got.DecisionID)
+		assert.Equal(t, Product, got.Metadata.Product.Name)
+		assert.Equal(t, VendorName, got.Metadata.Product.VendorName)
+		assert.Equal(t, SchemaVersion, got.Metadata.Version)
+		assert.Equal(t, 6003, got.ClassUID)
+		require.NotNil(t, got.Unmapped)
+		gotIDs = append(gotIDs, got.Unmapped.IAMJIT.DecisionID)
 	}
 	require.NoError(t, scanner.Err())
 	assert.Equal(t, []int64{1, 2, 3}, gotIDs)
@@ -72,16 +77,12 @@ func TestLogWriter_AppendsAcrossOpen(t *testing.T) {
 	path := filepath.Join(dir, "audit.jsonl")
 	w1, err := NewLogWriter(LogOptions{Path: path})
 	require.NoError(t, err)
-	require.NoError(t, w1.Write(context.Background(), Event{
-		EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 100,
-	}))
+	require.NoError(t, w1.Write(context.Background(), testDecisionEvent(100)))
 	require.NoError(t, w1.Shutdown(context.Background()))
 
 	w2, err := NewLogWriter(LogOptions{Path: path})
 	require.NoError(t, err)
-	require.NoError(t, w2.Write(context.Background(), Event{
-		EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 101,
-	}))
+	require.NoError(t, w2.Write(context.Background(), testDecisionEvent(101)))
 	require.NoError(t, w2.Shutdown(context.Background()))
 
 	data, err := os.ReadFile(path)
@@ -125,9 +126,7 @@ func TestLogWriter_DropsOnOverflow(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		done := make(chan struct{})
 		go func() {
-			_ = w.Write(context.Background(), Event{
-				EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(i),
-			})
+			_ = w.Write(context.Background(), testDecisionEvent(int64(i)))
 			close(done)
 		}()
 		select {
@@ -158,9 +157,7 @@ func TestLogWriter_ConcurrentWrites_AreSafeAndOrdered(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			_ = w.Write(context.Background(), Event{
-				EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(id),
-			})
+			_ = w.Write(context.Background(), testDecisionEvent(int64(id)))
 		}(i)
 	}
 	wg.Wait()
@@ -198,9 +195,7 @@ func TestLogWriter_StatsBeforeShutdown(t *testing.T) {
 	t.Cleanup(func() { _ = w.Shutdown(context.Background()) })
 
 	for i := 0; i < 50; i++ {
-		require.NoError(t, w.Write(context.Background(), Event{
-			EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(i),
-		}))
+		require.NoError(t, w.Write(context.Background(), testDecisionEvent(int64(i))))
 	}
 	// Give the worker a moment to drain.
 	time.Sleep(50 * time.Millisecond)

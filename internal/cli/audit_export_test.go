@@ -157,16 +157,18 @@ func TestStartupBanner_NoExporter_NoAuditLines(t *testing.T) {
 	assert.NotContains(t, out, "audit-export webhook")
 }
 
-// TestAuditEventSchemaVersion_PinsToOne_ZeroBeforeRelease pins the
-// cross-product schema version. Sibling agents in ibounce/kbounce
-// MUST emit "1.0.0" too. Bumping requires a coordinated cross-product
-// change.
-func TestAuditEventSchemaVersion_PinsToOne_ZeroBeforeRelease(t *testing.T) {
-	assert.Equal(t, "1.0.0", audit.SchemaVersion,
-		"schema version is a cross-product contract; bumping requires all three Bounce products to bump together")
-	// Also guard the product name so a refactor doesn't silently
-	// change what downstream consumers see.
+// TestAuditEventSchemaVersion_PinsToOCSF1_1_0 pins the cross-product
+// schema version to OCSF v1.1.0 per [[ocsf-audit-schema]]. Sibling
+// agents in ibounce/kbounce MUST emit "1.1.0" too. Bumping requires a
+// coordinated cross-product change AND a SIEM-mapping review (OCSF
+// minor-version bumps may add required fields).
+func TestAuditEventSchemaVersion_PinsToOCSF1_1_0(t *testing.T) {
+	assert.Equal(t, "1.1.0", audit.SchemaVersion,
+		"schema version is a cross-product OCSF contract; bumping requires all three Bounce products to bump together")
+	// Also guard the product name + vendor so a refactor doesn't
+	// silently change what downstream SIEM dashboards see.
 	assert.Equal(t, "dbounce", audit.Product)
+	assert.Equal(t, "iam-jit", audit.VendorName)
 }
 
 // Make sure the test file's strings import is used even if a future

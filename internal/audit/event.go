@@ -1,9 +1,13 @@
 // Package audit implements dbounce's security-team audit-export
 // transport (#252 Slice 1). Sibling agents ship the equivalent in
 // kbounce (Go) + ibounce (Python); the JSON schema below is the
-// cross-product contract per the [[security-team-audit-export]] memo so
-// a single downstream aggregator can consume all three products without
-// per-product parsing branches.
+// cross-product contract per the [[ocsf-audit-schema]] memo so a single
+// downstream aggregator (AWS Security Lake, Splunk, Cloudflare, IBM,
+// any OCSF-aware SIEM) can ingest all three products with zero
+// per-product mapping.
+//
+// Schema: OCSF v1.1.0 class 6003 (API Activity).
+// Reference: https://schema.ocsf.io/1.1.0/classes/api_activity
 //
 // Slice 1 ships TWO transports built on this Event schema:
 //
@@ -11,8 +15,10 @@
 //	HTTPS webhook   — internal/audit/webhook.go    — Enterprise (license-gated)
 //
 // Slice 2 (alerting rules) layers SECURITY_ALERT events on the SAME
-// transports + the SAME schema; this package's Event will gain an
-// EventType in that slice. v1.0 emits only the DECISION shape.
+// transports + the SAME OCSF schema; per the memo, Slice 2 events use
+// activity_id=99 with a descriptive activity_name and elevated
+// severity_id. v1.0 emits only the DECISION shape (+ the AUDIT_DROPPED
+// synthetic on webhook overflow).
 //
 // Per [[ibounce-honest-positioning]]: this is OPERATOR VISIBILITY +
 // post-hoc-review surface, not adversary defense. An attacker who can
@@ -20,15 +26,21 @@
 // + alerts catch what HAPPENED for the security team to review.
 //
 // Per [[scorer-is-ground-truth]]: this package CONSUMES decisions; it
-// MUST NOT mutate, re-score, or LLM-enrich them. The schema is a
-// faithful projection of store.DecisionRow.
+// MUST NOT mutate, re-score, or LLM-enrich them. The OCSF projection is
+// a faithful, deterministic mapping of store.DecisionRow.
 //
 // Per [[no-hosted-saas]]: iam-jit-the-company never receives webhook
 // traffic. The operator's --audit-webhook-url is THEIR endpoint.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: severity
+// defaults to Informational + status uses OCSF's neutral
+// Success/Failure framing — aligned with the safety-not-surveillance
+// language of the security-team docs.
 
 package audit
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,7 +49,13 @@ import (
 
 // EventType names the kind of event in the audit stream. Slice 1 emits
 // only EventTypeDecision + EventTypeAuditDropped; Slice 2 will add
-// EventTypeSecurityAlert.
+// EventTypeSecurityAlert via activity_id=99 + a descriptive
+// activity_name (see memo).
+//
+// EventType is NOT part of the OCSF schema — it lives ONLY under
+// unmapped.iam_jit.event_type so consumers that want our native
+// "what kind of synthetic is this?" branch can read it without parsing
+// activity_name. OCSF consumers branch on class_uid + activity_id.
 type EventType string
 
 const (
@@ -53,111 +71,278 @@ const (
 	EventTypeAuditDropped EventType = "AUDIT_DROPPED"
 )
 
-// Product names the originating Bounce product. The schema is shared
-// across kbounce / ibounce / dbounce so downstream consumers can branch
-// on product without per-product schema variants.
+// Product names the originating Bounce product. Stamped into
+// metadata.product.name per the shared OCSF schema so downstream
+// consumers can branch on product without per-product topic branches.
 const Product = "dbounce"
 
-// SchemaVersion is the audit-export schema version. Bumped only on
-// breaking schema changes (renames / type changes); additive fields
-// don't bump. Consumers should pin against MAJOR + tolerate additive
-// MINOR.
-const SchemaVersion = "1.0.0"
+// VendorName is the OCSF metadata.product.vendor_name shared across
+// all three Bounce products. A single SIEM rule keyed on vendor_name
+// catches events from any iam-jit product without per-product wiring.
+const VendorName = "iam-jit"
 
-// Event is the cross-product JSONL schema. JSON tags MATCH the spec in
-// the [[security-team-audit-export]] memo verbatim.
+// SchemaVersion is the OCSF schema version we emit. v1.1.0 is the
+// version backed by AWS Security Lake + Splunk + the major SIEMs.
+// Surfaced via metadata.version on every event.
+const SchemaVersion = "1.1.0"
+
+// OCSF class constants for class 6003 (API Activity). See the schema
+// reference URL in the package docstring.
+const (
+	ocsfClassUID    = 6003
+	ocsfClassName   = "API Activity"
+	ocsfCategoryUID = 6
+	ocsfCategoryNm  = "Application Activity"
+
+	// Type UID base. type_uid = (class_uid * 100) + activity_id per the
+	// OCSF spec. For class 6003 the base is 600300.
+	ocsfTypeUIDBase = 600300
+
+	// Severity. Default to Informational (1) for every decision per
+	// [[security-team-positioning-safety-not-surveillance]]; higher
+	// severities are reserved for Slice 2 alert events.
+	ocsfSeverityInformationalID = 1
+	ocsfSeverityInformational   = "Informational"
+	ocsfSeverityMediumID        = 3
+	ocsfSeverityMedium          = "Medium"
+)
+
+// OCSF activity_id values for class 6003 (see memo). Used in
+// activity_id, type_uid computation, and the per-dialect SQL mapping
+// below.
+const (
+	ActivityIDUnknown = 0
+	ActivityIDCreate  = 1
+	ActivityIDRead    = 2
+	ActivityIDUpdate  = 3
+	ActivityIDDelete  = 4
+	ActivityIDOther   = 99
+)
+
+// OCSF status_id values for class 6003 (see memo).
+const (
+	StatusIDUnknown = 0
+	StatusIDSuccess = 1
+	StatusIDFailure = 2
+	StatusIDOther   = 99
+)
+
+// BuildVersion is the dbounce binary version stamped into
+// metadata.product.version. Overridden at build time via
+// -ldflags "-X github.com/trsreagan3/dbounce/internal/audit.BuildVersion=...".
+// Unstamped builds report "dev".
 //
-// Field ordering reflects the doc order; the omitempty markers preserve
+// Why a separate variable from internal/cli.version: the audit package
+// can't import the cli package (cli imports audit transitively); the
+// build pipeline stamps both. Tests pin the default so a missing
+// -ldflags doesn't silently surface as "undefined" in customer events.
+var BuildVersion = "dev"
+
+// Event is the cross-product OCSF v1.1.0 class 6003 envelope. Every
+// field has the exact JSON tag the OCSF schema names so a SIEM with
+// OCSF-native parsing accepts the JSONL line directly.
+//
+// Field ordering follows the OCSF schema spec doc order: metadata,
+// classification, severity/status, actors, api, resources, endpoints,
+// then unmapped vendor extension. The `omitempty` markers preserve
 // downstream parsers' ability to assume "if present, populated" without
 // having to special-case zero values.
 type Event struct {
-	// EventType is "DECISION" (default for every proxy decision) or
-	// "AUDIT_DROPPED" (synthesized by the WebhookPusher on overflow).
-	EventType EventType `json:"event_type"`
+	// Metadata identifies the producing product + the schema version.
+	// Required by OCSF on every event.
+	Metadata Metadata `json:"metadata"`
 
-	// Ts is the decision timestamp in RFC3339Nano UTC. Mirrored on the
-	// JSONL writer + the webhook body so consumers can deduplicate by
-	// (product, ts, decision_id) if a retry double-delivers.
-	Ts string `json:"ts"`
+	// Time is the event timestamp in Unix milliseconds (OCSF requirement
+	// — NOT RFC3339; the spec says int64 epoch-ms).
+	Time int64 `json:"time"`
 
-	// Product names the originating Bounce product (always "dbounce"
-	// here). Lets one downstream aggregator consume all three Bounce
-	// products without per-product topic branches.
-	Product string `json:"product"`
+	// ClassUID identifies the OCSF event class. Always 6003 (API
+	// Activity) for dbounce decisions + AUDIT_DROPPED synthetics.
+	ClassUID int `json:"class_uid"`
 
-	// Version is the SchemaVersion constant.
-	Version string `json:"version"`
+	// ClassName is the OCSF class display name. Always "API Activity".
+	ClassName string `json:"class_name"`
 
-	// DecisionID is the monotonic SQLite row id from store.RecordDecision.
-	// Consumers use this to re-order events when retries reorder webhook
-	// delivery (the queue worker dispatches in order; the operator's
-	// receiver might not).
-	DecisionID int64 `json:"decision_id"`
+	// CategoryUID identifies the OCSF event category. Always 6
+	// (Application Activity) for class 6003.
+	CategoryUID int `json:"category_uid"`
 
-	// Mode is the cooperative/transparent mode the proxy was in.
-	Mode string `json:"mode"`
+	// CategoryName is the OCSF category display name.
+	CategoryName string `json:"category_name"`
 
-	// Profile is the ActiveProfileName at decision time. Empty when
-	// no profile was active (full-user equivalent).
-	Profile string `json:"profile,omitempty"`
+	// ActivityID is the OCSF action verb (1=Create / 2=Read / 3=Update /
+	// 4=Delete / 99=Other). For dbounce, derived from statement_type via
+	// activityIDFromStatementType.
+	ActivityID int `json:"activity_id"`
 
-	// Verdict is "allow" | "deny" | "bypass" (last is Slice-2 reserved).
-	Verdict string `json:"verdict"`
+	// ActivityName names the action in human-readable form. For dbounce
+	// this is the lower-cased statement_type ("select", "insert",
+	// "load_data", ...) so per-dialect specificity survives.
+	ActivityName string `json:"activity_name"`
 
-	// Reason is the rule engine's human-readable explanation.
-	Reason string `json:"reason,omitempty"`
+	// TypeUID = (class_uid * 100) + activity_id per OCSF spec; for class
+	// 6003 the base is 600300. SIEM dashboards use type_uid as the
+	// canonical fan-out key.
+	TypeUID int `json:"type_uid"`
 
-	// Principal identifies the inbound caller (kbounce + ibounce
-	// populate this from request context; dbounce v1.0 leaves it empty
-	// pending #196 PG principal capture). Field present in the schema
-	// so the JSONL contract is product-uniform.
-	Principal string `json:"principal,omitempty"`
+	// TypeName is the OCSF type display name in "Class: Verb" form.
+	TypeName string `json:"type_name"`
 
-	// Action is the operation the caller invoked. dbounce populates
-	// this with the statement_type ("SELECT" / "INSERT" / "DELETE" /
-	// ...) so the cross-product schema reads "principal X did action Y"
-	// uniformly.
-	Action string `json:"action,omitempty"`
+	// SeverityID is the OCSF severity. Defaults to 1 (Informational) for
+	// every decision per [[security-team-positioning-safety-not-
+	// surveillance]]. Slice 2 alert events use 2-5.
+	SeverityID int `json:"severity_id"`
 
-	// Resource is the primary target the action touched. dbounce
-	// populates this with the comma-joined TablesTouched list (or the
-	// first one if you'd rather; we ship comma-join for human
-	// readability in TUI viewers).
-	Resource string `json:"resource,omitempty"`
+	// Severity is the human-readable severity name.
+	Severity string `json:"severity"`
 
-	// RequestID is left empty in Slice 1; reserved for Slice 2 when
-	// the proxy gains per-request UUIDs.
-	RequestID string `json:"request_id,omitempty"`
+	// StatusID is the OCSF outcome of the API call. ALLOW + advisory-
+	// DENY + BYPASS map to 1 (Success); enforced DENY (transparent mode)
+	// maps to 2 (Failure). See verdictToStatus per the memo.
+	StatusID int `json:"status_id"`
 
-	// Enforced is true when the verdict CHANGED upstream behavior
-	// (transparent-mode DENY blocked the request). False on
-	// cooperative advisories + pause-window demotes.
-	Enforced bool `json:"enforced"`
+	// Status is the human-readable status name.
+	Status string `json:"status"`
 
-	// Host names the proxy listener host:port the decision came in on.
-	Host string `json:"host,omitempty"`
+	// StatusDetail carries the rule engine's deny / bypass reason so
+	// the operator can triage from the audit-export without a JOIN back
+	// to the SQLite audit row.
+	StatusDetail string `json:"status_detail,omitempty"`
 
-	// Upstream names the resolved upstream URL (host:port) the proxy
-	// forwarded — or would have forwarded — the call to.
-	Upstream string `json:"upstream,omitempty"`
+	// Actor describes who made the request (DB user / session). For
+	// dbounce v1.0 the DB user is not yet captured per-call (#196); the
+	// field is omitted from the wire when neither user nor session is
+	// available (pointer-to-struct so Go's omitempty actually drops the
+	// zero case rather than emitting `"actor":{}`).
+	Actor *Actor `json:"actor,omitempty"`
 
-	// Ext carries product-specific fields. dbounce populates the
-	// dialect (postgres / mysql / snowflake / bigquery) + the parsed
-	// statement context (is_dml / is_ddl / has_mutating_node / parse
-	// errors) so the downstream schema can branch per dialect WITHOUT
-	// adding non-shared top-level fields to the cross-product schema.
-	Ext map[string]any `json:"ext,omitempty"`
+	// API describes the API call (operation + service + request_uid).
+	// For dbounce, operation=statement_type, service.name=dialect.
+	API API `json:"api"`
 
-	// DroppedCount is set ONLY on EventTypeAuditDropped events. Counts
-	// how many decisions were dropped since the previous synthetic
-	// AUDIT_DROPPED event. Omitted on DECISION events.
-	DroppedCount int64 `json:"dropped_count,omitempty"`
+	// Resources lists the resource(s) the API call targeted. For
+	// dbounce, one entry per table touched.
+	Resources []Resource `json:"resources,omitempty"`
+
+	// SrcEndpoint is the proxy listener address the inbound SQL hit.
+	SrcEndpoint *Endpoint `json:"src_endpoint,omitempty"`
+
+	// DstEndpoint is the resolved upstream DB host:port (only set when
+	// a forwarder is configured + the upstream URL is reachable).
+	DstEndpoint *Endpoint `json:"dst_endpoint,omitempty"`
+
+	// Unmapped is the OCSF vendor-extension hook. Per the memo we use
+	// it for fields without OCSF mappings (mode, profile, verdict,
+	// decision_id, enforced, per-product ext map). Consumers that want
+	// the bouncer's native semantics read this; pure-OCSF consumers
+	// ignore it.
+	Unmapped *Unmapped `json:"unmapped,omitempty"`
 }
 
-// FromDecisionRow projects a store.DecisionRow into the cross-product
-// Event schema. Centralized here (not per-call-site in proxy.go /
-// forward.go / mysql.go) so the schema mapping is auditable in one
-// place + sibling agents can mirror the projection exactly in
+// Metadata is the OCSF metadata field. Required on every event.
+type Metadata struct {
+	Version string   `json:"version"`
+	Product Product_ `json:"product"`
+}
+
+// Product_ is the OCSF metadata.product sub-object. Trailing underscore
+// avoids the package-level Product const collision.
+type Product_ struct {
+	Name       string `json:"name"`
+	VendorName string `json:"vendor_name"`
+	Version    string `json:"version"`
+}
+
+// Actor is the OCSF actor object. Sub-fields user + session per the
+// schema; we populate only what's available.
+type Actor struct {
+	User    *User    `json:"user,omitempty"`
+	Session *Session `json:"session,omitempty"`
+}
+
+// User is the OCSF actor.user sub-object.
+type User struct {
+	Name string `json:"name,omitempty"`
+	UID  string `json:"uid,omitempty"`
+}
+
+// Session is the OCSF actor.session sub-object. Holds the task_id when
+// the decision happened inside a D-Slice 3 task scope.
+type Session struct {
+	UID string `json:"uid,omitempty"`
+}
+
+// API is the OCSF api object. operation = the action verb, service =
+// the upstream service name (dialect for dbounce), request.uid =
+// decision_id (as a string per OCSF — request UIDs are strings).
+type API struct {
+	Operation string   `json:"operation,omitempty"`
+	Service   Service  `json:"service,omitempty"`
+	Request   *Request `json:"request,omitempty"`
+}
+
+// Service is the OCSF api.service sub-object.
+type Service struct {
+	Name string `json:"name,omitempty"`
+}
+
+// Request is the OCSF api.request sub-object.
+type Request struct {
+	UID string `json:"uid,omitempty"`
+}
+
+// Resource is one entry in the OCSF resources array. For dbounce, one
+// per table the statement touched ({name: "schema.table", uid:
+// "schema.table", type: "sql table"}).
+type Resource struct {
+	Name string `json:"name,omitempty"`
+	UID  string `json:"uid,omitempty"`
+	Type string `json:"type,omitempty"`
+}
+
+// Endpoint is an OCSF endpoint object (used for src_endpoint +
+// dst_endpoint). We populate hostname + port; ip is left empty when
+// we don't have a resolved address (the upstream URL is a hostname,
+// not a resolved IP — leaving ip unset is preferable to fabricating
+// one).
+type Endpoint struct {
+	Hostname string `json:"hostname,omitempty"`
+	IP       string `json:"ip,omitempty"`
+	Port     int    `json:"port,omitempty"`
+}
+
+// Unmapped is the OCSF vendor-extension hook. iam_jit holds all
+// iam-jit-specific fields that don't have an OCSF home.
+type Unmapped struct {
+	IAMJIT IAMJITExt `json:"iam_jit"`
+}
+
+// IAMJITExt is the iam-jit vendor-extension payload. Per the memo:
+// mode, profile, verdict, decision_id, enforced + a per-product ext
+// map (dialect / tables_touched / is_dml / is_ddl / has_mutating_node /
+// mutating_node_type for dbounce).
+//
+// EventType + DroppedCount + QueueSize are populated only on the
+// AUDIT_DROPPED synthetic.
+type IAMJITExt struct {
+	Mode       string         `json:"mode,omitempty"`
+	Profile    string         `json:"profile,omitempty"`
+	Verdict    string         `json:"verdict,omitempty"`
+	DecisionID int64          `json:"decision_id,omitempty"`
+	Enforced   bool           `json:"enforced"`
+	Ext        map[string]any `json:"ext,omitempty"`
+
+	// Synthetic-event-only fields (populated for AUDIT_DROPPED, omitted
+	// for DECISION events).
+	EventType    string `json:"event_type,omitempty"`
+	DroppedCount int64  `json:"dropped_count,omitempty"`
+	QueueSize    int    `json:"queue_size,omitempty"`
+}
+
+// FromDecisionRow projects a store.DecisionRow into the OCSF v1.1.0
+// class 6003 Event schema. Centralized here (not per-call-site in
+// proxy.go / forward.go / mysql.go) so the schema mapping is auditable
+// in one place + sibling agents can mirror the projection exactly in
 // kbounce/ibounce.
 //
 // Empty / zero values omit from the Event so the JSONL line is the
@@ -169,56 +354,257 @@ type Event struct {
 // separately because store.DecisionRow itself does not carry it (the
 // store assigns it on insert).
 //
-// host is the wire-listener address ("127.0.0.1:5433") — projected onto
-// Event.Host so downstream consumers can group events by listener.
+// host is the proxy wire-listener address ("127.0.0.1:5433") —
+// projected onto src_endpoint so downstream consumers can group events
+// by listener.
+//
 // upstream is the resolved upstream URL host:port, or empty when the
-// proxy is observation-only.
+// proxy is observation-only — projected onto dst_endpoint when set.
 func FromDecisionRow(row store.DecisionRow, decisionID int64, host, upstream string) Event {
-	ts := row.At
-	if ts.IsZero() {
-		ts = time.Now().UTC()
+	at := row.At
+	if at.IsZero() {
+		at = time.Now().UTC()
 	}
-	return Event{
-		EventType:  EventTypeDecision,
-		Ts:         ts.UTC().Format(time.RFC3339Nano),
-		Product:    Product,
-		Version:    SchemaVersion,
-		DecisionID: decisionID,
-		Mode:       row.ModeAtDecision,
-		Profile:    row.ProfileName,
-		Verdict:    row.DecisionVerdict,
-		Reason:     row.DecisionReason,
-		// Action = statement_type so the cross-product schema reads
-		// "principal did action SELECT" uniformly. dbounce v1.0 does
-		// not yet capture per-call principal (#196); the field stays
-		// present-but-empty so the JSONL row shape is product-uniform.
-		Action:   row.StatementType,
-		Resource: joinResources(row.TablesTouched),
-		Enforced: row.Enforced,
-		Host:     host,
-		Upstream: upstream,
-		Ext:      buildExt(row),
+
+	stmtType := strings.ToUpper(strings.TrimSpace(row.StatementType))
+	activityID := activityIDFromStatementType(stmtType)
+	activityName := strings.ToLower(stmtType)
+	if activityName == "" {
+		activityName = "unknown"
+	}
+
+	verdictUpper := strings.ToUpper(strings.TrimSpace(row.DecisionVerdict))
+	statusID, statusName := verdictToStatus(verdictUpper, row.Enforced)
+
+	evt := Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         at.UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   activityID,
+		ActivityName: activityName,
+		TypeUID:      ocsfTypeUIDBase + activityID,
+		TypeName:     typeNameFor(activityID),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     statusID,
+		Status:       statusName,
+		StatusDetail: row.DecisionReason,
+		Actor:        buildActor(row),
+		API: API{
+			Operation: stmtType,
+			Service:   Service{Name: row.Dialect},
+			Request:   &Request{UID: strconv.FormatInt(decisionID, 10)},
+		},
+		Resources:   buildResources(row.TablesTouched),
+		SrcEndpoint: parseEndpoint(host),
+		DstEndpoint: parseEndpoint(upstream),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				Mode:       row.ModeAtDecision,
+				Profile:    row.ProfileName,
+				Verdict:    verdictUpper,
+				DecisionID: decisionID,
+				Enforced:   row.Enforced,
+				Ext:        buildExt(row),
+			},
+		},
+	}
+	return evt
+}
+
+// activityIDFromStatementType maps a SQL statement type to the OCSF
+// class-6003 activity_id per the memo:
+//
+//	SELECT                                                → 2 (Read)
+//	INSERT                                                → 1 (Create)
+//	UPDATE / ALTER / MERGE                                → 3 (Update)
+//	DELETE / DROP / TRUNCATE                              → 4 (Delete)
+//	CALL / DO / EXECUTE / WITH-WRITE / LOAD_DATA /
+//	  EXPORT_DATA / COPY_INTO                             → 99 (Other)
+//	(unrecognized)                                        → 99 (Other)
+//
+// Empty statement_type maps to 0 (Unknown) so a missing parse doesn't
+// silently look like a known shape.
+func activityIDFromStatementType(stmtType string) int {
+	if stmtType == "" {
+		return ActivityIDUnknown
+	}
+	switch stmtType {
+	case "SELECT":
+		return ActivityIDRead
+	case "INSERT":
+		return ActivityIDCreate
+	case "UPDATE", "ALTER", "MERGE":
+		return ActivityIDUpdate
+	case "DELETE", "DROP", "TRUNCATE":
+		return ActivityIDDelete
+	case "CALL", "DO", "EXECUTE", "WITH-WRITE",
+		"LOAD_DATA", "EXPORT_DATA", "COPY_INTO":
+		return ActivityIDOther
+	default:
+		return ActivityIDOther
 	}
 }
 
-// joinResources turns the parsed tables-touched slice into a single
-// comma-joined string for the shared Resource field. We keep the FULL
-// list in Ext.tables so a downstream aggregator that wants individual
-// tables can still find them.
-func joinResources(tables []string) string {
+// typeNameFor returns the OCSF type_name string for a class-6003
+// activity_id. Used by FromDecisionRow + NewAuditDroppedEvent.
+func typeNameFor(activityID int) string {
+	switch activityID {
+	case ActivityIDCreate:
+		return "API Activity: Create"
+	case ActivityIDRead:
+		return "API Activity: Read"
+	case ActivityIDUpdate:
+		return "API Activity: Update"
+	case ActivityIDDelete:
+		return "API Activity: Delete"
+	case ActivityIDOther:
+		return "API Activity: Other"
+	case ActivityIDUnknown:
+		return "API Activity: Unknown"
+	default:
+		return "API Activity: Other"
+	}
+}
+
+// verdictToStatus maps the bouncer's native verdict + enforced flag to
+// OCSF status_id + status name per the memo:
+//
+//	ALLOW                                          → 1 Success
+//	DENY  + enforced=true   (transparent blocked)  → 2 Failure
+//	DENY  + enforced=false  (cooperative advisory) → 1 Success
+//	BYPASS (pause-window-active)                   → 1 Success
+//	(unknown / empty verdict)                      → 0 Unknown
+//
+// The bouncer's native semantics are preserved under unmapped.iam_jit
+// for downstream tools that want them; the OCSF status reflects whether
+// the upstream call SUCCEEDED, which is the only honest framing for
+// SIEM consumers that don't know what a "bouncer DENY" means.
+func verdictToStatus(verdict string, enforced bool) (int, string) {
+	switch verdict {
+	case "ALLOW":
+		return StatusIDSuccess, "Success"
+	case "DENY":
+		if enforced {
+			return StatusIDFailure, "Failure"
+		}
+		return StatusIDSuccess, "Success"
+	case "BYPASS":
+		return StatusIDSuccess, "Success"
+	case "":
+		return StatusIDUnknown, "Unknown"
+	default:
+		return StatusIDUnknown, "Unknown"
+	}
+}
+
+// buildActor populates the OCSF actor object from a DecisionRow. For
+// dbounce v1.0 the DB-user-per-call capture is not yet wired (#196);
+// we ONLY emit actor.user when ImpersonatedRole is set (a `SET ROLE
+// alice` was the most-recent identity change in this session) and
+// actor.session.uid when a TaskID is present.
+//
+// Returns nil when neither field is available so the json:"actor,
+// omitempty" tag on Event drops it from the wire (rather than emitting
+// `"actor":{}`, which clutters the JSONL line + can confuse OCSF
+// schema validators that expect required actor.user.* when actor is
+// present).
+func buildActor(row store.DecisionRow) *Actor {
+	if row.ImpersonatedRole == "" && row.TaskID == "" {
+		return nil
+	}
+	actor := &Actor{}
+	if row.ImpersonatedRole != "" {
+		actor.User = &User{
+			Name: row.ImpersonatedRole,
+			UID:  row.ImpersonatedRole,
+		}
+	}
+	if row.TaskID != "" {
+		actor.Session = &Session{UID: row.TaskID}
+	}
+	return actor
+}
+
+// buildResources converts the parser's tables-touched slice into the
+// OCSF resources array. One entry per touched table; name + uid both
+// hold "schema.table" so downstream tools can correlate either field.
+// type is "sql table" per the memo.
+//
+// Empty input → nil so the json:"resources,omitempty" tag drops the
+// field from the wire on resourceless events.
+func buildResources(tables []string) []Resource {
 	if len(tables) == 0 {
-		return ""
+		return nil
 	}
-	return strings.Join(tables, ",")
+	out := make([]Resource, 0, len(tables))
+	for _, t := range tables {
+		if t == "" {
+			continue
+		}
+		out = append(out, Resource{
+			Name: t,
+			UID:  t,
+			Type: "sql table",
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
-// buildExt populates the dialect-specific ext fields. Dialect names
-// (postgres / mysql / snowflake / bigquery) round-trip from the parser;
-// the parsed-statement context (is_dml / is_ddl / has_mutating_node /
-// parse_errors / functions_called / impersonated_role / pause_id) lets
-// security-team filters downstream ask "show me all MUTATING rows that
-// touched function X under profile Y" without the consumer having to
-// run their own SQL parse.
+// parseEndpoint splits a "host:port" string into an OCSF Endpoint with
+// hostname + port. Returns nil on empty input or on parse failure (the
+// json:"src_endpoint,omitempty" tag drops it).
+//
+// We deliberately don't resolve hostnames to IPs here — fabricating
+// an IP when none was actually used would mislead SIEM consumers; the
+// memo says "ip if resolved" not "ip always."
+func parseEndpoint(hostPort string) *Endpoint {
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" {
+		return nil
+	}
+	idx := strings.LastIndex(hostPort, ":")
+	if idx < 0 {
+		// No port — treat the whole string as a hostname.
+		return &Endpoint{Hostname: hostPort}
+	}
+	host := hostPort[:idx]
+	portStr := hostPort[idx+1:]
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		// Malformed port — keep what looks like a host so the
+		// audit-export still names the listener; drop the port.
+		return &Endpoint{Hostname: hostPort}
+	}
+	return &Endpoint{Hostname: host, Port: port}
+}
+
+// buildExt populates the dbounce-specific ext fields under
+// unmapped.iam_jit.ext. Per the memo:
+//
+//	dialect, tables_touched, is_dml, is_ddl, has_mutating_node,
+//	mutating_node_type
+//
+// We additionally carry the operational fields downstream reviewers
+// have asked for since pre-launch: the parsed-statement context
+// (statement / statement_redacted / functions / parse_errors), the
+// decision-source layer (decision_source / matched_rule_id / pause_id),
+// the forwarder outcome (forwarded / upstream_status /
+// upstream_response_summary), + streaming flags. The map is open-ended
+// per the memo's "small product-specific fields" guidance.
 //
 // Why a map instead of a typed struct per dialect: the spec doc names
 // `ext` as "product-specific" — leaving it open-ended means a future
@@ -232,36 +618,32 @@ func buildExt(row store.DecisionRow) map[string]any {
 	if row.Dialect != "" {
 		ext["dialect"] = row.Dialect
 	}
+	if len(row.TablesTouched) > 0 {
+		// Always present in ext.tables_touched per the memo spec.
+		// Copy to defend against downstream mutation of the slice.
+		ext["tables_touched"] = append([]string(nil), row.TablesTouched...)
+	}
+	// is_dml / is_ddl / has_mutating_node / mutating_node_type are
+	// named in the memo as REQUIRED dbounce ext fields. Emit even when
+	// false so per-dialect SIEM filters can pin on them.
+	ext["is_dml"] = row.IsDML
+	ext["is_ddl"] = row.IsDDL
+	ext["has_mutating_node"] = row.HasMutatingNode
+	if row.MutatingNodeType != "" {
+		ext["mutating_node_type"] = row.MutatingNodeType
+	}
+
+	// Operationally-useful carry-over (NOT in the memo's required list
+	// but reviewers asked for these pre-launch; keep them since the
+	// memo's "small product-specific fields" guidance allows it).
 	if row.Statement != "" {
-		// Always include — even when redacted, the consumer wants the
-		// SQL text. The statement_redacted flag below tells them
-		// whether to trust it for replay.
 		ext["statement"] = row.Statement
 	}
 	if row.StatementRedacted {
 		ext["statement_redacted"] = true
 	}
 	if len(row.FunctionsCalled) > 0 {
-		// Copy to defend against downstream mutation of the slice
-		// (json.Marshal does not deep-copy; if the consumer modifies
-		// the JSONified slice the original audit-row's
-		// FunctionsCalled would be touched).
 		ext["functions"] = append([]string(nil), row.FunctionsCalled...)
-	}
-	if len(row.TablesTouched) > 0 {
-		ext["tables"] = append([]string(nil), row.TablesTouched...)
-	}
-	if row.IsDML {
-		ext["is_dml"] = true
-	}
-	if row.IsDDL {
-		ext["is_ddl"] = true
-	}
-	if row.HasMutatingNode {
-		ext["has_mutating_node"] = true
-	}
-	if row.MutatingNodeType != "" {
-		ext["mutating_node_type"] = row.MutatingNodeType
 	}
 	if row.IsExplain {
 		ext["is_explain"] = true
@@ -302,9 +684,6 @@ func buildExt(row store.DecisionRow) map[string]any {
 	if row.UpstreamResponseSummary != "" {
 		ext["upstream_response_summary"] = row.UpstreamResponseSummary
 	}
-	if len(ext) == 0 {
-		return nil
-	}
 	return ext
 }
 
@@ -314,18 +693,47 @@ func buildExt(row store.DecisionRow) map[string]any {
 // AUDIT_DROPPED event (NOT the cumulative total — consumers want the
 // rate).
 //
-// Schema note: this event uses the SAME envelope as a DECISION (Ts,
-// Product, Version) so downstream parsers can branch on EventType
-// without a separate parser path. DecisionID is zero on these synthetic
-// events.
+// Schema: OCSF class 6003, activity_id=99 (Other), activity_name=
+// "audit_dropped", type_uid=600399, severity_id=3 (Medium) so this
+// surfaces with elevated priority in a SIEM dashboard (per the memo).
+// status_id=99 (Other) since neither Success nor Failure honestly
+// describes "we dropped our own event."
+//
+// queueSize is the bounded-queue capacity (cap(ch)) at the time of
+// emission — exposed under unmapped.iam_jit.queue_size so an operator
+// triaging a drop spike sees the queue size that was exceeded.
 func NewAuditDroppedEvent(droppedSinceLast int64, host string) Event {
+	const detailFmt = "audit-export webhook dropped events due to backpressure"
 	return Event{
-		EventType:    EventTypeAuditDropped,
-		Ts:           time.Now().UTC().Format(time.RFC3339Nano),
-		Product:      Product,
-		Version:      SchemaVersion,
-		Host:         host,
-		DroppedCount: droppedSinceLast,
-		Reason:       "webhook queue overflowed; events were dropped without delivery — increase --audit-webhook-batch-size or downstream consumer throughput",
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "audit_dropped",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityMediumID,
+		Severity:     ocsfSeverityMedium,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detailFmt,
+		SrcEndpoint:  parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType:    string(EventTypeAuditDropped),
+				DroppedCount: droppedSinceLast,
+				Enforced:     false,
+			},
+		},
 	}
 }

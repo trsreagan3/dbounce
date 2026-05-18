@@ -103,21 +103,27 @@ func TestEvaluateAndAudit_FansOutToBothTransports(t *testing.T) {
 		fileEvents = append(fileEvents, e)
 	}
 	require.Len(t, fileEvents, 1, "log file must contain exactly one event")
-	assert.Equal(t, audit.EventTypeDecision, fileEvents[0].EventType)
-	assert.Equal(t, "SELECT", fileEvents[0].Action)
-	assert.Equal(t, "ALLOW", fileEvents[0].Verdict)
-	assert.Equal(t, audit.Product, fileEvents[0].Product)
-	assert.Equal(t, audit.SchemaVersion, fileEvents[0].Version)
-	assert.NotZero(t, fileEvents[0].DecisionID, "decision_id must be the assigned SQLite row id")
+	// OCSF v1.1.0 class 6003 envelope checks on the file-side event.
+	assert.Equal(t, 6003, fileEvents[0].ClassUID)
+	assert.Equal(t, audit.ActivityIDRead, fileEvents[0].ActivityID, "SELECT must map to OCSF Read")
+	assert.Equal(t, "SELECT", fileEvents[0].API.Operation)
+	require.NotNil(t, fileEvents[0].Unmapped)
+	assert.Equal(t, "ALLOW", fileEvents[0].Unmapped.IAMJIT.Verdict)
+	assert.Equal(t, audit.Product, fileEvents[0].Metadata.Product.Name)
+	assert.Equal(t, audit.VendorName, fileEvents[0].Metadata.Product.VendorName)
+	assert.Equal(t, audit.SchemaVersion, fileEvents[0].Metadata.Version)
+	assert.NotZero(t, fileEvents[0].Unmapped.IAMJIT.DecisionID,
+		"decision_id must be the assigned SQLite row id")
 
 	// Verify the webhook received the same event.
 	mu.Lock()
 	defer mu.Unlock()
 	require.Len(t, webhookEvents, 1, "webhook must receive exactly one event")
-	assert.Equal(t, fileEvents[0].DecisionID, webhookEvents[0].DecisionID,
-		"both transports must see the SAME decision_id (shared schema invariant)")
-	assert.Equal(t, fileEvents[0].Action, webhookEvents[0].Action)
-	assert.Equal(t, fileEvents[0].Verdict, webhookEvents[0].Verdict)
+	require.NotNil(t, webhookEvents[0].Unmapped)
+	assert.Equal(t, fileEvents[0].Unmapped.IAMJIT.DecisionID, webhookEvents[0].Unmapped.IAMJIT.DecisionID,
+		"both transports must see the SAME decision_id (shared OCSF schema invariant)")
+	assert.Equal(t, fileEvents[0].API.Operation, webhookEvents[0].API.Operation)
+	assert.Equal(t, fileEvents[0].Unmapped.IAMJIT.Verdict, webhookEvents[0].Unmapped.IAMJIT.Verdict)
 }
 
 // TestEvaluateAndAudit_NoExporter_PreservesD8Behavior verifies that

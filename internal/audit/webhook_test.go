@@ -111,10 +111,10 @@ func TestWebhookPusher_AllowInternalOptIn(t *testing.T) {
 // delivery must succeed + Push must never block the proxy hot-path.
 func TestWebhookPusher_SuccessfulDelivery_AsyncNonBlocking(t *testing.T) {
 	var (
-		mu          sync.Mutex
-		bodies      [][]byte
-		seenAuth    string
-		seenCTHdr   string
+		mu        sync.Mutex
+		bodies    [][]byte
+		seenAuth  string
+		seenCTHdr string
 	)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -141,9 +141,7 @@ func TestWebhookPusher_SuccessfulDelivery_AsyncNonBlocking(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		pushDone := make(chan struct{})
 		go func(id int) {
-			require.NoError(t, p.Push(context.Background(), Event{
-				EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(id),
-			}))
+			require.NoError(t, p.Push(context.Background(), testDecisionEvent(int64(id))))
 			close(pushDone)
 		}(i)
 		select {
@@ -169,8 +167,8 @@ func TestWebhookPusher_SuccessfulDelivery_AsyncNonBlocking(t *testing.T) {
 			var e Event
 			require.NoError(t, json.Unmarshal(line, &e),
 				"each POST body line must be a valid Event")
-			assert.Equal(t, Product, e.Product)
-			assert.Equal(t, SchemaVersion, e.Version)
+			assert.Equal(t, Product, e.Metadata.Product.Name)
+			assert.Equal(t, SchemaVersion, e.Metadata.Version)
 		}
 	}
 }
@@ -200,9 +198,7 @@ func TestWebhookPusher_RetriesOn5xx(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, p.Push(context.Background(), Event{
-		EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 1,
-	}))
+	require.NoError(t, p.Push(context.Background(), testDecisionEvent(1)))
 	require.NoError(t, p.Shutdown(context.Background()))
 	assert.GreaterOrEqual(t, attempts.Load(), int32(3), "must retry until 2xx (or maxAttempts)")
 	assert.Equal(t, int64(1), p.Stats().Delivered, "ultimate 200 must increment Delivered")
@@ -227,9 +223,7 @@ func TestWebhookPusher_GivesUpAfterMaxAttempts(t *testing.T) {
 		MaxAttempts:         3,
 	})
 	require.NoError(t, err)
-	require.NoError(t, p.Push(context.Background(), Event{
-		EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 99,
-	}))
+	require.NoError(t, p.Push(context.Background(), testDecisionEvent(99)))
 	require.NoError(t, p.Shutdown(context.Background()))
 
 	stats := p.Stats()
@@ -261,9 +255,7 @@ func TestWebhookPusher_NonRetryable4xx(t *testing.T) {
 		MaxAttempts:         5,
 	})
 	require.NoError(t, err)
-	require.NoError(t, p.Push(context.Background(), Event{
-		EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 1,
-	}))
+	require.NoError(t, p.Push(context.Background(), testDecisionEvent(1)))
 	require.NoError(t, p.Shutdown(context.Background()))
 	assert.Equal(t, int32(1), attempts.Load(),
 		"401 must not retry (each retry sends the same bad token)")
@@ -311,9 +303,7 @@ func TestWebhookPusher_DropsOnOverflow_AndEmitsAuditDropped(t *testing.T) {
 
 	// Pump events while the server is blocked.
 	for i := 0; i < 100; i++ {
-		_ = p.Push(context.Background(), Event{
-			EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(i),
-		})
+		_ = p.Push(context.Background(), testDecisionEvent(int64(i)))
 	}
 	// Release the server + let the worker drain.
 	close(release)
@@ -327,9 +317,11 @@ func TestWebhookPusher_DropsOnOverflow_AndEmitsAuditDropped(t *testing.T) {
 	defer mu.Unlock()
 	sawAuditDropped := false
 	for _, e := range received {
-		if e.EventType == EventTypeAuditDropped {
+		if e.ActivityName == "audit_dropped" {
 			sawAuditDropped = true
-			assert.Greater(t, e.DroppedCount, int64(0))
+			require.NotNil(t, e.Unmapped)
+			assert.Equal(t, string(EventTypeAuditDropped), e.Unmapped.IAMJIT.EventType)
+			assert.Greater(t, e.Unmapped.IAMJIT.DroppedCount, int64(0))
 		}
 	}
 	assert.True(t, sawAuditDropped,
@@ -380,9 +372,7 @@ func TestWebhookPusher_TokenNeverInStats(t *testing.T) {
 		MaxAttempts:         2,
 	})
 	require.NoError(t, err)
-	require.NoError(t, p.Push(context.Background(), Event{
-		EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: 1,
-	}))
+	require.NoError(t, p.Push(context.Background(), testDecisionEvent(1)))
 	require.NoError(t, p.Shutdown(context.Background()))
 
 	stats := p.Stats()
@@ -425,9 +415,7 @@ func TestWebhookPusher_AsyncNeverBlocksOnSlowServer(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		start := time.Now()
-		_ = p.Push(context.Background(), Event{
-			EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(i),
-		})
+		_ = p.Push(context.Background(), testDecisionEvent(int64(i)))
 		if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
 			t.Fatalf("Push took %v on attempt %d; proxy-hot-path-never-blocks invariant broken", elapsed, i)
 		}
@@ -462,9 +450,7 @@ func TestWebhookPusher_BatchSize_GroupsMultipleEvents(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 10; i++ {
-		require.NoError(t, p.Push(context.Background(), Event{
-			EventType: EventTypeDecision, Product: Product, Version: SchemaVersion, DecisionID: int64(i),
-		}))
+		require.NoError(t, p.Push(context.Background(), testDecisionEvent(int64(i))))
 	}
 	require.NoError(t, p.Shutdown(context.Background()))
 
@@ -500,8 +486,11 @@ func TestWebhookPusher_BatchSizeTooLarge(t *testing.T) {
 // downstream consumer can correlate gaps to proxy instances.
 func TestWebhookPusher_HostStampInDroppedEvent(t *testing.T) {
 	evt := NewAuditDroppedEvent(5, "10.10.10.10:5433")
-	assert.Equal(t, "10.10.10.10:5433", evt.Host)
-	assert.Equal(t, int64(5), evt.DroppedCount)
+	require.NotNil(t, evt.SrcEndpoint)
+	assert.Equal(t, "10.10.10.10", evt.SrcEndpoint.Hostname)
+	assert.Equal(t, 5433, evt.SrcEndpoint.Port)
+	require.NotNil(t, evt.Unmapped)
+	assert.Equal(t, int64(5), evt.Unmapped.IAMJIT.DroppedCount)
 }
 
 // TestWebhookPusher_ShutdownIdempotent: a second Shutdown call must
