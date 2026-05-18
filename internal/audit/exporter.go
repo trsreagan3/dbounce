@@ -46,6 +46,12 @@ type Exporter struct {
 	// drains before transports close (mirrors the Heartbeat
 	// ordering invariant).
 	HealthMonitor *ExportHealthMonitor
+	// #285 — optional per-session NDJSON recorder. Nil disables this
+	// channel. When wired, every event is teed to
+	// {dir}/{session_id}.ndjson so the cross-product replay CLI can
+	// walk the session. Synchronous + fail-soft inside Record so disk
+	// failures never propagate the proxy hot path.
+	Recorder *SessionRecorder
 
 	// host is the proxy listener address ("127.0.0.1:5433") stamped
 	// onto every event's Event.Host field. Provided at construction
@@ -74,11 +80,16 @@ func NewExporter(log *LogWriter, webhook *WebhookPusher, host, upstream string) 
 // Enabled reports whether ANY transport is configured. The proxy's
 // hot-path SHOULD short-circuit when this is false so we don't even
 // build the Event projection.
+//
+// The #285 SessionRecorder counts as a transport: when the operator
+// passes --record-sessions-dir without any other audit flag the proxy
+// MUST still build + dispatch events so the recorder has something
+// to tee.
 func (e *Exporter) Enabled() bool {
 	if e == nil {
 		return false
 	}
-	return e.Log != nil || e.Webhook != nil
+	return e.Log != nil || e.Webhook != nil || e.Recorder != nil
 }
 
 // EmitDecision projects a store.DecisionRow into the cross-product
@@ -118,6 +129,13 @@ func (e *Exporter) emit(ctx context.Context, evt Event) error {
 			errs = append(errs, err)
 		}
 	}
+	// #285 — per-session NDJSON tee. Fail-soft inside Record (any
+	// disk error is captured on the recorder's lastErr + surfaces
+	// via Status; never propagated into the proxy hot path so a
+	// busted recording dir can't stall decisions).
+	if e.Recorder != nil {
+		e.Recorder.Record(evt)
+	}
 	if len(errs) == 0 {
 		return nil
 	}
@@ -156,6 +174,12 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	// #285 — recorder shutdown atomic-renames every still-open
+	// session's .partial -> .ndjson. SIGKILL-leftover .partials are
+	// recovered by the next Start() instead.
+	if e.Recorder != nil {
+		e.Recorder.Stop()
+	}
 	if len(errs) == 0 {
 		return nil
 	}
@@ -166,12 +190,13 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 // per-transport stats + a top-level "configured" flag so the tool can
 // answer "is anything wired up?" without inspecting nil fields.
 type ExporterStatus struct {
-	Configured bool            `json:"configured"`
-	Log        *LogStats       `json:"log,omitempty"`
-	Webhook    *WebhookStats   `json:"webhook,omitempty"`
-	Heartbeat  *HeartbeatStats `json:"heartbeat,omitempty"`
-	Host       string          `json:"host,omitempty"`
-	Upstream   string          `json:"upstream,omitempty"`
+	Configured bool                   `json:"configured"`
+	Log        *LogStats              `json:"log,omitempty"`
+	Webhook    *WebhookStats          `json:"webhook,omitempty"`
+	Heartbeat  *HeartbeatStats        `json:"heartbeat,omitempty"`
+	Recorder   *SessionRecorderStatus `json:"recorder,omitempty"`
+	Host       string                 `json:"host,omitempty"`
+	Upstream   string                 `json:"upstream,omitempty"`
 }
 
 // Status returns the current per-transport stats. Safe for concurrent
@@ -196,6 +221,10 @@ func (e *Exporter) Status() ExporterStatus {
 	if e.Heartbeat != nil && e.Heartbeat.Configured() {
 		s := e.Heartbeat.Stats()
 		out.Heartbeat = &s
+	}
+	if e.Recorder != nil {
+		s := e.Recorder.Status()
+		out.Recorder = &s
 	}
 	return out
 }

@@ -394,3 +394,45 @@ gbounce, see
 [`iam-roles/docs/AUDIT-STREAM-TUI.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/AUDIT-STREAM-TUI.md)
 — `iam-jit audit stream` is the terminal-UI sibling of the per-
 bouncer web pages.
+
+## Per-session recordings (`--record-sessions-dir`, `#285` + `#290`)
+
+`dbounce run --record-sessions-dir PATH` tees every audit event
+into a per-session NDJSON file at
+`{PATH}/{agent.session_id}.ndjson`. Files are portable across
+ibounce / kbouncer / dbounce / gbounce — same on-disk shape per
+`[[cross-product-agent-parity]]` — so the cross-product
+`iam-jit session replay <FILE>` CLI walks any product's
+recordings uniformly. File mode 0o600.
+
+```bash
+# Run the proxy with per-session recording enabled.
+dbounce run --mode transparent --record-sessions-dir ~/.dbounce/sessions
+
+# List what got recorded.
+dbounce session list
+# SESSION_ID                              AGENT          EVENTS START                  END
+# 01956c44-c5c1-7c31-9bca-7c0aaa000001    claude-code         42 2026-05-19T14:01:33Z   2026-05-19T14:08:12Z
+# 01956c44-c5c1-7c31-9bca-7c0aaa000099    cursor              17 2026-05-19T15:22:01Z   2026-05-19T15:24:55Z
+
+# Summary + event-count-by-type for one recording.
+dbounce session show 01956c44-c5c1-7c31-9bca-7c0aaa000001
+
+# OCSF Detection Finding envelope (matches `#273 investigate`).
+dbounce session export 01956c44-c5c1-7c31-9bca-7c0aaa000001 \
+  --out /tmp/finding.json
+
+# Retention sweep — explicit threshold required; --dry-run lists candidates.
+dbounce session purge --older-than 30d --dry-run
+dbounce session purge --older-than 30d
+```
+
+Cross-product documentation lives at
+[`iam-roles/docs/SESSION-REPLAY.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/SESSION-REPLAY.md).
+
+Per `[[creates-never-mutates]]` the recorder is additive (it tees
+the existing event stream); the `session` subcommands are read-
+only or destructive-only-via-explicit-`purge --older-than`.
+
+Per `[[self-host-zero-billing-dependency]]`: zero network calls;
+entirely local filesystem.

@@ -201,6 +201,13 @@ func newRootCmd() *cobra.Command {
 	// ibounce.
 	root.AddCommand(newBackupCmd())
 	root.AddCommand(newRestoreCmd())
+	// #285 — `dbounce session list / show / export / purge`. Reads the
+	// per-session NDJSON recordings written when the proxy runs with
+	// `--record-sessions-dir`. Subcommand + flag names match ibounce +
+	// kbounce + gbounce exactly per [[cross-product-agent-parity]] so
+	// orchestrators (and the cross-product `iam-jit session replay
+	// <FILE>` CLI) consume any product's recordings uniformly.
+	root.AddCommand(newSessionCmd())
 	return root
 }
 
@@ -521,6 +528,9 @@ func newRunCmd() *cobra.Command {
 		// BEFORE downstream validation so license / SSRF / loopback
 		// gates see the preset-resolved values.
 		deploymentPreset string
+		// #285 — per-session NDJSON recordings directory. Empty disables
+		// the channel. Replayable via `iam-jit session replay <FILE>`.
+		recordSessionsDir string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -958,6 +968,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				auditExportHealthInterval,
 				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 				upstreamURL,
+				recordSessionsDir,
 			)
 			if exporterErr != nil {
 				return exporterErr
@@ -1311,6 +1322,12 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"mgmt port is bound externally. Empty + loopback mgmt-host = "+
 			"no auth (the loopback bind is the trust anchor). Empty + "+
 			"external mgmt-host = dbounce refuses to start.")
+	cmd.Flags().StringVar(&recordSessionsDir, "record-sessions-dir", "",
+		"#285 — per-session NDJSON recording directory. When set, every "+
+			"audit event is also written to {dir}/{agent.session_id}.ndjson "+
+			"(one file per agent session). Replayable via `iam-jit session "+
+			"replay <FILE>`. File mode 0o600. Default off; the recorder "+
+			"captures agent identity + operation details so it ships opt-in.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more
@@ -1353,6 +1370,7 @@ func buildAuditExporter(
 	heartbeatInterval, heartbeatGap time.Duration,
 	auditExportHealthInterval time.Duration,
 	listenerHost, upstreamURL string,
+	recordSessionsDir string,
 ) (*audit.Exporter, error) {
 	var logWriter *audit.LogWriter
 	if logPath != "" {
@@ -1426,7 +1444,8 @@ func buildAuditExporter(
 	// audit-export-health monitor is configured, the exporter is a
 	// no-op (FREE-tier default).
 	if logWriter == nil && webhookPusher == nil &&
-		heartbeatInterval == 0 && auditExportHealthInterval == 0 {
+		heartbeatInterval == 0 && auditExportHealthInterval == 0 &&
+		recordSessionsDir == "" {
 		return nil, nil
 	}
 	upstreamHost := ""
@@ -1439,7 +1458,40 @@ func buildAuditExporter(
 			upstreamHost = u.Host
 		}
 	}
+	// #285 — per-session NDJSON recorder. Default off; only constructed
+	// when the operator passed --record-sessions-dir. Start() creates
+	// the dir + recovers any stale .partial files. Fatal on failure so
+	// an unwritable dir surfaces immediately (mirrors the LogWriter
+	// fail-fast above; if the recording sink can't be opened the
+	// operator wants to know).
+	var sessRecorder *audit.SessionRecorder
+	if recordSessionsDir != "" {
+		sr, err := audit.NewSessionRecorder(audit.SessionRecorderOptions{
+			Dir:            recordSessionsDir,
+			BouncerProduct: "dbounce",
+		})
+		if err != nil {
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			if webhookPusher != nil {
+				_ = webhookPusher.Shutdown(context.Background())
+			}
+			return nil, fmt.Errorf("session recorder: %w", err)
+		}
+		if err := sr.Start(); err != nil {
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			if webhookPusher != nil {
+				_ = webhookPusher.Shutdown(context.Background())
+			}
+			return nil, fmt.Errorf("session recorder: %w", err)
+		}
+		sessRecorder = sr
+	}
 	exp := audit.NewExporter(logWriter, webhookPusher, listenerHost, upstreamHost)
+	exp.Recorder = sessRecorder
 	if heartbeatInterval > 0 {
 		hb := audit.NewHeartbeater(audit.HeartbeatOptions{
 			Interval:     heartbeatInterval,

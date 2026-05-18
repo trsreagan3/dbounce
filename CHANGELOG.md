@@ -5,6 +5,32 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Per-session recording CLI wiring (#290, 2026-05-19)
+
+- **`dbounce run --record-sessions-dir PATH`** — wires the #285
+  recorder library into the proxy hot path. Every audit event is
+  teed into `{dir}/{agent.session_id}.ndjson` (one file per agent
+  session) alongside any other configured audit transport.
+  Default off; opt-in flag.
+- **`dbounce session list / show / export / purge`** — read-only
+  inspection of recordings. Subcommand names + flag shape match
+  ibounce + kbounce + gbounce exactly per
+  `[[cross-product-agent-parity]]`. `purge --dry-run` lists
+  candidates without deleting; explicit `--older-than` required
+  per `[[creates-never-mutates]]` (destructive only via explicit
+  threshold).
+- `Exporter.Recorder` field + `ExporterStatus.Recorder` so
+  `audit-export health` surfaces recorder counters alongside
+  log + webhook + heartbeat stats. `Exporter.Enabled()` now
+  treats a configured recorder as a transport so the proxy keeps
+  building events when the operator wired ONLY the recorder.
+- `Shutdown` finalises every still-open recording (.partial →
+  .ndjson) before the proxy exits.
+- Per `[[self-host-zero-billing-dependency]]`: zero network calls;
+  entirely local filesystem.
+- See `docs/SESSION-REPLAY.md` in iam-roles for the cross-product
+  CLI; this slice ships the dbounce side of the surface.
+
 ### Per-session recording library (#285, 2026-05-19)
 
 - New `internal/audit/recorder.go` ships the per-session NDJSON
