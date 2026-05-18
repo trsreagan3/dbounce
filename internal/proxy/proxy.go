@@ -903,6 +903,14 @@ func (s *Server) Serve() error {
 	// in parallel against each reachable bouncer to produce a single
 	// merged stream.
 	mux.HandleFunc("/audit/events", auditEventsHandler(s.store, s.cfg.AuditEventsToken))
+	// #272 — GET / serves the minimal live audit-stream web UI on
+	// the same mgmt port as /healthz + /audit/events. The page polls
+	// /audit/events every 2 s. Same auth model as /audit/events:
+	// loopback no header; external bind takes the bearer token
+	// through the URL `#token=...` fragment so the rendered HTML
+	// body never embeds the secret. Cross-product-identical HTML
+	// shape with ibounce / kbounce / gbounce.
+	mux.HandleFunc("/", auditEventsUIHandler(s.cfg.AuditEventsToken))
 	s.mgmtSrv = &http.Server{
 		Addr:              mgmtAddr,
 		Handler:           mux,
