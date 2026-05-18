@@ -79,10 +79,24 @@ go build ./cmd/dbounce
 # HTTP port for /healthz is 127.0.0.1:8768 (distinct from kbounce's
 # 8766 and ibounce's 8767 so all three products coexist on the same
 # laptop).
-./dbounce run --upstream postgres://user:pass@localhost:5432/mydb
+#
+# For a loopback upstream (local PG on 127.0.0.1 / localhost / a
+# .local hostname), add --allow-internal-upstream — dbounce refuses
+# internal IP ranges by default to prevent SSRF when the upstream URL
+# comes from untrusted config:
+./dbounce run \
+  --upstream postgres://user:pass@127.0.0.1:5432/mydb \
+  --allow-internal-upstream
 ```
 
 Default audit DB: `~/.dbounce/state.db`.
+
+The `--allow-internal-upstream` flag is the dev-laptop opt-in; in
+production you'd point `--upstream` at a routable hostname and leave
+the flag off so a misconfigured value can't be coerced into hitting
+loopback / link-local / RFC1918 / .local addresses. The error message
+on a refused loopback URL names the flag, but the first-run snippet
+above shows it inline so the local-PG case never trips silently.
 
 ---
 

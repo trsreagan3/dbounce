@@ -5,6 +5,12 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Docs
+
+- README quickstart now shows `--allow-internal-upstream` inline for
+  loopback upstreams (local PG on 127.0.0.1) so first-run users with a
+  local Postgres don't hit the SSRF-gate refusal silently.
+
 ### D-Slice 1 — Foundation (2026-05-17)
 
 First slice of dbounce. Ships the observation-only PostgreSQL wire-
