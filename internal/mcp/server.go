@@ -936,6 +936,43 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 			"configured": false,
 		}
 	}
+	// [[audit-export-failure-visibility]] derived health block:
+	// per-transport health + aggregate degraded flag + reason. Read
+	// by agents that want to verify the audit-export pipeline is
+	// healthy BEFORE relying on its output for compliance / security-
+	// team review. Mirrors the /healthz audit_export_health JSON
+	// shape exactly so agents that scrape both surfaces see one
+	// consistent contract.
+	health := s.cfg.AuditExporter.Health()
+	healthBlock := map[string]any{
+		"configured":                       health.Configured,
+		"degraded":                         health.Degraded,
+		"reason":                           health.Reason,
+		"log_configured":                   health.LogConfigured,
+		"log_writes_ok":                    health.LogWritesOK,
+		"log_path":                         health.LogPath,
+		"log_last_error":                   health.LogLastError,
+		"log_last_error_seconds_ago":       health.LogLastErrorSecondsAgo,
+		"log_dropped_since_start":          health.LogDroppedSinceStart,
+		"webhook_configured":               health.WebhookConfigured,
+		"webhook_url_masked":               health.WebhookURLMasked,
+		"webhook_last_success_seconds_ago": health.WebhookLastSuccessSecondsAgo,
+		"webhook_last_attempt_seconds_ago": health.WebhookLastAttemptSecondsAgo,
+		"webhook_last_status_code":         health.WebhookLastStatusCode,
+		"webhook_consecutive_failures":     health.WebhookConsecutiveFailures,
+		"webhook_last_error":               health.WebhookLastError,
+		"webhook_dropped_since_start":      health.WebhookDroppedSinceStart,
+		"webhook_queue_depth":              health.WebhookQueueDepth,
+		"webhook_queue_capacity":           health.WebhookQueueCapacity,
+		"auth_failed":                      health.AuthFailed,
+	}
+	if s.cfg.AuditExporter.HealthMonitor != nil &&
+		s.cfg.AuditExporter.HealthMonitor.Debouncer() != nil {
+		fired, suppressed := s.cfg.AuditExporter.HealthMonitor.Debouncer().Stats()
+		healthBlock["degraded_alert_fired"] = fired
+		healthBlock["degraded_alert_suppressed"] = suppressed
+	}
+	out["audit_export_health"] = healthBlock
 	out["total_events"] = totalEvents
 	out["dropped_events"] = totalDropped
 	out["last_error"] = lastErr

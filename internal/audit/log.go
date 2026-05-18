@@ -54,6 +54,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // LogWriter writes one JSON-encoded Event per line to an append-only
@@ -92,6 +93,23 @@ type LogWriter struct {
 	// stderr.
 	lastErrMu sync.Mutex
 	lastErr   string
+
+	// lastErrAtUnixNano is the wall-clock at the most-recent recordErr
+	// call. Atomic so /healthz + the audit-export health CLI can read
+	// it without a lock. Per [[audit-export-failure-visibility]] F4/F5/
+	// F6: a stale "last write failed at HH:MM but we've had no recent
+	// failure" surface is the operator's signal that the log path is
+	// transiently broken — fold into log_writes_ok logic below.
+	lastErrAtUnixNano atomic.Int64
+
+	// lastWriteAtUnixNano is the wall-clock of the most-recent
+	// successful enc.Encode return. Atomic. Together with
+	// lastErrAtUnixNano this lets the health-monitor compute
+	// "log_writes_ok = (no recent error) OR (a successful write
+	// landed since the last error)". A LogWriter that was unhealthy
+	// at startup but is now writing fine reads as ok again, exactly
+	// like the webhook recovery semantics.
+	lastWriteAtUnixNano atomic.Int64
 }
 
 // LogOptions wires the LogWriter from CLI flags.
@@ -187,6 +205,17 @@ func (w *LogWriter) Write(ctx context.Context, evt Event) error {
 // when the channel is closed by Shutdown — at which point any in-flight
 // events have already been queued (Shutdown closes after the last Write
 // completes) so the worker drains them to disk before signaling doneCh.
+//
+// Per [[audit-export-failure-visibility]] F6: every Nth write also runs
+// a stat() on the path to detect "log file deleted/moved while bouncer
+// running" — the OS keeps the fd valid + writes succeed into the
+// unlinked inode (silently invisible to operators tailing the path).
+// On detection, the worker records an error AND re-opens the file at
+// the same path so subsequent events land where the operator expects.
+// N=64 balances "catch the deletion within a small event window" with
+// "don't add a per-event syscall." A 64-event window at 100 events/s
+// = ~640ms recovery; well within the [[audit-cadence-discipline]] BB
+// audit tolerance.
 func (w *LogWriter) runWorker() {
 	defer close(w.doneCh)
 	defer func() {
@@ -197,6 +226,7 @@ func (w *LogWriter) runWorker() {
 	enc := json.NewEncoder(w.f)
 	// The encoder appends \n after each Encode call — matches the JSONL
 	// contract (one event per line, newline-terminated).
+	var sinceStat int
 	for evt := range w.ch {
 		if err := enc.Encode(evt); err != nil {
 			w.recordErr(fmt.Errorf("encode: %w", err))
@@ -217,7 +247,99 @@ func (w *LogWriter) runWorker() {
 			}
 		}
 		w.written.Add(1)
+		w.lastWriteAtUnixNano.Store(time.Now().UnixNano())
+		sinceStat++
+		if sinceStat >= logStatCheckInterval {
+			sinceStat = 0
+			if newEnc := w.checkFilePresence(enc); newEnc != nil {
+				enc = newEnc
+			}
+		}
 	}
+}
+
+// logStatCheckInterval is the per-N-events cadence for F6 (file
+// deleted/moved). 64 is small enough that an operator who deletes the
+// file mid-run sees the recovery within ~half a second on a 100 ev/s
+// stream + large enough that the syscall overhead is in the noise (a
+// stat() is ~5-10us on a warm cache; per-event would be ~10% overhead
+// at high throughput, per-64-events is ~0.2%).
+const logStatCheckInterval = 64
+
+// checkFilePresence stats the log path; if the file is gone OR the
+// inode no longer matches the open fd, records an error + re-opens at
+// the same path. Returns a new json.Encoder bound to the re-opened
+// handle (or nil when no re-open was needed). Worker-only.
+//
+// Per [[audit-export-failure-visibility]] F6 + [[deliberate-feature-
+// completion]] the recovery is BOTH halves: detect (record error so
+// /healthz flips degraded + the SIEM alert fires) AND re-open (so
+// subsequent events land at the path the operator expects). A "detect
+// but don't recover" implementation would silently lose events for the
+// rest of the process lifetime; a "recover but don't surface" would
+// hide the operator's mis-action from the audit channel.
+func (w *LogWriter) checkFilePresence(enc *json.Encoder) *json.Encoder {
+	if w == nil || w.f == nil {
+		return nil
+	}
+	osF, ok := w.f.(*os.File)
+	if !ok {
+		return nil
+	}
+	pathStat, pathErr := os.Stat(w.path)
+	if pathErr != nil {
+		// File at the path no longer exists (or is unreadable). Try to
+		// re-open at the same path. If THAT also fails (perm-denied
+		// parent dir, disk-full), record both errors + keep writing to
+		// the old fd; the WritesOK signal will stay false until the
+		// operator fixes the path.
+		w.recordErr(fmt.Errorf("file vanished at %q: %w", w.path, pathErr))
+		return w.tryReopen()
+	}
+	fdStat, fdErr := osF.Stat()
+	if fdErr != nil {
+		w.recordErr(fmt.Errorf("fstat open fd: %w", fdErr))
+		return nil
+	}
+	if !os.SameFile(pathStat, fdStat) {
+		// Same path; different inode — the operator (or logrotate)
+		// renamed-then-touched a new file. Re-open so subsequent
+		// events land in the new inode. Per the docstring this is
+		// surfaced as an error so /healthz can flip — silent
+		// re-opens would hide rotation misconfiguration.
+		w.recordErr(fmt.Errorf(
+			"file inode changed at %q (logrotate misconfigured?)", w.path))
+		return w.tryReopen()
+	}
+	return nil
+}
+
+// tryReopen attempts to re-OpenFile(w.path) + swap w.f. On success,
+// returns a fresh json.Encoder bound to the new fd; on failure,
+// records the failure + returns nil (caller keeps using the old fd).
+// Worker-only — w.f mutation here is safe because the worker is the
+// only goroutine that touches it.
+func (w *LogWriter) tryReopen() *json.Encoder {
+	f, err := os.OpenFile(w.path,
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+		0o600)
+	if err != nil {
+		w.recordErr(fmt.Errorf("reopen %q: %w", w.path, err))
+		return nil
+	}
+	// Best-effort close of the previous fd. A failed close on the
+	// unlinked inode is expected (Linux deletes the inode when the
+	// last fd closes; the failure mode here would be ENOSPC on close,
+	// which we surface but don't act on — the new fd is already live).
+	if old, ok := w.f.(io.Closer); ok {
+		_ = old.Close()
+	}
+	w.f = f
+	// The recovery write itself is the "we're back" signal — no
+	// separate event; the next decision will land cleanly in the new
+	// inode + the LastWriteAt timestamp will bump past the LastErrorAt
+	// timestamp, which clears WritesOK back to true.
+	return json.NewEncoder(f)
 }
 
 // Shutdown closes the channel + waits for the worker to drain the
@@ -252,6 +374,12 @@ func (w *LogWriter) Shutdown(ctx context.Context) error {
 // Stats returns a snapshot of the writer's runtime counters. Read by
 // the dbounce_audit_export_status MCP tool. Race-free: all underlying
 // fields are atomics or mutex-guarded.
+//
+// Per [[audit-export-failure-visibility]]: WritesOK + LastErrorAt +
+// LastWriteAt are surfaced so /healthz + `dbounce audit-export health`
+// can answer "is the log writer healthy right now?" without re-
+// inspecting the file. F4/F5/F6 (perm-denied / disk-full / file
+// deleted) all flow through these fields via recordErr.
 type LogStats struct {
 	Path        string
 	Written     int64
@@ -261,6 +389,9 @@ type LogStats struct {
 	QueueDepth  int
 	QueueLimit  int
 	Configured  bool
+	WritesOK    bool
+	LastErrorAt int64
+	LastWriteAt int64
 }
 
 // Stats returns the current counters. Safe to call concurrently with
@@ -273,21 +404,39 @@ func (w *LogWriter) Stats() LogStats {
 	last := w.lastErr
 	w.lastErrMu.Unlock()
 	return LogStats{
-		Path:       w.path,
-		Written:    w.written.Load(),
-		Dropped:    w.dropped.Load(),
-		LastError:  last,
-		Fsync:      w.fsync,
-		QueueDepth: len(w.ch),
-		QueueLimit: cap(w.ch),
-		Configured: true,
+		Path:        w.path,
+		Written:     w.written.Load(),
+		Dropped:     w.dropped.Load(),
+		LastError:   last,
+		Fsync:       w.fsync,
+		QueueDepth:  len(w.ch),
+		QueueLimit:  cap(w.ch),
+		Configured:  true,
+		WritesOK:    w.WritesOK(),
+		LastErrorAt: w.lastErrAtUnixNano.Load(),
+		LastWriteAt: w.lastWriteAtUnixNano.Load(),
 	}
+}
+
+// RecordErrForTest is the exported test-only entry point to recordErr.
+// Lets the proxy package's /healthz test drive the LogWriter into a
+// degraded posture without simulating an ENOSPC / EPERM that depends
+// on filesystem state. Production code MUST NOT call this; the
+// recordErr-from-the-worker path is the only legitimate driver in
+// production builds.
+func (w *LogWriter) RecordErrForTest(msg string) {
+	w.recordErr(errors.New(msg))
 }
 
 // recordErr stores err as the most-recent worker-side error. Race-free
 // via the lastErrMu mutex. We don't keep an error CHAIN — only the most
 // recent — so the MCP tool's "last_error" field has stable read
 // semantics regardless of how many errors fired.
+//
+// Per [[audit-export-failure-visibility]] F4/F5/F6: also stamps the
+// wall-clock so /healthz + the audit-export health CLI can answer
+// "how recently did writes start failing?" The atomic store is
+// race-clean against concurrent Stats() reads.
 func (w *LogWriter) recordErr(err error) {
 	if err == nil {
 		return
@@ -295,4 +444,48 @@ func (w *LogWriter) recordErr(err error) {
 	w.lastErrMu.Lock()
 	w.lastErr = err.Error()
 	w.lastErrMu.Unlock()
+	w.lastErrAtUnixNano.Store(time.Now().UnixNano())
+}
+
+// LastErrorAtUnixNano returns the wall-clock of the most-recent
+// recordErr. Zero when no error has been recorded. Atomic-only read so
+// the health-monitor + /healthz can poll without locking.
+func (w *LogWriter) LastErrorAtUnixNano() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.lastErrAtUnixNano.Load()
+}
+
+// LastWriteAtUnixNano returns the wall-clock of the most-recent
+// successful enc.Encode return. Zero when nothing has been written
+// (e.g. an open writer that hasn't received any events yet). Atomic-
+// only read.
+func (w *LogWriter) LastWriteAtUnixNano() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.lastWriteAtUnixNano.Load()
+}
+
+// WritesOK reports whether the most-recent observation of the log
+// path is healthy. Definition: no error recorded, OR a successful
+// write landed AFTER the last error (recovery). The health-monitor
+// reads this to drive log_writes_ok in the /healthz block.
+//
+// Per [[audit-export-failure-visibility]]: a permission-denied parent
+// dir, a disk-full event, or a deleted-mid-run log file all surface
+// here as false until a subsequent write succeeds. Operators who pre-
+// check the log path via `dbounce audit-export health` get an exit-1
+// signal before the bouncer starts emitting decisions.
+func (w *LogWriter) WritesOK() bool {
+	if w == nil {
+		return true
+	}
+	lastErr := w.lastErrAtUnixNano.Load()
+	if lastErr == 0 {
+		return true
+	}
+	lastWrite := w.lastWriteAtUnixNano.Load()
+	return lastWrite > lastErr
 }

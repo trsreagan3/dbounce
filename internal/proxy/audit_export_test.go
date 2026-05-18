@@ -155,6 +155,70 @@ func TestEvaluateAndAudit_NoExporter_PreservesD8Behavior(t *testing.T) {
 		"no-exporter case must still write the SQLite audit row (back-compat)")
 }
 
+// TestHealthz_AuditExportHealthBlock confirms that when an exporter is
+// wired, /healthz includes the audit_export_health block (the derived
+// view that the audit-export health CLI command + external monitors
+// consume). Per [[audit-export-failure-visibility]] Part 1.
+func TestHealthz_AuditExportHealthBlock(t *testing.T) {
+	dir := t.TempDir()
+	logWriter, err := audit.NewLogWriter(audit.LogOptions{
+		Path: filepath.Join(dir, "audit.jsonl"),
+	})
+	require.NoError(t, err)
+	exp := audit.NewExporter(logWriter, nil, "127.0.0.1:5433", "")
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	srv, _, healthzURL, _ := startTestServer(t)
+	srv.SetAuditExporter(exp)
+
+	resp, err := http.Get(healthzURL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"healthy exporter MUST return 200")
+	var payload map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&payload))
+	health, ok := payload["audit_export_health"].(map[string]any)
+	require.True(t, ok, "/healthz MUST include audit_export_health block when exporter wired")
+	assert.Equal(t, true, health["configured"])
+	assert.Equal(t, false, health["degraded"])
+	assert.Equal(t, true, health["log_configured"])
+	assert.Equal(t, true, health["log_writes_ok"])
+}
+
+// TestHealthz_DegradedExporter_FlipsTo503 — when the audit-export
+// pipeline is degraded, /healthz MUST return 503 so external monitors
+// alert. Per [[audit-export-failure-visibility]] Part 1.
+func TestHealthz_DegradedExporter_FlipsTo503(t *testing.T) {
+	dir := t.TempDir()
+	logWriter, err := audit.NewLogWriter(audit.LogOptions{
+		Path: filepath.Join(dir, "audit.jsonl"),
+	})
+	require.NoError(t, err)
+	exp := audit.NewExporter(logWriter, nil, "127.0.0.1:5433", "")
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	srv, _, healthzURL, _ := startTestServer(t)
+	srv.SetAuditExporter(exp)
+
+	// Force the log writer into a degraded state via the same
+	// recordErr pathway F4/F5 use.
+	logWriter.RecordErrForTest("simulated perm denied")
+
+	resp, err := http.Get(healthzURL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"degraded exporter MUST flip /healthz to 503 for external monitors")
+	var payload map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&payload))
+	assert.Equal(t, "degraded", payload["status"])
+	health, ok := payload["audit_export_health"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, true, health["degraded"])
+	assert.NotEmpty(t, health["reason"])
+}
+
 // TestAuditExporter_TokenNeverInHealthz: scan the /healthz JSON for
 // the secret token; it MUST be absent. This is a binding test of the
 // no-leak invariant required by the spec.

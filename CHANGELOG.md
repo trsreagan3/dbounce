@@ -5,6 +5,49 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Audit-export failure visibility (2026-05-18)
+
+Closes the stealth-bypass gap flagged in the Slice 1 BB+WB audit per
+[[audit-export-failure-visibility]]: silently-failing log writes or
+webhook posts left operators thinking they had visibility when they
+had none. Five surfaces ship together per
+[[deliberate-feature-completion]]:
+
+- **`/healthz` `audit_export_health` block** — per-transport health
+  (log_writes_ok, webhook_consecutive_failures,
+  webhook_last_success_seconds_ago, auth_failed) plus an aggregate
+  degraded flag + reason. When degraded, `/healthz` returns 503 so
+  external monitors / K8s liveness probes alert.
+- **`dbounce audit-export health` CLI** — operator-facing explicit
+  check; reads `/healthz`; non-zero exit when degraded. `--json` mode
+  for tooling.
+- **`audit_export_degraded` OCSF SECURITY_ALERT** — new alert rule
+  (`activity_name="audit_export_degraded"`, severity Medium). Fires
+  via three lanes at once: stderr (operator-immediate), the audit-
+  export channel best-effort (so a SIEM sees it via any surviving
+  transport), and the `/healthz` 503 flip. Debounced at one alert per
+  5min window unless the failure-mode reason shifts. Opt-in via
+  `--audit-export-health-interval DURATION` (default OFF; recommended
+  30s).
+- **F1-F8 per-failure-mode tests** —
+  `internal/audit/export_health_test.go` covers webhook unreachable
+  (F1), 401/403 auth (F2), persistent 5xx (F3), log perm-denied (F4),
+  disk-full (F5, folded into F4), log file deleted mid-run (F6, with
+  re-open recovery via stat-check every 64 writes), queue overflow
+  (F7), and the placeholder gate for license-expiry (F8, deferred
+  pending #235).
+- **MCP `dbounce_audit_export_status`** — now also surfaces the
+  derived `audit_export_health` block + `degraded_alert_fired` /
+  `degraded_alert_suppressed` counters for agents that want to
+  introspect the SIEM-side alert volume.
+
+Webhook URL masking in the health surface goes beyond Slice 1's
+userinfo-strip: the URL path is also masked (`scheme://host/***`) so
+Datadog / Sentinel workspace ids embedded in the path don't leak via
+`/healthz`. Sibling agents in ibounce + kbounce ship the same field
+names + the same `rule_id="audit_export_degraded"` so a single cross-
+product SIEM rule catches all three.
+
 ### Docs
 
 - README quickstart now shows `--allow-internal-upstream` inline for

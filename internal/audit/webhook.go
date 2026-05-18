@@ -80,6 +80,20 @@ type WebhookPusher struct {
 	lastErrMu  sync.Mutex
 	lastErr    string
 
+	// Per [[audit-export-failure-visibility]] F1/F2/F3: the operator
+	// needs more than just last_error to triage. lastSuccessAtUnixNano
+	// + lastAttemptAtUnixNano answer "is the channel currently
+	// reachable?" without a JOIN against the SIEM. lastStatusCode
+	// answers "what HTTP code did the most recent attempt return?"
+	// (401 vs 502 vs ECONNREFUSED → different operator actions).
+	// consecutiveFailures drives the audit_export_degraded alert
+	// threshold + /healthz 503 flip. All atomic for race-clean read
+	// from /healthz + the audit-export health CLI.
+	lastSuccessAtUnixNano atomic.Int64
+	lastAttemptAtUnixNano atomic.Int64
+	lastStatusCode        atomic.Int64
+	consecutiveFailures   atomic.Int64
+
 	// droppedSinceLastSynthetic tracks the count since the last
 	// AUDIT_DROPPED event was emitted. Reset to 0 on each emission so
 	// the synthetic event names the DELTA — consumers can sum deltas
@@ -382,13 +396,16 @@ func (w *WebhookPusher) deliver(batch []Event, maxAttempts int, initialBackoff, 
 			req.Header.Set(k, v)
 		}
 		req.Header.Set("User-Agent", "dbounce-audit-export/"+SchemaVersion)
+		w.lastAttemptAtUnixNano.Store(time.Now().UnixNano())
 		resp, err := w.httpClient.Do(req)
 		if err != nil {
 			// Network-level error. Retry unless we've exhausted.
+			w.lastStatusCode.Store(0)
 			w.recordErr(fmt.Errorf(
 				"webhook POST %s attempt %d/%d: network error: %w",
 				w.RedactedURL(), attempt, maxAttempts, err))
 			if attempt == maxAttempts {
+				w.consecutiveFailures.Add(1)
 				w.dropped.Add(int64(len(batch)))
 				w.bumpDroppedSince(int64(len(batch)))
 				return
@@ -400,9 +417,15 @@ func (w *WebhookPusher) deliver(batch []Event, maxAttempts int, initialBackoff, 
 		// Drain + close so the connection pools.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
+		w.lastStatusCode.Store(int64(resp.StatusCode))
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			w.delivered.Add(int64(len(batch)))
+			w.lastSuccessAtUnixNano.Store(time.Now().UnixNano())
+			// Recovery: a successful delivery clears the consecutive-
+			// failure counter so the audit_export_degraded alert can
+			// re-fire on the NEXT sustained outage (debounce reset).
+			w.consecutiveFailures.Store(0)
 			return
 		case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
 			// Retryable. Don't burn an attempt on the 5xx itself if
@@ -411,6 +434,7 @@ func (w *WebhookPusher) deliver(batch []Event, maxAttempts int, initialBackoff, 
 				"webhook POST %s attempt %d/%d: HTTP %d (retryable)",
 				w.RedactedURL(), attempt, maxAttempts, resp.StatusCode))
 			if attempt == maxAttempts {
+				w.consecutiveFailures.Add(1)
 				w.dropped.Add(int64(len(batch)))
 				w.bumpDroppedSince(int64(len(batch)))
 				return
@@ -420,10 +444,19 @@ func (w *WebhookPusher) deliver(batch []Event, maxAttempts int, initialBackoff, 
 		default:
 			// 4xx (non-429) = config / auth error. Don't retry — the
 			// next request would just repeat the same failure. Drop +
-			// surface so the operator fixes the URL/token.
+			// surface so the operator fixes the URL/token. Per
+			// [[audit-export-failure-visibility]] F2: 401 should read
+			// distinctly in last_error so the operator triages "rotate
+			// the token" vs "fix the network."
+			authHint := ""
+			if resp.StatusCode == http.StatusUnauthorized ||
+				resp.StatusCode == http.StatusForbidden {
+				authHint = " — webhook auth failed; rotate --audit-webhook-token"
+			}
 			w.recordErr(fmt.Errorf(
-				"webhook POST %s attempt %d/%d: HTTP %d (non-retryable; check URL + token)",
-				w.RedactedURL(), attempt, maxAttempts, resp.StatusCode))
+				"webhook POST %s attempt %d/%d: HTTP %d (non-retryable; check URL + token)%s",
+				w.RedactedURL(), attempt, maxAttempts, resp.StatusCode, authHint))
+			w.consecutiveFailures.Add(1)
 			w.dropped.Add(int64(len(batch)))
 			w.bumpDroppedSince(int64(len(batch)))
 			return
@@ -468,16 +501,26 @@ func (w *WebhookPusher) Shutdown(ctx context.Context) error {
 
 // WebhookStats is the snapshot the dbounce_audit_export_status MCP tool
 // reads. Race-free: all fields are atomics or mutex-guarded.
+//
+// Per [[audit-export-failure-visibility]]: LastSuccessAt / LastAttemptAt
+// / LastStatusCode / ConsecutiveFailures are surfaced so /healthz +
+// `dbounce audit-export health` can answer F1/F2/F3 without re-
+// inspecting the network. ConsecutiveFailures drives the 503 flip on
+// /healthz + the audit_export_degraded alert threshold.
 type WebhookStats struct {
-	URLRedacted string
-	Delivered   int64
-	Dropped     int64
-	InFlight    int64
-	LastError   string
-	BatchSize   int
-	QueueDepth  int
-	QueueLimit  int
-	Configured  bool
+	URLRedacted         string
+	Delivered           int64
+	Dropped             int64
+	InFlight            int64
+	LastError           string
+	BatchSize           int
+	QueueDepth          int
+	QueueLimit          int
+	Configured          bool
+	LastSuccessAt       int64
+	LastAttemptAt       int64
+	LastStatusCode      int64
+	ConsecutiveFailures int64
 }
 
 // Stats returns the current counters. Safe to call concurrently.
@@ -489,15 +532,19 @@ func (w *WebhookPusher) Stats() WebhookStats {
 	last := w.lastErr
 	w.lastErrMu.Unlock()
 	return WebhookStats{
-		URLRedacted: w.RedactedURL(),
-		Delivered:   w.delivered.Load(),
-		Dropped:     w.dropped.Load(),
-		InFlight:    w.inFlight.Load(),
-		LastError:   last,
-		BatchSize:   w.batchSize,
-		QueueDepth:  len(w.ch),
-		QueueLimit:  cap(w.ch),
-		Configured:  true,
+		URLRedacted:         w.RedactedURL(),
+		Delivered:           w.delivered.Load(),
+		Dropped:             w.dropped.Load(),
+		InFlight:            w.inFlight.Load(),
+		LastError:           last,
+		BatchSize:           w.batchSize,
+		QueueDepth:          len(w.ch),
+		QueueLimit:          cap(w.ch),
+		Configured:          true,
+		LastSuccessAt:       w.lastSuccessAtUnixNano.Load(),
+		LastAttemptAt:       w.lastAttemptAtUnixNano.Load(),
+		LastStatusCode:      w.lastStatusCode.Load(),
+		ConsecutiveFailures: w.consecutiveFailures.Load(),
 	}
 }
 

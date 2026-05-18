@@ -817,6 +817,22 @@ const (
 	// like a full disable. Sibling agents in ibounce + kbounce ship
 	// the same rule_id so a cross-product SIEM correlation works.
 	AlertRuleHeartbeatGap AlertRuleID = "heartbeat_gap"
+
+	// AlertRuleAuditExportDegraded fires when the audit-export
+	// pipeline itself is the failure: log writes are erroring (perm
+	// denied / disk full / file deleted), the webhook is unreachable
+	// past the consecutive-failure threshold, or webhook auth is
+	// failing (401/403). Per [[audit-export-failure-visibility]]: a
+	// silently-failing audit channel IS a stealth bypass — security
+	// team thinks they have visibility, they actually have nothing.
+	// This rule makes the failure LOUD via three lanes at once:
+	// stderr (operator-visible immediately), /healthz (503 so external
+	// monitors flag it), and the audit-export channel best-effort (so
+	// the SIEM sees the alert when ANY transport survives — typically
+	// the log file when the webhook is the failure, or vice versa).
+	// Sibling agents in ibounce + kbounce ship the same rule_id +
+	// matching detail text so a cross-product SIEM correlation works.
+	AlertRuleAuditExportDegraded AlertRuleID = "audit_export_degraded"
 )
 
 // AlertSeverity names the SECURITY_ALERT severity level. Maps to OCSF
@@ -1059,6 +1075,92 @@ func NewHeartbeatGapEvent(host string, interval, threshold, observed time.Durati
 		CategoryName: ocsfCategoryNm,
 		ActivityID:   ActivityIDOther,
 		ActivityName: string(AlertRuleHeartbeatGap),
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityMediumID,
+		Severity:     ocsfSeverityMedium,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		SrcEndpoint:  parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeSecurityAlert),
+				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
+// NewAuditExportDegradedEvent constructs the SECURITY_ALERT event the
+// audit-export health monitor emits when the export pipeline itself
+// is failing (log perm-denied / disk full / file deleted / webhook
+// unreachable / webhook auth failed). Per
+// [[audit-export-failure-visibility]]: this is the meta-alert that
+// closes the stealth-bypass-via-silent-failure surface flagged in the
+// Slice 1 BB+WB audit.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "audit_export_degraded", type_uid=600399, severity_id=3 (Medium),
+// status_id=99 (Other). Per [[security-team-positioning-safety-not-
+// surveillance]]: status_detail names the failure mode + suggests the
+// operator action; never accuses the operator.
+//
+// Self-emitting concern: when the audit-export pipeline IS the
+// failure, this alert can't ride that pipeline. The emit is best-
+// effort + the operator's signal comes from /healthz (status flips to
+// 503) + stderr (the in-process check writes a line). When SOME
+// transport survives (e.g. log file works but webhook is dead), this
+// alert lands via the survivor.
+//
+// Sibling agents in ibounce + kbounce ship the same rule_id + matching
+// detail text + matching ext payload so a single cross-product SIEM
+// rule keyed on rule_id="audit_export_degraded" catches all three.
+func NewAuditExportDegradedEvent(host string, health ExportHealth) Event {
+	ext := map[string]any{
+		"rule_id":                          string(AlertRuleAuditExportDegraded),
+		"log_configured":                   health.LogConfigured,
+		"log_writes_ok":                    health.LogWritesOK,
+		"log_dropped_since_start":          health.LogDroppedSinceStart,
+		"webhook_configured":               health.WebhookConfigured,
+		"webhook_consecutive_failures":     health.WebhookConsecutiveFailures,
+		"webhook_dropped_since_start":      health.WebhookDroppedSinceStart,
+		"webhook_last_status_code":         health.WebhookLastStatusCode,
+		"webhook_last_success_seconds_ago": health.WebhookLastSuccessSecondsAgo,
+		"auth_failed":                      health.AuthFailed,
+		"reason":                           health.Reason,
+	}
+	if health.LogPath != "" {
+		ext["log_path"] = health.LogPath
+	}
+	if health.WebhookURLMasked != "" {
+		ext["webhook_url_masked"] = health.WebhookURLMasked
+	}
+	if health.LogLastError != "" {
+		ext["log_last_error"] = health.LogLastError
+	}
+	if health.WebhookLastError != "" {
+		ext["webhook_last_error"] = health.WebhookLastError
+	}
+	detail := "audit-export pipeline degraded — " + health.Reason +
+		"; check `dbounce audit-export health` for the full picture"
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: string(AlertRuleAuditExportDegraded),
 		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
 		TypeName:     typeNameFor(ActivityIDOther),
 		SeverityID:   ocsfSeverityMediumID,

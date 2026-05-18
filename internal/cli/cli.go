@@ -133,6 +133,16 @@ func newRootCmd() *cobra.Command {
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newAuditCmd())
+	// [[audit-export-failure-visibility]] Part 2: explicit operator
+	// health check for the audit-export pipeline. Non-zero exit when
+	// degraded so an operator can chain it in a startup script:
+	//   `dbounce audit-export health || alert-on-call`
+	// Reads the live /healthz endpoint of a running proxy — this
+	// avoids re-opening the audit log / hitting the webhook a second
+	// time (which would inflate counters + spam the collector). See
+	// the cross-product "audit-export health" pattern shared with
+	// ibounce + kbounce.
+	root.AddCommand(newAuditExportCmd())
 	root.AddCommand(newInitTLSCmd())
 	// D-Slice 7: environment profile + MCP server subcommand trees.
 	root.AddCommand(newProfileCmd())
@@ -465,6 +475,14 @@ func newRunCmd() *cobra.Command {
 		// works for all three.
 		heartbeatIntervalStr     string
 		heartbeatGapThresholdStr string
+		// [[audit-export-failure-visibility]] Part 3: periodic
+		// audit_export_degraded alert + /healthz 503 flip. Default
+		// OFF (operator opt-in); any non-zero positive value enables
+		// the in-process poll goroutine that fires the alert when
+		// the export pipeline is degraded. Sibling agents in
+		// ibounce + kbounce ship the SAME flag name so cross-product
+		// SIEM alerting cadence is uniform.
+		auditExportHealthIntervalStr string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -775,6 +793,32 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 					heartbeatGap)
 			}
 
+			// [[audit-export-failure-visibility]] interval parse +
+			// validation. Default 0 = no periodic poll. Range 5s-1h
+			// when non-zero — narrower than the heartbeat range
+			// (poll cadence has no SIEM-absence semantics; 5s is the
+			// floor at which the alert is timely without burning CPU).
+			auditExportHealthInterval, err := time.ParseDuration(auditExportHealthIntervalStr)
+			if err != nil {
+				return fmt.Errorf(
+					"dbounce: --audit-export-health-interval: parse %q: %w",
+					auditExportHealthIntervalStr, err)
+			}
+			if auditExportHealthInterval < 0 {
+				return fmt.Errorf(
+					"dbounce: --audit-export-health-interval must be >= 0 (got %s); "+
+						"0 disables", auditExportHealthInterval)
+			}
+			if auditExportHealthInterval > 0 &&
+				(auditExportHealthInterval < 5*time.Second || auditExportHealthInterval > time.Hour) {
+				return fmt.Errorf(
+					"dbounce: --audit-export-health-interval must be in 5s-1h when "+
+						"non-zero (got %s); narrower than --heartbeat-interval "+
+						"because the audit_export_degraded alert is local-state "+
+						"+ doesn't need sub-5s precision",
+					auditExportHealthInterval)
+			}
+
 			s := proxy.NewServer(cfg, st)
 
 			// #252 Slice 1: build the audit-export fan-out from the
@@ -800,6 +844,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				auditWebhookBatchSize, allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
 				heartbeatInterval, heartbeatGap,
+				auditExportHealthInterval,
 				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 				upstreamURL,
 			)
@@ -1119,6 +1164,25 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"stderr + flips /healthz status to 'degraded'). Default 0 "+
 			"resolves to 2.5x --heartbeat-interval. Has no effect when "+
 			"--heartbeat-interval is 0.")
+
+	// [[audit-export-failure-visibility]] Part 3: periodic
+	// audit_export_degraded alert when the export pipeline itself is
+	// failing (log perm-denied / disk full / webhook unreachable /
+	// webhook auth failed). Default 0 disables — operator opt-in. The
+	// /healthz audit_export_health block + the `dbounce audit-export
+	// health` CLI command remain available regardless of this flag;
+	// this flag controls only the periodic OCSF alert + stderr line.
+	// Sibling agents in ibounce + kbounce ship the SAME flag name so
+	// a cross-product SIEM rule keyed on rule_id="audit_export_
+	// degraded" works for all three.
+	cmd.Flags().StringVar(&auditExportHealthIntervalStr, "audit-export-health-interval", "0",
+		"Poll the audit-export pipeline at this cadence + fire the "+
+			"audit_export_degraded OCSF SECURITY_ALERT when degraded "+
+			"(log writes failing, webhook unreachable, webhook auth "+
+			"failed). Default 0 disables. Practical range 5s-1h; "+
+			"recommended 30s. Independent of --heartbeat-interval. "+
+			"Per [[audit-export-failure-visibility]]: silent audit "+
+			"failures are a stealth bypass; making them loud is the fix.")
 	return cmd
 }
 
@@ -1144,6 +1208,7 @@ func buildAuditExporter(
 	allowInternalWebhook bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
 	heartbeatInterval, heartbeatGap time.Duration,
+	auditExportHealthInterval time.Duration,
 	listenerHost, upstreamURL string,
 ) (*audit.Exporter, error) {
 	var logWriter *audit.LogWriter
@@ -1212,11 +1277,13 @@ func buildAuditExporter(
 				"either pair them or drop both flags")
 	}
 
-	// Heartbeat can run on its own (stderr line + /healthz degraded
-	// flag are useful even without an export transport); when no
-	// transport AND no heartbeat is configured, the exporter is a
+	// Heartbeat / health-monitor can run on their own (stderr line +
+	// /healthz degraded flag are useful even without an export
+	// transport); when no transport AND no heartbeat AND no
+	// audit-export-health monitor is configured, the exporter is a
 	// no-op (FREE-tier default).
-	if logWriter == nil && webhookPusher == nil && heartbeatInterval == 0 {
+	if logWriter == nil && webhookPusher == nil &&
+		heartbeatInterval == 0 && auditExportHealthInterval == 0 {
 		return nil, nil
 	}
 	upstreamHost := ""
@@ -1243,6 +1310,23 @@ func buildAuditExporter(
 		// proxy is still binding listeners — earliest possible
 		// "alive" signal to the SIEM.
 		hb.Start()
+	}
+	// [[audit-export-failure-visibility]] Part 3: wire the periodic
+	// audit_export_degraded alert monitor. Independent of heartbeat
+	// — operators may want the audit-export health alert WITHOUT the
+	// heartbeat (e.g. they're already tracking absence externally via
+	// the JSONL log file size). Same shutdown-ordering invariant: the
+	// monitor stops FIRST in Exporter.Shutdown so its in-flight Emit
+	// drains before transports close.
+	if auditExportHealthInterval > 0 {
+		mon := audit.NewExportHealthMonitor(audit.ExportHealthMonitorOptions{
+			Exporter: exp,
+			Interval: auditExportHealthInterval,
+			Stderr:   os.Stderr,
+			Host:     listenerHost,
+		})
+		exp.HealthMonitor = mon
+		mon.Start()
 	}
 	return exp, nil
 }

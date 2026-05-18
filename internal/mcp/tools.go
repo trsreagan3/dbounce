@@ -191,9 +191,13 @@ func ToolDescriptors() []map[string]any {
 				"the Bearer token is NEVER surfaced). Also returns the heartbeat " +
 				"block when --heartbeat-interval was set: emitted count, gap_fired, " +
 				"missed_ticks, and degraded flag per " +
-				"[[prompt-injection-disable-bouncer-threat]]. Use this to verify " +
-				"the audit-export is healthy before relying on its output for " +
-				"compliance / security-team review. Composes with " +
+				"[[prompt-injection-disable-bouncer-threat]]. Additionally returns " +
+				"the audit_export_health derived view per " +
+				"[[audit-export-failure-visibility]]: log_writes_ok, " +
+				"webhook_consecutive_failures, webhook_last_success_seconds_ago, " +
+				"auth_failed, plus the top-level degraded flag + reason. Use this " +
+				"to verify the audit-export is healthy before relying on its " +
+				"output for compliance / security-team review. Composes with " +
 				"[[security-team-audit-export]] + [[ibounce-honest-positioning]] " +
 				"(operator-visibility, not adversary defense).",
 			"inputSchema": map[string]any{

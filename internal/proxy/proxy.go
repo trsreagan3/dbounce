@@ -1256,16 +1256,29 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	// only). Per the spec docstring: token absence from /healthz is
 	// a tested invariant.
 	type HealthzAuditExport = audit.ExporterStatus
+	// HealthzAuditExportHealth surfaces the [[audit-export-failure-
+	// visibility]] derived view: per-transport health + the aggregate
+	// degraded flag + the human-readable reason. Distinct from
+	// AuditExport (which is the raw per-transport counters) so a
+	// downstream monitor scraping /healthz can read either the raw
+	// view or the health-derived view depending on what its
+	// alerting rule needs. The derived view also drives the 503 flip
+	// below — when audit_export_health.degraded=true, /healthz
+	// returns 503 so external monitors / Kubernetes liveness probes
+	// alert. Per the memo: silently-failing audit IS a stealth
+	// bypass; making it loud closes the gap.
+	type HealthzAuditExportHealth = audit.ExportHealth
 	payload := struct {
-		Status              string             `json:"status"`
-		Mode                string             `json:"mode"`
-		DefaultPolicy       string             `json:"default_policy"`
-		Dialect             string             `json:"dialect"`
-		ActiveProfile       string             `json:"active_profile"`
-		DecisionsCount      int64              `json:"decisions_count"`
-		LookupErrorsCounter int64              `json:"lookup_errors_counter"`
-		Pause               *HealthzPause      `json:"pause"`
-		AuditExport         *HealthzAuditExport `json:"audit_export,omitempty"`
+		Status              string                    `json:"status"`
+		Mode                string                    `json:"mode"`
+		DefaultPolicy       string                    `json:"default_policy"`
+		Dialect             string                    `json:"dialect"`
+		ActiveProfile       string                    `json:"active_profile"`
+		DecisionsCount      int64                     `json:"decisions_count"`
+		LookupErrorsCounter int64                     `json:"lookup_errors_counter"`
+		Pause               *HealthzPause             `json:"pause"`
+		AuditExport         *HealthzAuditExport       `json:"audit_export,omitempty"`
+		AuditExportHealth   *HealthzAuditExportHealth `json:"audit_export_health,omitempty"`
 	}{
 		Status:              "ok",
 		Mode:                string(s.cfg.Mode),
@@ -1298,6 +1311,17 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		// [[prompt-injection-disable-bouncer-threat]]: the gap alert
 		// fires on stderr + OCSF + here in lockstep.
 		if st.Heartbeat != nil && st.Heartbeat.Degraded {
+			payload.Status = "degraded"
+		}
+		// [[audit-export-failure-visibility]] /healthz section: surface
+		// per-transport health + aggregate Degraded flag. When
+		// degraded, flip the response status so external monitors
+		// alert (same 503 pathway the heartbeat watchdog uses). The
+		// derived health view computes from race-free atomic reads of
+		// the per-transport stats; no per-decision overhead.
+		health := s.auditExporter.Health()
+		payload.AuditExportHealth = &health
+		if health.Degraded {
 			payload.Status = "degraded"
 		}
 	}

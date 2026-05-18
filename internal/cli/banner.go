@@ -148,6 +148,18 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 				"heartbeat            : every %s  (gap-threshold %s)\n",
 				st.Heartbeat.Interval, st.Heartbeat.GapThreshold)
 		}
+		// Audit-export health monitor — per
+		// [[audit-export-failure-visibility]]. Surfaces when the operator
+		// opted into the periodic audit_export_degraded alert. The
+		// passive /healthz audit_export_health block is ALWAYS available
+		// when an exporter is wired; the banner line names the monitor
+		// only when the operator set the interval explicitly.
+		if opts.AuditExporter.HealthMonitor != nil &&
+			opts.AuditExporter.HealthMonitor.Configured() {
+			fmt.Fprintln(w,
+				"audit-export health  : monitored (periodic audit_export_degraded "+
+					"alert on log/webhook failure)")
+		}
 	}
 	fmt.Fprintln(w, "Ctrl+C to stop.")
 }

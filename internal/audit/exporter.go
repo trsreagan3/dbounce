@@ -38,6 +38,14 @@ type Exporter struct {
 	Log       *LogWriter
 	Webhook   *WebhookPusher
 	Heartbeat *Heartbeater
+	// HealthMonitor is the [[audit-export-failure-visibility]] poll
+	// goroutine that fires the audit_export_degraded alert when the
+	// pipeline itself is failing. Nil = no periodic alerting; /healthz
+	// + the audit-export health CLI remain the failure-visibility
+	// channels. Stopped FIRST in Shutdown so its in-flight Emit
+	// drains before transports close (mirrors the Heartbeat
+	// ordering invariant).
+	HealthMonitor *ExportHealthMonitor
 
 	// host is the proxy listener address ("127.0.0.1:5433") stamped
 	// onto every event's Event.Host field. Provided at construction
@@ -126,6 +134,13 @@ func (e *Exporter) emit(ctx context.Context, evt Event) error {
 func (e *Exporter) Shutdown(ctx context.Context) error {
 	if e == nil {
 		return nil
+	}
+	// [[audit-export-failure-visibility]] ordering: HealthMonitor
+	// MUST stop FIRST so its in-flight CheckExportHealthAndAlert
+	// finishes its best-effort Emit before the transport channels
+	// close. Same invariant as Heartbeat.Stop below.
+	if e.HealthMonitor != nil {
+		e.HealthMonitor.Stop()
 	}
 	if e.Heartbeat != nil {
 		e.Heartbeat.Stop()
