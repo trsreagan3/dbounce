@@ -184,6 +184,12 @@ func newRootCmd() *cobra.Command {
 	// muscle-memory shortcut works across all three products.
 	root.AddCommand(newDiagnosticsCmd())
 	root.AddCommand(newDiagnosticsDiagAliasCmd())
+	// #279 SQLite backup/restore. Top-level subcommands (NOT under
+	// `dbounce config`) — see internal/cli/backup.go for the verb-
+	// choice rationale + the cross-product alignment with kbounce +
+	// ibounce.
+	root.AddCommand(newBackupCmd())
+	root.AddCommand(newRestoreCmd())
 	return root
 }
 

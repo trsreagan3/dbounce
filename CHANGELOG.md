@@ -5,6 +5,39 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### SQLite backup + restore (#279, 2026-05-18)
+
+Two new top-level subcommands ship online backup + structured restore of
+the dbounce state.db for migration / DR / audit-trail preservation:
+
+- **`dbounce backup --out PATH [--include-audit] [--include-prompts]`**
+  — uses SQLite's `VACUUM INTO` for atomic online backup; the source
+  database is NOT locked, concurrent writers continue. Default excludes
+  the two high-volume tables (`pending_audit_events`,
+  `pending_prompts`); opt in via flag. Embeds a `dbounce_backup_metadata`
+  table carrying dbounce_version, created_at (RFC3339),
+  source_hostname_hash (sha256[:12]), schema_version, and the included
+  flags.
+- **`dbounce restore --in PATH [--force]`** — wholesale file-level
+  replacement of state.db. Validates schema_version (HARD; --force
+  does NOT override — cross-schema migration is `dbounce migrate`
+  territory), dbounce_version (soft; --force overrides with a warning),
+  destination-empty (unless --force), and probes loopback ports
+  5433 + 8768 to refuse if `dbounce run` is alive. Emits row counts +
+  sha256 of the restored DB.
+- **Cross-product alignment** per [[cross-product-agent-parity]]:
+  kbounce + ibounce ship the same CLI shape + flag names + metadata-
+  table format. The product-namespaced metadata-table name
+  (`dbounce_backup_metadata` / `kbounce_backup_metadata` /
+  `iam_jit_backup_metadata`) lets shared tooling tell which product
+  produced a given backup file.
+- **ADMIN_ACTION audit events**: `backup.create` + `backup.restore`
+  enqueue via the same pending_audit_events queue as every other admin
+  mutation.
+- **Docs**: `docs/BACKUP-RESTORE.md` covers the why, the
+  online-vs-stop-required contract, schema-version safety, and a sample
+  session.
+
 ### Bulk-prompt-answer UX (2026-05-18)
 
 Closes the "block-happy = uninstalled" failure mode per
