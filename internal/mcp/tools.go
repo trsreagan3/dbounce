@@ -274,5 +274,23 @@ func ToolDescriptors() []map[string]any {
 				},
 			},
 		},
+		{
+			"name": "list_audit_webhook_presets",
+			"description": "#259 — return the cross-product list of audit-" +
+				"webhook preset shapes the bouncer speaks, each preset's " +
+				"auth header convention + body shape + which CLI flags it " +
+				"requires / accepts as optional. Per [[audit-webhook-presets]] " +
+				"+ [[cross-product-agent-parity]]: identical JSON shape across " +
+				"ibounce / kbounce / dbounce so an agent that wants to ask " +
+				"'which webhook shape should I configure for this operator's " +
+				"Datadog org?' gets a structured answer regardless of which " +
+				"Bounce product it's talking to. READ-ONLY; no side effects; " +
+				"safe for agents to poll. Returns the SAME descriptor list " +
+				"`dbounce audit-webhook presets list --json` emits.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
 	}
 }

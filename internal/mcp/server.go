@@ -399,6 +399,8 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolPromptsBulkPending(args)
 	case "dbounce_prompts_bulk_answer":
 		return s.toolPromptsBulkAnswer(args)
+	case "list_audit_webhook_presets":
+		return s.toolListAuditWebhookPresets(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
@@ -995,6 +997,28 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 	out["dropped_events"] = totalDropped
 	out["last_error"] = lastErr
 	return out, nil
+}
+
+// toolListAuditWebhookPresets is the agent-facing surface mirroring
+// `dbounce audit-webhook presets list --json`. Returns the same
+// descriptor list the CLI emits so an agent can discover the webhook
+// preset shapes the bouncer speaks without spawning a subprocess.
+//
+// Per [[cross-product-agent-parity]]: identical JSON shape across
+// ibounce / kbounce / dbounce. Per [[scorer-is-ground-truth]]: the
+// descriptor list is static — the tool just defers to the shared
+// audit.PresetDescriptors helper.
+func (s *Server) toolListAuditWebhookPresets(_ map[string]any) (map[string]any, error) {
+	descriptors := audit.PresetDescriptors()
+	body, err := json.Marshal(descriptors)
+	if err != nil {
+		return nil, fmt.Errorf("list_audit_webhook_presets: marshal: %w", err)
+	}
+	var presets []map[string]any
+	if err := json.Unmarshal(body, &presets); err != nil {
+		return nil, fmt.Errorf("list_audit_webhook_presets: unmarshal: %w", err)
+	}
+	return map[string]any{"presets": presets}, nil
 }
 
 // ---------------------------------------------------------------------

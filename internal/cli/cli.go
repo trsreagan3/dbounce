@@ -142,6 +142,11 @@ func newRootCmd() *cobra.Command {
 	// the cross-product "audit-export health" pattern shared with
 	// ibounce + kbounce.
 	root.AddCommand(newAuditExportCmd())
+	// `dbounce audit-webhook presets list` (#259) — operator-facing
+	// CLI to enumerate the webhook preset shapes the binary speaks.
+	// Sibling to `audit-export health`; cross-product parity with
+	// ibounce + kbounce per [[cross-product-agent-parity]].
+	root.AddCommand(newAuditWebhookCmd())
 	// [[basic-app-hygiene-features]] TIER 1 #1: `dbounce config
 	// export | import` ships a portable JSON bundle of the runtime
 	// configuration so an operator can back up, move, or change-

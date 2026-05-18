@@ -67,6 +67,108 @@ const (
 	PresetSentinel   Preset = "sentinel"
 )
 
+// AllPresets is the canonical list of supported preset names. Used
+// by CLI flag validation + by docs / banner output to enumerate the
+// available adapters.
+func AllPresets() []Preset {
+	return []Preset{PresetGeneric, PresetDatadog, PresetSplunkHEC, PresetSentinel}
+}
+
+// PresetDescriptor is the cross-product descriptor shape returned by
+// both the CLI (`dbounce audit-webhook presets list --json`) and
+// the MCP tool (`list_audit_webhook_presets`). Field set matches
+// the ibounce + kbounce descriptor shape byte-for-byte so an agent
+// calling the matching tool on any bouncer sees identical JSON.
+// Per [[cross-product-agent-parity]].
+type PresetDescriptor struct {
+	Name          string   `json:"name"`
+	Description   string   `json:"description"`
+	AuthHeader    string   `json:"auth_header"`
+	BodyShape     string   `json:"body_shape"`
+	RequiredFlags []string `json:"required_flags"`
+	OptionalFlags []string `json:"optional_flags"`
+}
+
+// PresetDescriptors returns the static, in-binary descriptor list
+// for every audit-webhook preset dbounce speaks.
+//
+// Exposed in the audit package so both the CLI surface and the MCP
+// tool can import it without creating a circular dependency.
+// Per [[scorer-is-ground-truth]] + [[don't-tailor-to-lighthouse]]:
+// hand-maintained here. A test asserts every name returned by
+// AllPresets() shows up in this list (preventing silent drift).
+func PresetDescriptors() []PresetDescriptor {
+	return []PresetDescriptor{
+		{
+			Name: "generic",
+			Description: "Default. Bearer token in Authorization + JSON " +
+				"body. Byte-identical to the pre-#257 wire shape; existing " +
+				"webhook consumers + custom ingest scripts keep working " +
+				"without code changes.",
+			AuthHeader: "Authorization: Bearer <token>",
+			BodyShape:  "NDJSON of OCSF v1.1.0 class 6003 events",
+			RequiredFlags: []string{
+				"--audit-webhook-url",
+				"--audit-webhook-token",
+			},
+			OptionalFlags: []string{
+				"--audit-webhook-batch-size",
+			},
+		},
+		{
+			Name: "datadog",
+			Description: "Datadog Logs HTTP intake. OCSF event overlaid " +
+				"with DD-native fields (ddsource, service, ddtags, status, " +
+				"message); the OCSF payload remains queryable as nested " +
+				"fields. Vendor-reserved field collisions (status, host) " +
+				"preserve the OCSF original under ocsf.<name>.",
+			AuthHeader: "DD-API-KEY: <api_key>",
+			BodyShape: "JSON array of OCSF events, each overlaid with " +
+				"Datadog-native overlay fields",
+			RequiredFlags: []string{
+				"--audit-webhook-url",
+				"--audit-webhook-token",
+			},
+			OptionalFlags: []string{
+				"--audit-webhook-tags",
+			},
+		},
+		{
+			Name: "splunk-hec",
+			Description: "Splunk HTTP Event Collector. NDJSON body where " +
+				"each line wraps the OCSF event under HEC's `event` " +
+				"envelope; sourcetype + source + host + time are set from " +
+				"OCSF metadata.",
+			AuthHeader: "Authorization: Splunk <hec_token>",
+			BodyShape: "NDJSON; each line is one HEC envelope wrapping " +
+				"one OCSF event",
+			RequiredFlags: []string{
+				"--audit-webhook-url",
+				"--audit-webhook-token",
+			},
+			OptionalFlags: []string{},
+		},
+		{
+			Name: "sentinel",
+			Description: "Microsoft Sentinel / Log Analytics Workspace " +
+				"via the Data Collector API. HMAC-SHA256-signed SharedKey " +
+				"auth computed over the canonical (method, content-length, " +
+				"content-type, x-ms-date, resource) string keyed by the " +
+				"base64-decoded workspace shared key. The token value MUST " +
+				"be the base64-encoded shared key.",
+			AuthHeader: "Authorization: SharedKey <workspace-id>:<HMAC-SHA256>",
+			BodyShape:  "JSON array of OCSF events",
+			RequiredFlags: []string{
+				"--audit-webhook-url",
+				"--audit-webhook-token",
+			},
+			OptionalFlags: []string{
+				"--audit-webhook-sentinel-table",
+			},
+		},
+	}
+}
+
 // DefaultSentinelTable is the Log Analytics custom-table name when
 // the operator doesn't override via --audit-webhook-sentinel-table.
 // Per the memo: one custom table across all three Bounce products

@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/trsreagan3/dbounce/schemas/dbounce-config.schema.json",
+  "title": "dbounce config export/import bundle",
+  "description": "Portable, human-reviewable snapshot of a dbounce deployment's runtime configuration. Produced by `dbounce config export`; consumed by `dbounce config import`. Per [[basic-app-hygiene-features]] TIER 1 #1.\n\nWire-shape parity (#288): top-level `schema_version` (string semver) + `product` field match ibounce + gbounce + kbounce so one cross-product backup script reads identically across the suite. The pre-#288 shape (`format: \"dbounce.config\"` + `format_version: 1` (int) + int `schema_version` naming the store-schema version) is still accepted by the importer; it's normalized to the canonical shape before validation runs, with a stderr deprecation warning. The compat window stays open across the full v1.x line.\n\nDialect handling: runtime_config.dialect names one of the four supported dialects. Each profile may declare which dialects it applies to (preserved on round-trip). The active rule pack is referenced by name+version (NOT embedded — pack content ships with the binary).\n\nSchema additions are backwards-compatible: importers MUST tolerate unknown top-level fields + unknown sub-fields under rules/profiles items.",
+  "type": "object",
+  "required": ["schema_version", "product", "exported_at", "store_schema_version", "runtime_config", "rules", "profiles"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1.0"],
+      "description": "Wire-format version (string semver). Currently \"1.0\" per the #288 cross-product reconciliation. Bumps to \"1.1\" (additive) or \"2.0\" (breaking) preserve the parser shape across version drift. The pre-#288 shape used int 1 here to mean the STORE schema version — importers accept that legacy form and rename it to `store_schema_version` before validation."
+    },
+    "product": {
+      "type": "string",
+      "enum": ["dbounce"],
+      "description": "Product name. Must be \"dbounce\" for a dbounce import — the importer refuses bundles from sibling Bounce products. Replaces the pre-#288 `format: \"dbounce.config\"` magic string (same semantic, the cross-product-canonical field name)."
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp the export ran."
+    },
+    "exported_by": {
+      "type": "string",
+      "description": "Operator id captured at export. Same resolution as --actor on every other admin command ($USER fallback, then 'unknown')."
+    },
+    "dbounce_version": {
+      "type": "string",
+      "description": "The exporter's `dbounce --version` string. Informational; importers MAY warn on a major-version mismatch but MUST NOT reject."
+    },
+    "source_hostname_hash": {
+      "type": "string",
+      "description": "sha256[:12] of os.Hostname() at export time. Privacy-preserving attribution: a reviewer can tell two bundles produced on different hosts apart without leaking the literal hostname into a file the operator may share. Matches the kbounce + ibounce + gbounce + dbounce-backup-metadata convention."
+    },
+    "store_schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The store.SchemaVersion at export time. Import refuses when the importer's store schema is older than the exporter's (older binary cannot read a newer-schema bundle). Equal or newer importer store-schema is always accepted (additive migrations only — see store.go). Renamed from pre-#288 `schema_version` to break the field-name collision with the new wire-format `schema_version` (string semver)."
+    },
+    "runtime_config": {
+      "type": "object",
+      "required": ["dialect"],
+      "additionalProperties": true,
+      "properties": {
+        "dialect": {
+          "type": "string",
+          "enum": ["postgres", "mysql", "snowflake", "bigquery"],
+          "description": "Active dialect at export time. Import refuses when --dialect on the importing host does not match (a postgres bundle MUST NOT silently land on a mysql deployment). Override the check with --force at your own risk."
+        }
+      }
+    },
+    "rule_pack": {
+      "type": ["object", "null"],
+      "description": "Reference to the dialect's embedded rule pack (BY NAME + VERSION — content lives in the binary at internal/packs/<dialect>.yaml; never inlined here so bundles stay small + dialect-pack drift across dbounce versions surfaces explicitly at import).",
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Pack name matching the dialect (postgres, mysql, snowflake, bigquery)."
+        },
+        "version": {
+          "type": "string",
+          "description": "Pack metadata.version from the embedded YAML. Importer warns when the binary's pack version differs from the bundle's."
+        },
+        "calibration_status": {
+          "type": "string",
+          "description": "Pack metadata.calibration_status (calibrated / provisional / experimental). Informational; per [[scorer-is-ground-truth]] the operator MUST surface this in their change-management review."
+        },
+        "embedded": {
+          "type": "boolean",
+          "description": "Always true in v1 (packs always live in the binary). Reserved for a future external-pack feature."
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "description": "Every row in the rules table at export time. Insertion order preserved. Per [[creates-never-mutates]] import APPENDS — it never edits or removes existing rules. The optional `id` field is informational (the original row id); on import a fresh id is assigned by AddRule.",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "effect"],
+        "additionalProperties": true,
+        "properties": {
+          "id": {"type": "integer"},
+          "pattern": {"type": "string"},
+          "effect": {"type": "string", "enum": ["allow", "deny"]},
+          "schema_scope": {"type": "string"},
+          "table_scope": {"type": "string"},
+          "function_scope": {"type": "string"},
+          "note": {"type": "string"},
+          "origin": {"type": "string"},
+          "dialects": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["postgres", "mysql", "snowflake", "bigquery"]},
+            "description": "Per-rule dialect tags derived from the table-glob prefix (matches inferDialectsFromRulePattern). Empty/omitted means dialect-agnostic. Round-tripped for human review; not consulted by the rule engine."
+          }
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "required": ["items"],
+      "additionalProperties": true,
+      "properties": {
+        "active": {
+          "type": "string",
+          "description": "The profile name selected via --profile / DBOUNCE_PROFILE at export time (or empty when none)."
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute path the profiles.yaml was loaded from. Informational; the importer writes to its own configured profiles.yaml path, never to this one."
+        },
+        "items": {
+          "type": "array",
+          "description": "Full profile entries. Imported via AddLocalProfile per [[creates-never-mutates]]: an existing same-named profile is reported + skipped (use --replace to overwrite). Non-local-source profiles (Source != \"\" + Source != \"local\") are preserved on export but SKIPPED on import — they belong to a `profile install --from URL` flow.",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": true,
+            "properties": {
+              "name": {"type": "string"},
+              "description": {"type": "string"},
+              "source": {"type": "string"},
+              "allow_baseline": {"type": "string"},
+              "deny_ast_mutating_nodes": {"type": "boolean"},
+              "deny_actions": {"type": "array", "items": {"type": "string"}},
+              "deny_keywords": {"type": "array", "items": {"type": "string"}},
+              "keyword_match": {"type": "string"},
+              "keyword_targets": {"type": "array", "items": {"type": "string"}},
+              "exempt_resources": {"type": "array", "items": {"type": "string"}},
+              "exempt_actions": {"type": "array", "items": {"type": "string"}},
+              "exceptions": {"type": "array", "items": {"type": "string"}},
+              "allow_rules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {"type": "string"},
+                    "note": {"type": "string"}
+                  }
+                }
+              },
+              "dialects": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["postgres", "mysql", "snowflake", "bigquery"]},
+                "description": "Per-profile dialect tags derived from inferDialectsFromProfileNames. Empty/omitted means dialect-agnostic. Preserved on round-trip so a reviewer can see which dialects a profile was authored for."
+              }
+            }
+          }
+        }
+      }
+    },
+    "pause": {
+      "type": ["object", "null"],
+      "description": "Active pause window at export time (or null when none). Pause windows are operational state — not re-played on import; included for informational change-management review.",
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "integer"},
+        "started_at": {"type": "string"},
+        "ends_at": {"type": "string"},
+        "reason": {"type": "string"},
+        "started_by": {"type": "string"}
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "description": "Active task scopes at export time. Operational state — NOT re-played on import; included for informational change-management review (the importing host may have its own active tasks).",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "task_id": {"type": "string"},
+          "description": {"type": "string"},
+          "started_at": {"type": "string"},
+          "expires_at": {"type": "string"},
+          "started_by": {"type": "string"},
+          "owner": {"type": "string"}
+        }
+      }
+    }
+  }
+}
