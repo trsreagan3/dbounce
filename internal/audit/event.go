@@ -40,6 +40,7 @@
 package audit
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -94,6 +95,19 @@ const (
 	// activity_id=99 (Other); activity_name="session_ended"; severity
 	// Informational (this is bookkeeping, not an alert).
 	EventTypeSessionEnded EventType = "SESSION_ENDED"
+
+	// EventTypeHeartbeat is the periodic liveness signal emitted by the
+	// Heartbeater goroutine when --heartbeat-interval is configured. Per
+	// [[prompt-injection-disable-bouncer-threat]]: an attacker who
+	// induces an operator (or an AI agent) to disable / pause / kill
+	// the bouncer eliminates dbounce's audit + gating surface; the
+	// HEARTBEAT cadence lets a SIEM consumer alert on the ABSENCE of
+	// recent heartbeats. Sibling agents in ibounce + kbounce ship the
+	// same event under the same schema so one cross-product absence
+	// rule catches all three. activity_id=99 (Other); activity_name=
+	// "heartbeat"; severity Informational (this is bookkeeping, not an
+	// alert — the GAP alert below is the elevated signal).
+	EventTypeHeartbeat EventType = "HEARTBEAT"
 )
 
 // Product names the originating Bounce product. Stamped into
@@ -790,6 +804,19 @@ const (
 	// UNDROP / un-allowlisted CALL / DML against a sensitive schema).
 	// The per-dialect verb table lives in alerts.go::highRiskByDialect.
 	AlertRuleUnusualHighRiskAction AlertRuleID = "unusual_high_risk_action"
+
+	// AlertRuleHeartbeatGap fires when the in-process Heartbeater's
+	// watchdog detects the tick loop fell behind by more than
+	// (Interval + GapThreshold). Per
+	// [[prompt-injection-disable-bouncer-threat]]: catches the case
+	// where the bouncer process was suspended / CPU-throttled /
+	// debugger-attached / paused but didn't fully die — the heartbeats
+	// went silent for long enough that a SIEM would otherwise have to
+	// wait for its own absence-detection window. The gap alert lands
+	// on the export channel BEFORE the silence is wide enough to look
+	// like a full disable. Sibling agents in ibounce + kbounce ship
+	// the same rule_id so a cross-product SIEM correlation works.
+	AlertRuleHeartbeatGap AlertRuleID = "heartbeat_gap"
 )
 
 // AlertSeverity names the SECURITY_ALERT severity level. Maps to OCSF
@@ -931,6 +958,120 @@ func NewSessionEndedEvent(agent Agent, host string) Event {
 				EventType: string(EventTypeSessionEnded),
 				Enforced:  false,
 				Agent:     agentPtrOrNil(agent),
+			},
+		},
+	}
+}
+
+// NewHeartbeatEvent constructs the synthetic periodic-liveness event
+// the Heartbeater emits on each tick. Per
+// [[prompt-injection-disable-bouncer-threat]]: the heartbeat cadence
+// is the cross-product signal a SIEM uses to detect a disabled /
+// killed / suspended bouncer. Severity Informational keeps the volume
+// below the dashboard noise floor while still indexable for absence
+// detection.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "heartbeat", type_uid=600399, severity_id=1 (Informational),
+// status_id=99 (Other). The interval is stamped under
+// unmapped.iam_jit.ext.interval_seconds so a SIEM operator triaging
+// an absence alert can answer "how often SHOULD this bouncer be
+// emitting?" without a JOIN against config.
+func NewHeartbeatEvent(host string, interval time.Duration) Event {
+	ext := map[string]any{
+		"interval_seconds": interval.Seconds(),
+	}
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "heartbeat",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: "bouncer alive",
+		API: API{
+			Operation: "heartbeat",
+		},
+		SrcEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeHeartbeat),
+				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
+// NewHeartbeatGapEvent constructs the SECURITY_ALERT event the
+// Heartbeater's watchdog emits when the tick loop fell behind by more
+// than (Interval + GapThreshold). Per
+// [[prompt-injection-disable-bouncer-threat]]: this is the
+// in-process counterpart to the SIEM-side absence detection — the
+// alert reaches the SIEM via the export channel BEFORE the silence
+// is wide enough to register as a full disable.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "heartbeat_gap", type_uid=600399, severity_id=3 (Medium),
+// status_id=99 (Other). Per [[security-team-positioning-safety-not-
+// surveillance]]: status_detail is NEUTRAL — names the observation
+// + suggests redistribution; never accuses the operator.
+func NewHeartbeatGapEvent(host string, interval, threshold, observed time.Duration) Event {
+	detail := fmt.Sprintf(
+		"heartbeat gap observed (last tick %s ago; interval %s; "+
+			"threshold %s); consider distributing the proxy onto a "+
+			"non-throttled instance",
+		observed.Round(time.Millisecond), interval, threshold)
+	ext := map[string]any{
+		"rule_id":              string(AlertRuleHeartbeatGap),
+		"interval_seconds":     interval.Seconds(),
+		"threshold_seconds":    threshold.Seconds(),
+		"observed_gap_seconds": observed.Seconds(),
+	}
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: string(AlertRuleHeartbeatGap),
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityMediumID,
+		Severity:     ocsfSeverityMedium,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		SrcEndpoint:  parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeSecurityAlert),
+				Enforced:  false,
+				Ext:       ext,
 			},
 		},
 	}

@@ -909,6 +909,33 @@ func (s *Server) toolAuditExportStatus(_ map[string]any) (map[string]any, error)
 			lastErr += "webhook: " + st.Webhook.LastError
 		}
 	}
+	// Heartbeat surface — periodic OCSF liveness events + the
+	// in-process gap watchdog per
+	// [[prompt-injection-disable-bouncer-threat]]. Only surfaced when
+	// --heartbeat-interval was set; configured=false otherwise so a
+	// downstream agent can branch on whether the operator opted in.
+	if st.Heartbeat != nil {
+		out["heartbeat"] = map[string]any{
+			"configured":          st.Heartbeat.Configured,
+			"interval":            st.Heartbeat.Interval,
+			"gap_threshold":       st.Heartbeat.GapThreshold,
+			"emitted":             st.Heartbeat.Emitted,
+			"gap_fired":           st.Heartbeat.GapFired,
+			"missed_ticks":        st.Heartbeat.MissedTicks,
+			"degraded":            st.Heartbeat.Degraded,
+			"last_tick_unix_nano": st.Heartbeat.LastTickUnixNano,
+		}
+		if st.Heartbeat.Degraded {
+			if lastErr != "" {
+				lastErr += "; "
+			}
+			lastErr += "heartbeat: gap watchdog degraded"
+		}
+	} else {
+		out["heartbeat"] = map[string]any{
+			"configured": false,
+		}
+	}
 	out["total_events"] = totalEvents
 	out["dropped_events"] = totalDropped
 	out["last_error"] = lastErr

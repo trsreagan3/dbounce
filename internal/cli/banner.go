@@ -139,6 +139,15 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 				"audit-export webhook : %s  (batch=%d, queue=%d; ENTERPRISE — token masked)\n",
 				st.Webhook.URLRedacted, st.Webhook.BatchSize, st.Webhook.QueueLimit)
 		}
+		// Heartbeat — per [[prompt-injection-disable-bouncer-threat]].
+		// Surfaces the cadence the SIEM should expect; absence detection
+		// works at the SIEM end. The in-process gap watchdog handles
+		// the case where the bouncer was throttled/suspended.
+		if st.Heartbeat != nil && st.Heartbeat.Configured {
+			fmt.Fprintf(w,
+				"heartbeat            : every %s  (gap-threshold %s)\n",
+				st.Heartbeat.Interval, st.Heartbeat.GapThreshold)
+		}
 	}
 	fmt.Fprintln(w, "Ctrl+C to stop.")
 }

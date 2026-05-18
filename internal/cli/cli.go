@@ -457,6 +457,14 @@ func newRunCmd() *cobra.Command {
 		auditWebhookPreset        string
 		auditWebhookTags          string
 		auditWebhookSentinelTable string
+		// Heartbeat — periodic OCSF liveness event + in-process gap
+		// watchdog per [[prompt-injection-disable-bouncer-threat]].
+		// Default OFF (heartbeatInterval == 0). Sibling agents in
+		// ibounce + kbounce ship the SAME flag names so a single
+		// cross-product SIEM rule keyed on activity_name=heartbeat
+		// works for all three.
+		heartbeatIntervalStr     string
+		heartbeatGapThresholdStr string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -730,6 +738,43 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				RedactLiterals:    redactLiterals,
 			}.Normalize()
 
+			// Heartbeat — parse + validate BEFORE the exporter build so a
+			// malformed flag fails fast. Per
+			// [[prompt-injection-disable-bouncer-threat]]: default OFF;
+			// any non-zero positive Interval turns on both the periodic
+			// tick + the in-process gap watchdog.
+			heartbeatInterval, err := time.ParseDuration(heartbeatIntervalStr)
+			if err != nil {
+				return fmt.Errorf(
+					"dbounce: --heartbeat-interval: parse %q: %w",
+					heartbeatIntervalStr, err)
+			}
+			if heartbeatInterval < 0 {
+				return fmt.Errorf(
+					"dbounce: --heartbeat-interval must be >= 0 (got %s); "+
+						"0 disables", heartbeatInterval)
+			}
+			if heartbeatInterval > 0 &&
+				(heartbeatInterval < time.Second || heartbeatInterval > time.Hour) {
+				return fmt.Errorf(
+					"dbounce: --heartbeat-interval must be in 1s-1h when "+
+						"non-zero (got %s); 1s is the minimum credible cadence "+
+						"and 1h is beyond any usable SIEM-absence window",
+					heartbeatInterval)
+			}
+			heartbeatGap, err := time.ParseDuration(heartbeatGapThresholdStr)
+			if err != nil {
+				return fmt.Errorf(
+					"dbounce: --heartbeat-gap-threshold: parse %q: %w",
+					heartbeatGapThresholdStr, err)
+			}
+			if heartbeatGap < 0 {
+				return fmt.Errorf(
+					"dbounce: --heartbeat-gap-threshold must be >= 0 (got %s); "+
+						"0 resolves to 2.5x --heartbeat-interval",
+					heartbeatGap)
+			}
+
 			s := proxy.NewServer(cfg, st)
 
 			// #252 Slice 1: build the audit-export fan-out from the
@@ -741,11 +786,20 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			// #257 webhook presets: vendor-native body/header overlays
 			// are passed through to the WebhookPusher; the preset
 			// adapter dispatches per-batch at send-time.
+			//
+			// Heartbeat is layered on the same exporter — its periodic
+			// HEARTBEAT events + heartbeat_gap SECURITY_ALERTs flow
+			// through whichever transports are configured. When no
+			// transport is wired AND heartbeat is enabled, the
+			// heartbeater still runs (stderr line + /healthz degraded
+			// flag are useful on their own); the OCSF events are simply
+			// dropped on the floor because there's nowhere to send them.
 			auditExporter, exporterErr := buildAuditExporter(
 				auditLogPath, auditLogFsync,
 				auditWebhookURL, auditWebhookToken,
 				auditWebhookBatchSize, allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
+				heartbeatInterval, heartbeatGap,
 				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 				upstreamURL,
 			)
@@ -757,7 +811,9 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				// Close the exporter AFTER the proxy shuts down so any
 				// in-flight final-decision events get drained to disk +
 				// flushed to webhook. 5s is the same shutdown budget the
-				// proxy uses for its other transports.
+				// proxy uses for its other transports. Exporter.Shutdown
+				// stops the heartbeater FIRST (see exporter.go) so its
+				// in-flight final tick drains before transports close.
 				defer func() {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
@@ -1043,23 +1099,51 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"dbounce + kbounce + ibounce rows; operators who prefer per-product "+
 			"tables override this per-deployment. Sentinel custom-log tables "+
 			"have a max name length of 100 chars + must match [A-Za-z0-9_]+.")
+	// Heartbeat — periodic OCSF liveness event + in-process gap
+	// watchdog per [[prompt-injection-disable-bouncer-threat]]. Default
+	// OFF preserves the safety-not-surveillance posture; opt-in via
+	// --heartbeat-interval. Sibling agents in ibounce + kbounce ship
+	// the SAME flag names so a single cross-product SIEM absence rule
+	// keyed on activity_name=heartbeat works for all three.
+	cmd.Flags().StringVar(&heartbeatIntervalStr, "heartbeat-interval", "0",
+		"Emit a periodic HEARTBEAT OCSF event at this cadence so a SIEM "+
+			"consumer can alert on ABSENCE (the bouncer was killed / "+
+			"paused / suspended). Default 0 disables. Practical range 1s "+
+			"to 1h; recommended 30s for high-fidelity deployments / 5m for "+
+			"low-overhead production. Pairs with --heartbeat-gap-threshold "+
+			"for the in-process gap watchdog (defaults to 2.5x interval). "+
+			"Per [[prompt-injection-disable-bouncer-threat]].")
+	cmd.Flags().StringVar(&heartbeatGapThresholdStr, "heartbeat-gap-threshold", "0",
+		"How far past --heartbeat-interval the in-process watchdog waits "+
+			"before firing a heartbeat_gap SECURITY_ALERT (also writes to "+
+			"stderr + flips /healthz status to 'degraded'). Default 0 "+
+			"resolves to 2.5x --heartbeat-interval. Has no effect when "+
+			"--heartbeat-interval is 0.")
 	return cmd
 }
 
 // buildAuditExporter constructs the #252 Slice 1 audit-export fan-out
 // from CLI flags. Returns nil + nil err when no transports are
-// configured (FREE-tier default). License gate fires BEFORE any IO so
-// a rejected license never opens a webhook connection / creates a log
-// file.
+// configured AND heartbeat is disabled (FREE-tier default). License
+// gate fires BEFORE any IO so a rejected license never opens a webhook
+// connection / creates a log file.
 //
 // listenerHost is the proxy listener "host:port" the exporter stamps
 // onto Event.Host; upstreamURL is the upstream's "host:port" stamped
 // onto Event.Upstream (or empty when observation-only).
+//
+// heartbeatInterval > 0 turns on the Heartbeater (periodic OCSF
+// liveness events + in-process gap watchdog per
+// [[prompt-injection-disable-bouncer-threat]]); heartbeatGap defaults
+// inside the heartbeater when 0. The heartbeater is wired to the same
+// Exporter as decisions + alerts so a SIEM consumes all three streams
+// on one channel.
 func buildAuditExporter(
 	logPath string, logFsync bool,
 	webhookURL, webhookToken string, webhookBatchSize int,
 	allowInternalWebhook bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
+	heartbeatInterval, heartbeatGap time.Duration,
 	listenerHost, upstreamURL string,
 ) (*audit.Exporter, error) {
 	var logWriter *audit.LogWriter
@@ -1128,7 +1212,11 @@ func buildAuditExporter(
 				"either pair them or drop both flags")
 	}
 
-	if logWriter == nil && webhookPusher == nil {
+	// Heartbeat can run on its own (stderr line + /healthz degraded
+	// flag are useful even without an export transport); when no
+	// transport AND no heartbeat is configured, the exporter is a
+	// no-op (FREE-tier default).
+	if logWriter == nil && webhookPusher == nil && heartbeatInterval == 0 {
 		return nil, nil
 	}
 	upstreamHost := ""
@@ -1141,7 +1229,22 @@ func buildAuditExporter(
 			upstreamHost = u.Host
 		}
 	}
-	return audit.NewExporter(logWriter, webhookPusher, listenerHost, upstreamHost), nil
+	exp := audit.NewExporter(logWriter, webhookPusher, listenerHost, upstreamHost)
+	if heartbeatInterval > 0 {
+		hb := audit.NewHeartbeater(audit.HeartbeatOptions{
+			Interval:     heartbeatInterval,
+			GapThreshold: heartbeatGap,
+			Host:         listenerHost,
+			Stderr:       os.Stderr,
+		})
+		hb.SetExporter(exp)
+		exp.Heartbeat = hb
+		// Start immediately so the first HEARTBEAT lands while the
+		// proxy is still binding listeners — earliest possible
+		// "alive" signal to the SIEM.
+		hb.Start()
+	}
+	return exp, nil
 }
 
 // newAuditCmd implements `dbounce audit ...`. D-Slice 1 ships `tail`

@@ -1292,8 +1292,20 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	if s.auditExporter != nil && s.auditExporter.Enabled() {
 		st := s.auditExporter.Status()
 		payload.AuditExport = &st
+		// Heartbeat watchdog degraded → /healthz reports degraded +
+		// returns 503 so a Kubernetes liveness probe / load-balancer
+		// health check drains traffic from a throttled instance. Per
+		// [[prompt-injection-disable-bouncer-threat]]: the gap alert
+		// fires on stderr + OCSF + here in lockstep.
+		if st.Heartbeat != nil && st.Heartbeat.Degraded {
+			payload.Status = "degraded"
+		}
 	}
-	w.WriteHeader(http.StatusOK)
+	status := http.StatusOK
+	if payload.Status == "degraded" {
+		status = http.StatusServiceUnavailable
+	}
+	w.WriteHeader(status)
 	if err := writeJSON(w, payload); err != nil {
 		log.Warn().Err(err).Msg("dbounce: encode /healthz failed")
 	}

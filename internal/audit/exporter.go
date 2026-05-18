@@ -35,8 +35,9 @@ import (
 // Either field MAY be nil — the exporter handles partial configuration
 // gracefully (e.g. operator passed --audit-log-path but no webhook).
 type Exporter struct {
-	Log     *LogWriter
-	Webhook *WebhookPusher
+	Log       *LogWriter
+	Webhook   *WebhookPusher
+	Heartbeat *Heartbeater
 
 	// host is the proxy listener address ("127.0.0.1:5433") stamped
 	// onto every event's Event.Host field. Provided at construction
@@ -117,9 +118,17 @@ func (e *Exporter) emit(ctx context.Context, evt Event) error {
 
 // Shutdown closes every configured transport. Idempotent. Caller MUST
 // stop calling Emit BEFORE Shutdown.
+//
+// Order matters: Heartbeater MUST stop FIRST so its final in-flight
+// tick / gap alert drains to the transports BEFORE Log / Webhook close
+// their channels. Without this, Stop racing with Shutdown can deadlock
+// the heartbeater's emit goroutine on a closed transport channel.
 func (e *Exporter) Shutdown(ctx context.Context) error {
 	if e == nil {
 		return nil
+	}
+	if e.Heartbeat != nil {
+		e.Heartbeat.Stop()
 	}
 	var errs []error
 	if e.Log != nil {
@@ -142,11 +151,12 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 // per-transport stats + a top-level "configured" flag so the tool can
 // answer "is anything wired up?" without inspecting nil fields.
 type ExporterStatus struct {
-	Configured bool         `json:"configured"`
-	Log        *LogStats    `json:"log,omitempty"`
-	Webhook    *WebhookStats `json:"webhook,omitempty"`
-	Host       string       `json:"host,omitempty"`
-	Upstream   string       `json:"upstream,omitempty"`
+	Configured bool            `json:"configured"`
+	Log        *LogStats       `json:"log,omitempty"`
+	Webhook    *WebhookStats   `json:"webhook,omitempty"`
+	Heartbeat  *HeartbeatStats `json:"heartbeat,omitempty"`
+	Host       string          `json:"host,omitempty"`
+	Upstream   string          `json:"upstream,omitempty"`
 }
 
 // Status returns the current per-transport stats. Safe for concurrent
@@ -167,6 +177,10 @@ func (e *Exporter) Status() ExporterStatus {
 	if e.Webhook != nil {
 		s := e.Webhook.Stats()
 		out.Webhook = &s
+	}
+	if e.Heartbeat != nil && e.Heartbeat.Configured() {
+		s := e.Heartbeat.Stats()
+		out.Heartbeat = &s
 	}
 	return out
 }
