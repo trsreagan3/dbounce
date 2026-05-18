@@ -287,3 +287,53 @@ dbounce audit tail \
 # How many of each verdict in the last 1000 rows
 dbounce audit tail --limit 1000 --summary
 ```
+
+---
+
+## HTTP `GET /audit/events` endpoint (`#271`)
+
+dbounce exposes the same query surface as a headless HTTP endpoint on
+its management port (`8768` by default; `--mgmt-host` / `--mgmt-port`
+control the bind):
+
+```
+GET /audit/events?since=ISO8601&until=ISO8601&filter=field=value&filter=...&limit=N&format=jsonl|ocsf-bundle
+```
+
+Same filter language as `dbounce audit tail --filter`, same supported
+field catalog (cross-product OCSF + dbounce-specific
+`unmapped.iam_jit.ext.*` fields). Defaults: `limit=100` (max `1000`),
+`format=jsonl` (one OCSF event per line). Pass `format=ocsf-bundle`
+for a single OCSF v1.1.0 class 2004 Detection Finding wrapping the
+matched events.
+
+### Sample invocations
+
+```bash
+# Loopback bind (default): no auth required.
+curl 'http://127.0.0.1:8768/audit/events?limit=10'
+
+# Filter to one dialect + last hour, NDJSON.
+curl 'http://127.0.0.1:8768/audit/events?filter=api.service.name=postgres&since=2026-05-18T00:00:00Z'
+
+# OCSF Detection Finding bundle for SIEM batch import.
+curl 'http://127.0.0.1:8768/audit/events?format=ocsf-bundle&limit=100'
+```
+
+### Auth model
+
+- **Loopback mgmt-host (default)**: no `Authorization` header
+  required. The dbounce mgmt listener refuses to bind off-loopback
+  without `--i-know-mgmt-binds-externally`.
+- **External mgmt-host**: `dbounce run --i-know-mgmt-binds-externally
+  --mgmt-host 0.0.0.0 --audit-events-token <TOKEN>` is required.
+  Requests must carry `Authorization: Bearer <TOKEN>`. Missing header
+  → 401; wrong token → 403. dbounce refuses to start in external-bind
+  mode without `--audit-events-token`.
+
+### Cross-bouncer query
+
+The `iam-jit audit query` CLI calls this endpoint on every reachable
+bouncer in parallel and merges the results. See
+[`iam-roles/docs/IAM-JIT-AUDIT-QUERY.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/IAM-JIT-AUDIT-QUERY.md)
+for the cross-product correlation workflow.

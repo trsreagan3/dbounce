@@ -507,6 +507,9 @@ func newRunCmd() *cobra.Command {
 		// ibounce + kbounce ship the SAME flag name so cross-product
 		// SIEM alerting cadence is uniform.
 		auditExportHealthIntervalStr string
+		// #271 — bearer token for GET /audit/events when the mgmt port
+		// is bound off-loopback. Empty = loopback-only (no auth gate).
+		auditEventsToken string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -606,6 +609,16 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 						"intentional read-only health endpoint behind a "+
 						"trusted reverse proxy), re-run with "+
 						"--i-know-mgmt-binds-externally.",
+					mgmtHost)
+			}
+			// #271 — GET /audit/events lives on the same mgmt port; an
+			// external bind without a bearer token would expose recent
+			// audit events (statement_type, table names) without auth.
+			// Refuse to start in that shape.
+			if _, ok := loopbackHosts[mgmtHost]; !ok && auditEventsToken == "" {
+				return fmt.Errorf(
+					"dbounce: --audit-events-token TOKEN is required when --mgmt-host %q is non-loopback "+
+						"(GET /audit/events would otherwise be exposed without auth)",
 					mgmtHost)
 			}
 
@@ -778,6 +791,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				SyncPromptTimeout: syncPromptTimeout,
 				SyncPromptDefault: syncPromptDefault,
 				RedactLiterals:    redactLiterals,
+				AuditEventsToken:  auditEventsToken,
 			}.Normalize()
 
 			// Heartbeat — parse + validate BEFORE the exporter build so a
@@ -1212,6 +1226,11 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"recommended 30s. Independent of --heartbeat-interval. "+
 			"Per [[audit-export-failure-visibility]]: silent audit "+
 			"failures are a stealth bypass; making them loud is the fix.")
+	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "",
+		"Bearer token required for GET /audit/events (#271) when the "+
+			"mgmt port is bound externally. Empty + loopback mgmt-host = "+
+			"no auth (the loopback bind is the trust anchor). Empty + "+
+			"external mgmt-host = dbounce refuses to start.")
 	return cmd
 }
 

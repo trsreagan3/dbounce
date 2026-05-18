@@ -297,6 +297,13 @@ type Config struct {
 	// them exactly once via the listener / http.Server it owns.
 	WireListener net.Listener
 	MgmtListener net.Listener
+
+	// AuditEventsToken (#271) is the bearer token clients must present
+	// on GET /audit/events when the mgmt port is bound off-loopback.
+	// Empty + loopback mgmt host = no auth (the loopback bind is the
+	// trust anchor); empty + external mgmt host = the CLI refuses to
+	// start.
+	AuditEventsToken string
 }
 
 // Normalize fills in zero-valued fields with sensible defaults.
@@ -890,6 +897,12 @@ func (s *Server) Serve() error {
 	mgmtAddr := fmt.Sprintf("%s:%d", s.cfg.MgmtHost, s.cfg.MgmtPort)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
+	// #271 — GET /audit/events ships the headless audit-tail query
+	// surface. Same filter language as `dbounce audit tail --filter`;
+	// the cross-bouncer `iam-jit audit query` CLI calls this endpoint
+	// in parallel against each reachable bouncer to produce a single
+	// merged stream.
+	mux.HandleFunc("/audit/events", auditEventsHandler(s.store, s.cfg.AuditEventsToken))
 	s.mgmtSrv = &http.Server{
 		Addr:              mgmtAddr,
 		Handler:           mux,
