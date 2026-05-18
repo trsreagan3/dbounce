@@ -134,10 +134,33 @@ Start the wire-protocol listener.
 - `--dialect postgres` — wire-protocol dialect. Only `postgres`
   recognized in D-Slice 1.
 
-### `dbounce audit tail [--limit N]`
+### `dbounce audit tail`
 
-Show the most recent N decisions, newest first. `--limit` must be
-1-1000 (rejected at parse time).
+Show recent decisions from the local SQLite audit log. The base path
+prints a human-readable table; four flag-driven modes (#268; mirrored
+in ibounce + kbounce per [[cross-product-agent-parity]]) extend the
+surface for live monitoring, filtered review, summary aggregation, and
+bulk SIEM export. See [docs/AUDIT-TAIL.md](docs/AUDIT-TAIL.md) for the
+full reference.
+
+```
+dbounce audit tail [--limit N] [--json]
+                   [--follow] [--poll-interval D]
+                   [--filter EXPR ...] [--summary]
+                   [--export {jsonl|csv|ocsf-bundle} --out PATH]
+                   [--csv-columns COLS]
+```
+
+| Mode      | Flag        | Notes                                                    |
+| --------- | ----------- | -------------------------------------------------------- |
+| snapshot  | (default)   | newest N rows as a table; `--json` for JSON-per-line     |
+| follow    | `--follow`  | live tail; SIGINT to exit; `--filter` narrows the stream |
+| summary   | `--summary` | count-summary by event_type / severity / actor / op      |
+| export    | `--export`  | jsonl / csv / ocsf-bundle to `--out PATH`                |
+
+CSV and ocsf-bundle exports ALWAYS redact SQL string literals
+(MED-D8-09 redactor applied defensively on read) so a bulk SIEM
+shipment cannot leak PII embedded in raw statements.
 
 ### `dbounce --version`
 

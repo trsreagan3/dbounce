@@ -17,7 +17,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1394,106 +1393,38 @@ func parentRequiresSubcommand(parent string, _ *cobra.Command) func(*cobra.Comma
 	}
 }
 
+// newAuditTailCmd builds the `dbounce audit tail` subcommand. The flag
+// surface + dispatch live in audit_tail.go (#268 added --follow, --filter,
+// --summary, and --export to the legacy snapshot + --json path); this
+// constructor stays here so the cobra command tree definition is in one
+// place.
 func newAuditTailCmd() *cobra.Command {
-	var (
-		limit   int
-		dbPath  string
-		asJSON  bool
-	)
+	var o auditTailOpts
 	cmd := &cobra.Command{
 		Use:   "tail",
-		Short: "Show the most recent N decisions (newest first)",
-		Args:  cobra.NoArgs,
+		Short: "Show recent decisions (snapshot, live follow, summary, or bulk export)",
+		Long: `Show the most recent decisions from the local SQLite audit log.
+
+Default mode prints the newest --limit rows as a human-readable table.
+The flag set extends with four operator workflows shared cross-product
+with ibounce + kbounce (#268):
+
+  --follow                  live tail; polls the audit DB + prints new
+                            rows as they arrive. Exit on SIGINT.
+  --filter EXPR             field predicate (repeatable; AND-combined).
+                            Forms: field=val, field~regex, field>=N,
+                            field<=N. See --filter --help for fields.
+  --summary                 count-summary across event_type, severity_id,
+                            actor.user.name, api.operation. Honors --filter.
+  --export FORMAT --out P   bulk export. FORMAT: jsonl | csv | ocsf-bundle.
+                            SQL string literals are ALWAYS redacted on the
+                            csv + ocsf-bundle paths so a bulk SIEM export
+                            cannot leak PII embedded in raw statements.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Bound --limit at parse time so operators understand the
-			// range rather than silently no-op'ing on out-of-range
-			// values. Mirrors kbounce + ibounce UAT-K2 HIGH-K2-03.
-			if limit < 1 || limit > 1000 {
-				return fmt.Errorf("--limit must be in 1-1000 (got %d)", limit)
-			}
-			st, err := store.Open(dbPath)
-			if err != nil {
-				return fmt.Errorf("open store: %w", err)
-			}
-			defer st.Close()
-			rows, err := st.RecentDecisions(limit)
-			if err != nil {
-				return err
-			}
-			if asJSON {
-				// Cross-product parity per [[cross-product-agent-parity]]:
-				// kbounce + ibounce both ship `audit tail --json`; dbounce
-				// matches the shape (one decision per line, newest first).
-				enc := json.NewEncoder(cmd.OutOrStdout())
-				for _, r := range rows {
-					rec := map[string]any{
-						"at":                 r.At.UTC().Format(time.RFC3339),
-						"dialect":            r.Dialect,
-						"statement":          r.Statement,
-						"statement_type":     r.StatementType,
-						"tables":             r.TablesTouched,
-						"functions":          r.FunctionsCalled,
-						"is_dml":             r.IsDML,
-						"is_ddl":             r.IsDDL,
-						"has_mutating_node":  r.HasMutatingNode,
-						"mutating_node_type": r.MutatingNodeType,
-						"is_explain":         r.IsExplain,
-						"is_explain_analyze": r.IsExplainAnalyze,
-						"impersonated_role":  r.ImpersonatedRole,
-						"parse_errors":       r.ParseErrors,
-						"decision_verdict":   r.DecisionVerdict,
-						"decision_reason":    r.DecisionReason,
-						"mode_at_decision":   r.ModeAtDecision,
-						"enforced":           r.Enforced,
-						"decision_source":    r.DecisionSource,
-						"profile_name":       r.ProfileName,
-						"task_id":            r.TaskID,
-						"is_stream":          r.IsStream,
-						"stream_kind":        r.StreamKind,
-						// MED-D8-09: surface so audit consumers know
-						// the SQL has been [REDACTED] and is not
-						// replayable.
-						"statement_redacted": r.StatementRedacted,
-					}
-					if err := enc.Encode(rec); err != nil {
-						return err
-					}
-				}
-				return nil
-			}
-			if len(rows) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "(no decisions recorded yet)")
-				return nil
-			}
-			w := cmd.OutOrStdout()
-			fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-12s  %s\n",
-				"AT (UTC)", "MODE", "VERDICT", "STMT-TYPE", "STATEMENT")
-			for _, r := range rows {
-				at := r.At.UTC().Format("2006-01-02 15:04:05")
-				stmt := r.Statement
-				if len(stmt) > 60 {
-					stmt = stmt[:57] + "..."
-				}
-				fmt.Fprintf(w, "%-20s  %-6s  %-7s  %-12s  %s\n",
-					at, r.ModeAtDecision, r.DecisionVerdict, r.StatementType, stmt)
-				if r.DecisionReason != "" {
-					reason := r.DecisionReason
-					if len(reason) > 80 {
-						reason = reason[:77] + "..."
-					}
-					fmt.Fprintf(w, "%52s  %s\n", "↳", reason)
-				}
-			}
-			return nil
+			return runAuditTail(cmd, &o)
 		},
 	}
-	cmd.Flags().IntVar(&limit, "limit", 50,
-		"Max rows to return (1-1000). Default 50.")
-	cmd.Flags().StringVar(&dbPath, "db", "",
-		"SQLite DB path (default: ~/.dbounce/state.db, or DBOUNCE_DB env).")
-	cmd.Flags().BoolVar(&asJSON, "json", false,
-		"Emit one JSON object per decision row, newest first. Mirrors "+
-			"kbounce + ibounce's `audit tail --json` for cross-product "+
-			"agent parity.")
+	registerAuditTailFlags(cmd, &o)
 	return cmd
 }

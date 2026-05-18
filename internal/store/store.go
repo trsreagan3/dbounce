@@ -651,6 +651,145 @@ func (s *Store) CountDecisions() (int64, error) {
 	return n, nil
 }
 
+// DecisionRowWithID is RecentDecisionsAfterID's return shape — pairs a
+// DecisionRow with the auto-increment row id. Used by `dbounce audit
+// tail --follow` to watermark new rows across poll cycles without
+// risking a tie on the second-resolution `at` column.
+//
+// Why a separate type instead of an ID field on DecisionRow: adding ID
+// to DecisionRow would ripple through every RecordDecision call site
+// (the proxy passes a freshly-built DecisionRow and never reads it
+// back) and every test fixture. The follow path is the only consumer
+// that needs the id back, so we expose it via a wrapper.
+type DecisionRowWithID struct {
+	ID  int64
+	Row DecisionRow
+}
+
+// RecentDecisionsAfterID returns up to `limit` decisions with id > after,
+// ordered ASCENDING by id so a follow-style consumer can print them in
+// insertion order. Pass after=0 on first call to get the most recent
+// rows + use the last returned id as the watermark for the next poll.
+// limit clamps the per-poll batch: pass 0 / negative for the default of
+// 200; capped at 1000.
+func (s *Store) RecentDecisionsAfterID(after int64, limit int) ([]DecisionRowWithID, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(`SELECT
+		id, at, dialect, statement, statement_type,
+		tables_json, functions_json,
+		is_dml, is_ddl, has_mutating_node, mutating_node_type,
+		is_explain, is_explain_analyze,
+		impersonated_role, parse_errors_json,
+		decision_verdict, decision_reason, mode_at_decision, enforced,
+		decision_source, profile_name,
+		matched_rule_id, task_id, pause_id,
+		is_stream, stream_kind,
+		forwarded, upstream_status, upstream_response_summary,
+		statement_redacted
+		FROM decisions
+		WHERE id > ?
+		ORDER BY id ASC
+		LIMIT ?`, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("dbounce: decisions after id query: %w", err)
+	}
+	defer rows.Close()
+	out := make([]DecisionRowWithID, 0, limit)
+	for rows.Next() {
+		var (
+			id               int64
+			d                DecisionRow
+			atStr            string
+			tablesJSON       string
+			functionsJSON    string
+			parseErrJSON     string
+			isDML            int
+			isDDL            int
+			hasMut           int
+			isExplain        int
+			isExplainAnalyze int
+			enforced         int
+			profileName      sql.NullString
+			ruleID           sql.NullInt64
+			taskID           sql.NullString
+			pauseID          sql.NullInt64
+			isStream         int
+			forwarded        int
+			stmtRedacted     int
+		)
+		if err := rows.Scan(
+			&id, &atStr, &d.Dialect, &d.Statement, &d.StatementType,
+			&tablesJSON, &functionsJSON,
+			&isDML, &isDDL, &hasMut, &d.MutatingNodeType,
+			&isExplain, &isExplainAnalyze,
+			&d.ImpersonatedRole, &parseErrJSON,
+			&d.DecisionVerdict, &d.DecisionReason, &d.ModeAtDecision, &enforced,
+			&d.DecisionSource, &profileName,
+			&ruleID, &taskID, &pauseID,
+			&isStream, &d.StreamKind,
+			&forwarded, &d.UpstreamStatus, &d.UpstreamResponseSummary,
+			&stmtRedacted,
+		); err != nil {
+			return nil, fmt.Errorf("dbounce: decisions after id scan: %w", err)
+		}
+		if t, perr := time.Parse("2006-01-02T15:04:05Z", atStr); perr == nil {
+			d.At = t
+		}
+		d.TablesTouched = unmarshalStrings(tablesJSON)
+		d.FunctionsCalled = unmarshalStrings(functionsJSON)
+		d.ParseErrors = unmarshalStrings(parseErrJSON)
+		d.IsDML = isDML != 0
+		d.IsDDL = isDDL != 0
+		d.HasMutatingNode = hasMut != 0
+		d.IsExplain = isExplain != 0
+		d.IsExplainAnalyze = isExplainAnalyze != 0
+		d.Enforced = enforced != 0
+		if profileName.Valid {
+			d.ProfileName = profileName.String
+		}
+		if ruleID.Valid {
+			rid := ruleID.Int64
+			d.MatchedRuleID = &rid
+		}
+		if taskID.Valid {
+			d.TaskID = taskID.String
+		}
+		if pauseID.Valid {
+			pid := pauseID.Int64
+			d.PauseID = &pid
+		}
+		d.IsStream = isStream != 0
+		d.Forwarded = forwarded != 0
+		d.StatementRedacted = stmtRedacted != 0
+		out = append(out, DecisionRowWithID{ID: id, Row: d})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("dbounce: decisions after id iterate: %w", err)
+	}
+	return out, nil
+}
+
+// MaxDecisionID returns the largest id in the decisions table, or 0
+// when empty. Used by `dbounce audit tail --follow` to seed the
+// watermark so the first poll cycle only returns rows that arrive
+// AFTER the command was invoked (matching `tail -f` semantics — we
+// don't replay history when the operator asked to follow).
+func (s *Store) MaxDecisionID() (int64, error) {
+	var n sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(id) FROM decisions`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("dbounce: max decision id: %w", err)
+	}
+	if !n.Valid {
+		return 0, nil
+	}
+	return n.Int64, nil
+}
+
 // RecentDecisions returns the N most recently recorded decisions,
 // newest first. Used by `dbounce audit tail`. Pass 0 / negative for
 // the implicit default of 50; capped at 1000.
