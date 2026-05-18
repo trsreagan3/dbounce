@@ -125,6 +125,18 @@ func (s *Store) AddPendingAuditEvent(kind PendingAuditEventKind, payloadJSON str
 	return id, nil
 }
 
+// CountPendingAuditEvents returns the current pending_audit_events
+// queue depth. Read-only — never deletes, never blocks the drain
+// loop. Used by the #277 diagnostics bundle (queue-depth.json) and
+// any future operator-facing queue-health surfaces.
+func (s *Store) CountPendingAuditEvents() (int64, error) {
+	var n int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pending_audit_events`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("dbounce: count pending audit events: %w", err)
+	}
+	return n, nil
+}
+
 // DrainPendingAuditEvents reads up to maxBatch rows in id-ascending
 // order + DELETEs them in the same transaction so a race against a
 // second drainer never double-emits. limit <= 0 defaults to 256 (a

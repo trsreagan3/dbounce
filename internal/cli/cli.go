@@ -177,6 +177,13 @@ func newRootCmd() *cobra.Command {
 	// [[dbounce-build-plan]] §D-Slice 6); also works for postgres +
 	// mysql so the shim pattern is dialect-uniform.
 	root.AddCommand(newDecideCmd())
+	// #277 diagnostics bundle (per [[basic-app-hygiene-features]] +
+	// [[cross-product-agent-parity]]). Two surface paths: the canonical
+	// `dbounce diagnostics bundle` parent + the `dbounce diag` alias
+	// that sibling agents in kbounce + ibounce also wire so a single
+	// muscle-memory shortcut works across all three products.
+	root.AddCommand(newDiagnosticsCmd())
+	root.AddCommand(newDiagnosticsDiagAliasCmd())
 	return root
 }
 

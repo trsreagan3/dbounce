@@ -209,6 +209,18 @@ func (s *Store) AddPendingPrompt(p PendingPrompt) (int64, error) {
 	return id, nil
 }
 
+// CountPendingPrompts returns the total pending_prompts row count.
+// Used by the #277 diagnostics bundle (queue-depth.json). Read-only;
+// counts ALL statuses (pending + answered) so a stuck-answered backlog
+// is also visible.
+func (s *Store) CountPendingPrompts() (int64, error) {
+	var n int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pending_prompts`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("dbounce: count pending prompts: %w", err)
+	}
+	return n, nil
+}
+
 // ListPendingPrompts returns prompts ordered newest-first. status ""
 // returns ALL statuses. limit <= 0 defaults to 50; capped at 500.
 func (s *Store) ListPendingPrompts(status PromptStatus, limit int) ([]PendingPrompt, error) {
