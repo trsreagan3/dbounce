@@ -291,6 +291,111 @@ func TestPoller_DrainsProfileInstalled(t *testing.T) {
 			"(Slice 2 contract per [[security-team-audit-export]])")
 }
 
+// TestPoller_DrainsAdminAction verifies the ADMIN_ACTION wiring per
+// [[basic-app-hygiene-features]] TIER 1 #4 +
+// [[security-team-audit-export]]: when an admin CLI subcommand
+// (running in a separate process from `dbounce run`) writes a
+// pending_audit_events row, the run-process poller drains it + emits
+// an ADMIN_ACTION OCSF event through the wired Exporter.
+//
+// Cross-product contract: ext.config_change.{action, actor,
+// resource_*, dialects, details} all land on the wire; sibling agents
+// in ibounce + kbounce ship the same shape.
+func TestPoller_DrainsAdminAction(t *testing.T) {
+	srv, st := newPausePromptServer(t, ModeTransparent, DefaultPolicyDeny, false)
+	exp, expSnapshot := captureExporter(t)
+	srv.SetAuditExporter(exp)
+
+	// Simulate the cross-process admin CLI path: an out-of-proc
+	// `dbounce rules add` writes the row directly (the CLI cannot
+	// reach the run-proc's Exporter — Option A: SQLite queue with
+	// 1s drain cadence per the spec).
+	_, err := st.AddPendingAuditEvent(
+		store.PendingAuditEventAdminAction,
+		`{"action":"rules.add","actor":"alice","resource_type":"rule",`+
+			`"resource_id":"42","result":"success","dialects":["mysql"],`+
+			`"details":{"pattern":"SELECT:mysql.app_db.*","effect":"allow"}}`)
+	require.NoError(t, err)
+
+	srv.drainPendingAuditEventsOnce()
+
+	got := expSnapshot()
+	var adminEvents []audit.Event
+	for _, e := range got {
+		if e.ActivityName == "admin_action" {
+			adminEvents = append(adminEvents, e)
+		}
+	}
+	require.Len(t, adminEvents, 1,
+		"poller MUST drain ADMIN_ACTION row + emit exactly one synthetic")
+	evt := adminEvents[0]
+	require.NotNil(t, evt.Unmapped)
+	assert.Equal(t, string(audit.EventTypeAdminAction),
+		evt.Unmapped.IAMJIT.EventType)
+	cc, ok := evt.Unmapped.IAMJIT.Ext["config_change"].(map[string]any)
+	require.True(t, ok,
+		"ext.config_change MUST survive cross-process round-trip "+
+			"(SQLite payload → poller → audit.NewAdminActionEvent → JSONL)")
+	assert.Equal(t, "rules.add", cc["action"])
+	assert.Equal(t, "alice", cc["actor"])
+	assert.Equal(t, "rule", cc["resource_type"])
+	assert.Equal(t, "42", cc["resource_id"])
+	dialects, ok := cc["dialects"].([]any)
+	require.True(t, ok,
+		"per-dialect note: config_change.dialects MUST be present + "+
+			"slice-shaped per the spec")
+	require.Len(t, dialects, 1)
+	assert.Equal(t, "mysql", dialects[0])
+	details, ok := cc["details"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "SELECT:mysql.app_db.*", details["pattern"])
+
+	// After drain, depth must be zero (idempotent: the queue's
+	// SELECT+DELETE inside one txn rules out double-emission).
+	depth, err := st.PendingAuditEventDepth()
+	require.NoError(t, err)
+	assert.Equal(t, 0, depth, "drained rows must be deleted in-txn")
+}
+
+// TestPoller_DrainsAdminAction_DialectAgnostic verifies the per-
+// dialect note's flip side: when the admin action carries no dialect
+// signal (e.g. pause.start, or a cross-dialect rule with table-glob
+// "public.*"), config_change.dialects MUST be ABSENT on the wire so
+// SIEM dashboards that filter "where dialects is set" don't false-
+// positive on dialect-agnostic actions.
+func TestPoller_DrainsAdminAction_DialectAgnostic(t *testing.T) {
+	srv, st := newPausePromptServer(t, ModeTransparent, DefaultPolicyDeny, false)
+	exp, expSnapshot := captureExporter(t)
+	srv.SetAuditExporter(exp)
+
+	_, err := st.AddPendingAuditEvent(
+		store.PendingAuditEventAdminAction,
+		`{"action":"pause.start","actor":"bob","resource_type":"pause",`+
+			`"resource_id":"7","result":"success",`+
+			`"details":{"ttl_seconds":1800,"reason":"live demo"}}`)
+	require.NoError(t, err)
+
+	srv.drainPendingAuditEventsOnce()
+	got := expSnapshot()
+	var adminEvents []audit.Event
+	for _, e := range got {
+		if e.ActivityName == "admin_action" {
+			adminEvents = append(adminEvents, e)
+		}
+	}
+	require.Len(t, adminEvents, 1)
+	cc, ok := adminEvents[0].Unmapped.IAMJIT.Ext["config_change"].(map[string]any)
+	require.True(t, ok)
+	_, hasDialects := cc["dialects"]
+	assert.False(t, hasDialects,
+		"config_change.dialects MUST be omitted for dialect-agnostic "+
+			"actions like pause.start")
+	// Sanity: the details DID survive the round-trip.
+	details, ok := cc["details"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "live demo", details["reason"])
+}
+
 // TestPoller_DrainsMultipleRowsInOrder verifies the drain ordering
 // invariant: rows MUST be emitted in id-ASC order so a SIEM consumer
 // sees lifecycle events in the same sequence the originating CLI

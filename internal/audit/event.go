@@ -182,6 +182,49 @@ const (
 	// filter "profile installs that touched MySQL." Empty when no
 	// dialect can be inferred.
 	EventTypeProfileInstalled EventType = "PROFILE_INSTALLED"
+
+	// EventTypeAdminAction synthesizes when an operator runs a CLI
+	// subcommand that MUTATES dbounce's configuration / gating surface
+	// (rules add / rules remove / rules recommend (when --save-as-profile),
+	// pause start, presets apply, alert-rule edit, license install,
+	// config import/export). The closely-related lifecycle synthetics
+	// (PROFILE_INSTALLED, ADMIN_FALLBACK_END) cover the install / pause-
+	// close paths SPECIFICALLY because those have richer per-event
+	// payloads + dedicated alert rules; ADMIN_ACTION is the general
+	// catch-all for the remaining admin surface so a security reviewer
+	// can answer "what config changes happened today?" from the audit-
+	// export alone.
+	//
+	// Per [[basic-app-hygiene-features]] TIER 1 #4 +
+	// [[security-team-audit-export]]: this is the OPERATOR-VISIBILITY
+	// surface for the admin command surface — a SIEM consumer pivots on
+	// activity_name="admin_action" + ext.config_change.action to triage
+	// "who changed what when." Sibling agents in ibounce + kbounce ship
+	// the same event under the same schema so a single cross-product
+	// SIEM rule catches all three products' admin actions.
+	//
+	// activity_id=99 (Other); activity_name="admin_action"; severity
+	// Informational (this is bookkeeping, not an alert — config changes
+	// are EXPECTED operator behavior). Per [[security-team-positioning-
+	// safety-not-surveillance]]: status_detail NAMES what changed +
+	// suggests no remediation; never accuses the operator.
+	//
+	// Cross-process emission: every admin CLI subcommand runs in a
+	// SEPARATE process from `dbounce run` (they're one-shot Cobra
+	// invocations). The CLI side writes a pending_audit_events row;
+	// the run-process drains the queue every 1s + emits through its
+	// wired Exporter / RuleEngine. Matches the ADMIN_FALLBACK_END +
+	// PROFILE_INSTALLED pattern shipped in 24eca0c.
+	//
+	// Per-dialect note: dbounce admin actions may have per-dialect
+	// implications (a rule's table-glob may match only one dialect's
+	// catalog, a profile preset may target a specific dialect). When
+	// the action carries dialect signal, the CLI stamps the affected
+	// set under unmapped.iam_jit.config_change.dialects so a SIEM
+	// dashboard can filter "rule edits that touched the MySQL surface."
+	// Empty/omitted when the action is dialect-agnostic (the common
+	// case for pause windows + cross-dialect rules).
+	EventTypeAdminAction EventType = "ADMIN_ACTION"
 )
 
 // Product names the originating Bounce product. Stamped into
@@ -1566,6 +1609,147 @@ func NewProfileInstalledEvent(host string, info ProfileInstalledInfo) Event {
 		Unmapped: &Unmapped{
 			IAMJIT: IAMJITExt{
 				EventType: string(EventTypeProfileInstalled),
+				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
+// AdminActionInfo carries the per-event payload for the ADMIN_ACTION
+// synthetic. Action is the cross-product stable id (rules.add,
+// rules.remove, pause.start, presets.apply, alert_rule.edit,
+// license.install, config.import, config.export, ...) — sibling agents
+// in ibounce + kbounce ship the same id space so a single SIEM
+// correlation key works across products.
+//
+// Actor is the human/system identity that initiated the change (--actor
+// flag, $USER fallback, or "unknown"). ResourceType + ResourceID name
+// what changed in a way the SIEM can pivot on (e.g. "rule"/"42",
+// "profile"/"pg-readonly", "preset"/"analytics-engineer"). Both are
+// optional — `pause start` has no per-resource handle.
+//
+// Result is one of "success", "failure", "noop" — captured so a SIEM
+// can ask "which admin actions actually changed state?" without
+// JOIN-ing back to the source-of-truth tables. Defaults to "success"
+// when empty (the CLI only emits AFTER the action lands).
+//
+// Dialects encodes the per-dialect implication when the action affects
+// only some dialects (e.g. a rule whose table_glob is "snowflake.*.*"
+// touches only Snowflake). Empty/omitted when the action is dialect-
+// agnostic — the common case for pause windows + cross-dialect rules.
+// Stamped under unmapped.iam_jit.config_change.dialects per the
+// [[security-team-audit-export]] cross-product contract.
+//
+// Details is an open-ended per-action map for fields without a
+// dedicated slot (rule pattern + effect + scope axes; preset id +
+// target profile; pause ttl + reason; ...). Stamped under
+// unmapped.iam_jit.config_change.details so a SIEM consumer that wants
+// the full triage context can read it without a JOIN; consumers that
+// only need who-what-when ignore the field.
+type AdminActionInfo struct {
+	Action       string
+	Actor        string
+	ResourceType string
+	ResourceID   string
+	Result       string
+	Dialects     []string
+	Details      map[string]any
+}
+
+// NewAdminActionEvent constructs the OCSF v1.1.0 class-6003 ADMIN_ACTION
+// envelope. The synthetic is fired by the run-process's audit-event
+// poller AFTER draining a pending_audit_events row that an admin CLI
+// subcommand enqueued; sibling agents in ibounce + kbounce ship the
+// same shape under the same schema so a single cross-product SIEM
+// rule keyed on activity_name="admin_action" works for all three.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "admin_action", type_uid=600399, severity_id=1 (Informational),
+// status_id=99 (Other). Per [[security-team-positioning-safety-not-
+// surveillance]]: status_detail NAMES the action + the actor; never
+// accuses the operator.
+//
+// The unmapped.iam_jit.config_change block is the cross-product
+// contract — actor / action / resource_{type,id} / result / dialects /
+// details all live there so a SIEM rule keyed on
+// ext.config_change.action can fan out per-action without parsing
+// free-form text.
+func NewAdminActionEvent(host string, info AdminActionInfo) Event {
+	action := strings.TrimSpace(info.Action)
+	if action == "" {
+		action = "unknown"
+	}
+	actor := strings.TrimSpace(info.Actor)
+	if actor == "" {
+		actor = "unknown"
+	}
+	result := strings.TrimSpace(info.Result)
+	if result == "" {
+		result = "success"
+	}
+	cc := map[string]any{
+		"action": action,
+		"actor":  actor,
+		"result": result,
+	}
+	if info.ResourceType != "" {
+		cc["resource_type"] = info.ResourceType
+	}
+	if info.ResourceID != "" {
+		cc["resource_id"] = info.ResourceID
+	}
+	if len(info.Dialects) > 0 {
+		cc["dialects"] = append([]string(nil), info.Dialects...)
+	}
+	if len(info.Details) > 0 {
+		// Shallow-copy the details map so a downstream mutation of the
+		// returned event's ext map doesn't surprise the caller. The
+		// values are typically primitives + strings so a shallow copy
+		// is sufficient.
+		details := make(map[string]any, len(info.Details))
+		for k, v := range info.Details {
+			details[k] = v
+		}
+		cc["details"] = details
+	}
+	ext := map[string]any{
+		"config_change": cc,
+	}
+	detail := "admin action: " + action + " by " + actor
+	if info.ResourceType != "" && info.ResourceID != "" {
+		detail += " (" + info.ResourceType + "=" + info.ResourceID + ")"
+	}
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "admin_action",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		API: API{
+			Operation: "admin_action",
+		},
+		SrcEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeAdminAction),
 				Enforced:  false,
 				Ext:       ext,
 			},

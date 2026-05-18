@@ -69,6 +69,7 @@ func newRulesAddCmd() *cobra.Command {
 		tableScope    string
 		functionScope string
 		note          string
+		actor         string
 	)
 	cmd := &cobra.Command{
 		Use:   "add",
@@ -98,6 +99,43 @@ func newRulesAddCmd() *cobra.Command {
 			}
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"added rule %d: %s (effect=%s)\n", id, pattern, eff)
+
+			// [[basic-app-hygiene-features]] TIER 1 #4 +
+			// [[security-team-audit-export]]: enqueue an ADMIN_ACTION
+			// row carrying the rule's stable id + pattern + effect +
+			// scope axes. The drain side (proxy poller) emits an
+			// ADMIN_ACTION OCSF event through the wired Exporter +
+			// RuleEngine. Per-dialect inference: when the table-glob
+			// half carries a recognized dialect prefix (snowflake.*,
+			// mysql.*, ...), the affected dialect set is stamped under
+			// config_change.dialects. Best-effort: enqueue failure does
+			// NOT roll back the rule add.
+			details := map[string]any{
+				"rule_id": id,
+				"pattern": pattern,
+				"effect":  string(eff),
+				"origin":  string(dbrules.OriginUser),
+			}
+			if schemaScope != "" {
+				details["schema_scope"] = schemaScope
+			}
+			if tableScope != "" {
+				details["table_scope"] = tableScope
+			}
+			if functionScope != "" {
+				details["function_scope"] = functionScope
+			}
+			if note != "" {
+				details["note"] = note
+			}
+			enqueueAdminAction(cmd.ErrOrStderr(), dbPath, adminActionEnqueueParams{
+				Action:       "rules.add",
+				Actor:        resolveActor(actor),
+				ResourceType: "rule",
+				ResourceID:   fmt.Sprintf("%d", id),
+				Dialects:     inferDialectsFromRulePattern(pattern),
+				Details:      details,
+			})
 			return nil
 		},
 	}
@@ -115,6 +153,9 @@ func newRulesAddCmd() *cobra.Command {
 		"Glob matched against called function names (CALL/DO/EXECUTE).")
 	cmd.Flags().StringVar(&note, "note", "",
 		"Free-form description recorded with the rule.")
+	cmd.Flags().StringVar(&actor, "actor", "",
+		"Operator id recorded on the ADMIN_ACTION audit event. "+
+			"Defaults to $USER then 'unknown'.")
 	_ = cmd.MarkFlagRequired("pattern")
 	return cmd
 }
@@ -172,7 +213,10 @@ func newRulesListCmd() *cobra.Command {
 }
 
 func newRulesRemoveCmd() *cobra.Command {
-	var dbPath string
+	var (
+		dbPath string
+		actor  string
+	)
 	cmd := &cobra.Command{
 		Use:   "remove ID",
 		Short: "Remove a global rule by id",
@@ -195,11 +239,31 @@ func newRulesRemoveCmd() *cobra.Command {
 				return fmt.Errorf("no rule with id %d", idInt)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "removed rule %d.\n", idInt)
+
+			// [[basic-app-hygiene-features]] TIER 1 #4 +
+			// [[security-team-audit-export]]: enqueue an ADMIN_ACTION
+			// row for the deletion. Per-dialect not inferred here —
+			// the deleted rule's pattern is no longer in the table by
+			// the time we enqueue; carrying the id alone is the
+			// load-bearing audit signal (a SIEM consumer can JOIN
+			// against the prior rules.add event for the full pattern).
+			enqueueAdminAction(cmd.ErrOrStderr(), dbPath, adminActionEnqueueParams{
+				Action:       "rules.remove",
+				Actor:        resolveActor(actor),
+				ResourceType: "rule",
+				ResourceID:   fmt.Sprintf("%d", idInt),
+				Details: map[string]any{
+					"rule_id": idInt,
+				},
+			})
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", "",
 		"SQLite DB path (default: ~/.dbounce/state.db, or DBOUNCE_DB env).")
+	cmd.Flags().StringVar(&actor, "actor", "",
+		"Operator id recorded on the ADMIN_ACTION audit event. "+
+			"Defaults to $USER then 'unknown'.")
 	return cmd
 }
 
@@ -336,7 +400,31 @@ func newRulesRecommendCmd(profileWriter ProfileWriter) *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"created profile %q with %d allow rules (origin=recommended).\n",
 				resolved, len(allow))
-			_ = actor // reserved for future audit-row emission
+
+			// [[basic-app-hygiene-features]] TIER 1 #4 +
+			// [[security-team-audit-export]]: enqueue an ADMIN_ACTION
+			// row for the profile creation. The recommender's profile
+			// is a CREATE (not a mutation of an existing profile per
+			// [[creates-never-mutates]]) so resource_type="profile" +
+			// resource_id=resolved-name. Per-dialect inference from
+			// the resolved profile name (matches the existing
+			// profile-install dialect heuristic) so a SIEM dashboard
+			// sees the dialect signal when the operator picked a
+			// dialect-tagged name (rare for auto-named recommends,
+			// common for explicit --save-as-profile=mysql-readonly).
+			enqueueAdminAction(cmd.ErrOrStderr(), dbPath, adminActionEnqueueParams{
+				Action:       "rules.recommend",
+				Actor:        resolveActor(actor),
+				ResourceType: "profile",
+				ResourceID:   resolved,
+				Dialects:     inferDialectsFromProfileNames([]string{resolved}),
+				Details: map[string]any{
+					"profile_name":     resolved,
+					"allow_rule_count": len(allow),
+					"scanned_rows":     len(rows),
+					"recommendations":  len(recs),
+				},
+			})
 			return nil
 		},
 	}

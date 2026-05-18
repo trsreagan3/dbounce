@@ -86,21 +86,43 @@ func newPauseStartCmd() *cobra.Command {
 				return err
 			}
 			if asJSON {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
+				_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
 					"pause_id":   id,
 					"ends_at":    endsAt.Format(time.RFC3339),
 					"reason":     reason,
 					"started_by": startedBy,
 				})
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"pause %d started by %s; ends at %s (in %s)\n",
+					id, startedBy, endsAt.Format(time.RFC3339), forDur)
+				if reason != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "reason: %s\n", reason)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"while paused, transparent DENY decisions demote to ALLOW + audit-row pause_id is stamped.")
 			}
-			fmt.Fprintf(cmd.OutOrStdout(),
-				"pause %d started by %s; ends at %s (in %s)\n",
-				id, startedBy, endsAt.Format(time.RFC3339), forDur)
-			if reason != "" {
-				fmt.Fprintf(cmd.OutOrStdout(), "reason: %s\n", reason)
-			}
-			fmt.Fprintln(cmd.OutOrStdout(),
-				"while paused, transparent DENY decisions demote to ALLOW + audit-row pause_id is stamped.")
+
+			// [[basic-app-hygiene-features]] TIER 1 #4 +
+			// [[security-team-audit-export]]: enqueue an ADMIN_ACTION
+			// row for the pause open. ADMIN_FALLBACK (per-demote) +
+			// ADMIN_FALLBACK_END (per-close) already exist (24eca0c) —
+			// the ADMIN_ACTION here is the OPEN-event signal so a SIEM
+			// dashboard sees the operator's intent BEFORE any demotes
+			// land. Pause windows are dialect-agnostic so no
+			// Dialects field.
+			enqueueAdminAction(cmd.ErrOrStderr(), dbPath, adminActionEnqueueParams{
+				Action:       "pause.start",
+				Actor:        startedBy,
+				ResourceType: "pause",
+				ResourceID:   fmt.Sprintf("%d", id),
+				Details: map[string]any{
+					"pause_id":    id,
+					"ttl_seconds": forDur.Seconds(),
+					"ends_at":     endsAt.UTC().Format(time.RFC3339),
+					"reason":      reason,
+				},
+			})
 			return nil
 		},
 	}

@@ -765,6 +765,116 @@ func TestNewProfileInstalledEvent_NoDialectsOmitted(t *testing.T) {
 		"ext.dialects MUST be omitted when no dialect could be inferred")
 }
 
+// TestNewAdminActionEvent_OCSFShape pins the admin-action synthetic
+// per [[basic-app-hygiene-features]] TIER 1 #4 +
+// [[security-team-audit-export]]. Sibling agents in ibounce + kbounce
+// ship the same shape under the same schema so a single cross-product
+// SIEM rule keyed on activity_name="admin_action" works across all
+// three. The ext.config_change.{action, actor, resource_type,
+// resource_id, result, dialects, details} block is the cross-product
+// contract.
+func TestNewAdminActionEvent_OCSFShape(t *testing.T) {
+	evt := NewAdminActionEvent("127.0.0.1:5433", AdminActionInfo{
+		Action:       "rules.add",
+		Actor:        "alice",
+		ResourceType: "rule",
+		ResourceID:   "42",
+		Result:       "success",
+		Dialects:     []string{"mysql"},
+		Details: map[string]any{
+			"pattern": "SELECT:mysql.app_db.*",
+			"effect":  "allow",
+		},
+	})
+	assert.Equal(t, 6003, evt.ClassUID)
+	assert.Equal(t, ActivityIDOther, evt.ActivityID)
+	assert.Equal(t, "admin_action", evt.ActivityName)
+	assert.Equal(t, 600399, evt.TypeUID)
+	assert.Equal(t, ocsfSeverityInformationalID, evt.SeverityID,
+		"admin_action is bookkeeping, NOT an alert — severity must be Informational")
+	assert.Equal(t, StatusIDOther, evt.StatusID)
+	assert.Equal(t, "admin_action", evt.API.Operation)
+
+	require.NotNil(t, evt.Unmapped)
+	assert.Equal(t, string(EventTypeAdminAction), evt.Unmapped.IAMJIT.EventType)
+	require.NotNil(t, evt.Unmapped.IAMJIT.Ext)
+	cc, ok := evt.Unmapped.IAMJIT.Ext["config_change"].(map[string]any)
+	require.True(t, ok,
+		"ext.config_change MUST be a nested object — cross-product contract")
+	assert.Equal(t, "rules.add", cc["action"])
+	assert.Equal(t, "alice", cc["actor"])
+	assert.Equal(t, "rule", cc["resource_type"])
+	assert.Equal(t, "42", cc["resource_id"])
+	assert.Equal(t, "success", cc["result"])
+	assert.Equal(t, []string{"mysql"}, cc["dialects"],
+		"per-dialect note: dialects MUST travel under config_change.dialects "+
+			"per the [[security-team-audit-export]] admin-action contract")
+	details, ok := cc["details"].(map[string]any)
+	require.True(t, ok,
+		"config_change.details MUST be present when info.Details is non-empty")
+	assert.Equal(t, "SELECT:mysql.app_db.*", details["pattern"])
+	assert.Equal(t, "allow", details["effect"])
+
+	require.NoError(t, assertOCSFCompliant(evt))
+}
+
+// TestNewAdminActionEvent_DefaultsAndOmissions verifies the helper's
+// safe-defaults behavior + the per-field omission contract: a
+// dialect-agnostic action with no details MUST NOT carry dialects /
+// details fields on the wire (so SIEM dashboards that filter "where
+// dialects is set" don't false-positive on cross-dialect actions).
+// Empty action → "unknown"; empty actor → "unknown"; empty result →
+// "success" (the helper is called AFTER the mutation lands).
+func TestNewAdminActionEvent_DefaultsAndOmissions(t *testing.T) {
+	evt := NewAdminActionEvent("127.0.0.1:5433", AdminActionInfo{
+		Action: "pause.start",
+		Actor:  "bob",
+		// No dialects, no details.
+	})
+	require.NotNil(t, evt.Unmapped)
+	cc, ok := evt.Unmapped.IAMJIT.Ext["config_change"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "pause.start", cc["action"])
+	assert.Equal(t, "bob", cc["actor"])
+	assert.Equal(t, "success", cc["result"],
+		"empty Result defaults to 'success' — caller only enqueues AFTER the action lands")
+	_, hasDialects := cc["dialects"]
+	assert.False(t, hasDialects,
+		"config_change.dialects MUST be omitted for dialect-agnostic actions")
+	_, hasDetails := cc["details"]
+	assert.False(t, hasDetails,
+		"config_change.details MUST be omitted when info.Details is empty")
+	_, hasRT := cc["resource_type"]
+	assert.False(t, hasRT,
+		"config_change.resource_type MUST be omitted when caller didn't populate it")
+
+	// Empty Action + Actor → "unknown" safe-defaults.
+	bare := NewAdminActionEvent("127.0.0.1:5433", AdminActionInfo{})
+	bcc := bare.Unmapped.IAMJIT.Ext["config_change"].(map[string]any)
+	assert.Equal(t, "unknown", bcc["action"])
+	assert.Equal(t, "unknown", bcc["actor"])
+}
+
+// TestNewAdminActionEvent_DetailsDefensiveCopy verifies the helper
+// shallow-copies the caller's Details map so a downstream mutation of
+// the caller's map doesn't reach the encoded event. Defensive against
+// CLI code that reuses a details map across multiple enqueue calls.
+func TestNewAdminActionEvent_DetailsDefensiveCopy(t *testing.T) {
+	details := map[string]any{"k": "v1"}
+	evt := NewAdminActionEvent("127.0.0.1:5433", AdminActionInfo{
+		Action:  "rules.add",
+		Actor:   "alice",
+		Details: details,
+	})
+	// Mutate the caller's map AFTER constructing the event.
+	details["k"] = "v2-mutated"
+	cc := evt.Unmapped.IAMJIT.Ext["config_change"].(map[string]any)
+	got := cc["details"].(map[string]any)
+	assert.Equal(t, "v1", got["k"],
+		"NewAdminActionEvent MUST shallow-copy caller's Details to defend "+
+			"against downstream mutation")
+}
+
 // assertOCSFCompliant is the test-only schema validator we use in lieu
 // of a JSON-Schema library (zero new deps per slice constraints). It
 // checks every OCSF v1.1.0 class-6003 required field is present +

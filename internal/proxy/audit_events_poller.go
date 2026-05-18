@@ -157,6 +157,24 @@ func (s *Server) emitDrainedAuditEvent(r store.PendingAuditEvent) {
 			InstalledBy:    p.InstalledBy,
 			Dialects:       p.Dialects,
 		})
+	case store.PendingAuditEventAdminAction:
+		var p adminActionPayload
+		if err := json.Unmarshal([]byte(r.PayloadJSON), &p); err != nil {
+			BumpLookupErrors()
+			log.Warn().Err(err).
+				Int64("queue_row_id", r.ID).
+				Msg("dbounce: parse admin_action payload failed")
+			return
+		}
+		s.emitAdminAction(audit.AdminActionInfo{
+			Action:       p.Action,
+			Actor:        p.Actor,
+			ResourceType: p.ResourceType,
+			ResourceID:   p.ResourceID,
+			Result:       p.Result,
+			Dialects:     p.Dialects,
+			Details:      p.Details,
+		})
 	default:
 		// Unknown kind: log + drop. The row is already deleted by
 		// DrainPendingAuditEvents so no replay loop.
@@ -192,4 +210,23 @@ type profileInstalledPayload struct {
 	ProfilesPath   string   `json:"profiles_path"`
 	InstalledBy    string   `json:"installed_by"`
 	Dialects       []string `json:"dialects"`
+}
+
+// adminActionPayload is the JSON shape every admin CLI subcommand
+// enqueues per the [[basic-app-hygiene-features]] TIER 1 #4 +
+// [[security-team-audit-export]] admin-action wiring. Mirrors
+// audit.AdminActionInfo so the json.Unmarshal lands cleanly + the
+// emit path is one struct-copy away.
+//
+// Sibling agents in ibounce + kbounce ship the same payload shape +
+// the same field names so the run-process drain code in all three
+// products reads identically.
+type adminActionPayload struct {
+	Action       string         `json:"action"`
+	Actor        string         `json:"actor"`
+	ResourceType string         `json:"resource_type"`
+	ResourceID   string         `json:"resource_id"`
+	Result       string         `json:"result"`
+	Dialects     []string       `json:"dialects"`
+	Details      map[string]any `json:"details"`
 }

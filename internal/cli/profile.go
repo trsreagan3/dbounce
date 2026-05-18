@@ -396,20 +396,13 @@ func inferDialectsFromProfileNames(names []string) []string {
 	if len(names) == 0 {
 		return nil
 	}
-	// Token aliases per dialect — kept in sync with parser.Dialect +
-	// the cross-product dbounce dialect set. "pg" matches "postgres"
-	// because operators frequently use the shorthand in profile
-	// names ("pg-readonly").
-	aliases := map[string]string{
-		"postgres":  "postgres",
-		"postgresql": "postgres",
-		"pg":        "postgres",
-		"mysql":     "mysql",
-		"snowflake": "snowflake",
-		"sf":        "snowflake",
-		"bigquery":  "bigquery",
-		"bq":        "bigquery",
-	}
+	// Token aliases per dialect — sourced from the central
+	// dialectAliasMap helper (admin_action.go) so the dialect
+	// vocabulary stays consistent across the install-event helper +
+	// the admin-action helpers (rule-pattern + preset-id). "pg"
+	// matches "postgres" because operators frequently use the
+	// shorthand in profile names ("pg-readonly").
+	aliases := dialectAliasMap()
 	seen := map[string]struct{}{}
 	for _, name := range names {
 		lower := strings.ToLower(name)

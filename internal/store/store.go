@@ -390,13 +390,16 @@ func (s *Store) migrate() error {
 			BEGIN SELECT RAISE(ABORT, 'dbounce: decisions is append-only (MED-D8-07)'); END`,
 		// pending_audit_events: cross-process audit-event queue per
 		// [[security-team-audit-export]]. CLI processes (`dbounce
-		// pause stop`, `dbounce profile install`) APPEND rows; the
-		// running `dbounce run` process polls + drains on its sweep
-		// tick + emits through its wired Exporter / RuleEngine. The
-		// `payload_json` column is a free-form per-kind payload (parsed
-		// per-kind on the drain side); `kind` is one of
-		// {"admin_fallback_end", "profile_installed"} v6 — additive
-		// future kinds can be added without a schema bump.
+		// pause stop`, `dbounce profile install`, every admin-action
+		// subcommand) APPEND rows; the running `dbounce run` process
+		// polls + drains on its sweep tick + emits through its wired
+		// Exporter / RuleEngine. The `payload_json` column is a free-
+		// form per-kind payload (parsed per-kind on the drain side);
+		// `kind` is one of {"admin_fallback_end", "profile_installed",
+		// "admin_action"} v7 — additive future kinds can be added
+		// without a schema bump (the drain path tolerates unknown
+		// kinds per the [[deliberate-feature-completion]] forward-
+		// compat guarantee).
 		//
 		// Single-table queue (no separate per-kind tables) so the
 		// drain path is one SELECT...ORDER BY id ASC + one DELETE per

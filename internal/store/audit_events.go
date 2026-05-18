@@ -67,6 +67,21 @@ const (
 	// rebuild the audit.ProfileInstalledInfo AND fire the Slice 2
 	// RuleEngine.ObserveProfileInstall hook (non-org-source alert).
 	PendingAuditEventProfileInstalled PendingAuditEventKind = "profile_installed"
+
+	// PendingAuditEventAdminAction corresponds to
+	// audit.EventTypeAdminAction. Emitted by admin CLI subcommands
+	// that mutate dbounce's gating surface: `rules add` / `rules
+	// remove` / `rules recommend --save-as-profile` / `pause start` /
+	// `presets apply` / `alert-rule edit` (when wired) / `license
+	// install` (when wired) / `config import`+`config export`
+	// (when #275 lands). payload_json carries
+	// {action, actor, resource_type, resource_id, result, dialects,
+	// details} so the drain side can rebuild the audit.AdminActionInfo
+	// without a JOIN against any source-of-truth table. Sibling agents
+	// in ibounce + kbounce ship the same kind string under the same
+	// payload shape so a single cross-product SIEM rule keyed on
+	// activity_name="admin_action" works for all three products.
+	PendingAuditEventAdminAction PendingAuditEventKind = "admin_action"
 )
 
 // PendingAuditEvent is one queued row. The CLI side constructs +

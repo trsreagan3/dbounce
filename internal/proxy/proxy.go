@@ -759,6 +759,32 @@ func (s *Server) emitProfileInstalled(info audit.ProfileInstalledInfo) {
 	}
 }
 
+// emitAdminAction fires the ADMIN_ACTION synthetic on the wired
+// Exporter + RuleEngine per [[basic-app-hygiene-features]] TIER 1 #4
+// + [[security-team-audit-export]] admin-action wiring. Called from
+// runPendingAuditEventsPoller when an ADMIN_ACTION row is drained
+// from the cross-process queue. Every admin CLI subcommand runs in a
+// separate process from `dbounce run`, so the SQLite queue is the
+// only path; this method is NEVER called from in-process code paths.
+//
+// Nil-safe + best-effort identical to emitAdminFallbackEnd. The
+// RuleEngine.ObserveDecision feed lets a future alert rule key on
+// config_change.action without re-routing the synthetic.
+func (s *Server) emitAdminAction(info audit.AdminActionInfo) {
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
+		return
+	}
+	evt := audit.NewAdminActionEvent(s.listenerAddr(), info)
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	if alertsOn {
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+}
+
 // emitSessionEnded fires a SESSION_ENDED synthetic event for the
 // connection identified by sessionID. Called from the per-protocol
 // connection-close path (PG forwarder + observation-only PG loop +

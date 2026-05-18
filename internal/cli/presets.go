@@ -145,6 +145,7 @@ func newPresetsApplyCmd(profileWriter ProfileWriter) *cobra.Command {
 	var (
 		target string
 		actor  string
+		dbPath string
 	)
 	cmd := &cobra.Command{
 		Use:   "apply NAME",
@@ -203,8 +204,37 @@ func newPresetsApplyCmd(profileWriter ProfileWriter) *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"created profile %q from preset %s (%d allow rules + %d deny rules).\n",
 				resolved, p.ID, len(allow), len(deny))
-			_ = actor // reserved for an audit-row emission once D-Slice 7's profile package surfaces a CreatedBy field
 			_ = dbrules.OriginPreset // silence unused-import if profileWriter wraps the rules transparently
+
+			// [[basic-app-hygiene-features]] TIER 1 #4 +
+			// [[security-team-audit-export]]: enqueue an ADMIN_ACTION
+			// row for the preset apply. Per [[creates-never-mutates]]
+			// the apply CREATES a fresh profile rather than mutating
+			// an existing one — resource_type="profile" + resource_id
+			// is the freshly-resolved target name (NOT the preset id;
+			// the SIEM correlation key is "what profile now exists",
+			// not "what preset was the source"). The preset id rides
+			// in details.preset_id. Per-dialect inference unions the
+			// preset id heuristic AND the target profile-name
+			// heuristic so a SIEM dashboard catches dialect signal
+			// from either side.
+			dialects := unionStringSlices(
+				inferDialectsFromPresetID(p.ID),
+				inferDialectsFromProfileNames([]string{resolved}),
+			)
+			enqueueAdminAction(cmd.ErrOrStderr(), dbPath, adminActionEnqueueParams{
+				Action:       "presets.apply",
+				Actor:        resolveActor(actor),
+				ResourceType: "profile",
+				ResourceID:   resolved,
+				Dialects:     dialects,
+				Details: map[string]any{
+					"preset_id":        p.ID,
+					"profile_name":     resolved,
+					"allow_rule_count": len(allow),
+					"deny_rule_count":  len(deny),
+				},
+			})
 			return nil
 		},
 	}
@@ -216,8 +246,53 @@ func newPresetsApplyCmd(profileWriter ProfileWriter) *cobra.Command {
 	// RunE strips before resolving. pflag refuses empty NoOptDefVal.
 	cmd.Flag("target").NoOptDefVal = "__AUTO__"
 	cmd.Flags().StringVar(&actor, "actor", "",
-		"Operator id (reserved for future audit fields).")
+		"Operator id recorded on the ADMIN_ACTION audit event. "+
+			"Defaults to $USER then 'unknown'.")
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"SQLite DB path used for the cross-process admin-action "+
+			"audit-event queue (default: ~/.dbounce/state.db, or "+
+			"DBOUNCE_DB env).")
 	return cmd
+}
+
+// unionStringSlices returns the deduped + sorted union of two string
+// slices. Local helper so the presets-apply per-dialect inference can
+// union the preset-id signal with the target-profile-name signal
+// without pulling in a set library. Empty input → empty output (no
+// dialect field on the audit event).
+func unionStringSlices(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	for _, s := range a {
+		seen[s] = struct{}{}
+	}
+	for _, s := range b {
+		seen[s] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sortStrings(out)
+	return out
+}
+
+// sortStrings is a tiny stand-alone sort wrapper kept here so the
+// presets package doesn't grow a "sort" import for one call. Pulls
+// from the std lib via the package-level import already present in
+// presets.go via the FieldsFunc / Join callers above (we already
+// import "strings"; sort lands in admin_action.go transitively, but
+// presets.go doesn't import "sort" — keeping this helper avoids a
+// new top-level import).
+func sortStrings(s []string) {
+	// Insertion sort — n is at most |aliases| ~= 4-6 dialects per call.
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
 
 // indent prefixes each line of s with prefix. Used to render the
