@@ -108,6 +108,80 @@ const (
 	// "heartbeat"; severity Informational (this is bookkeeping, not an
 	// alert — the GAP alert below is the elevated signal).
 	EventTypeHeartbeat EventType = "HEARTBEAT"
+
+	// EventTypeAdminFallback synthesizes when an active pause window
+	// DEMOTES a transparent-mode DENY to ALLOW. dbounce's pause window
+	// is the [[safety-mode-lean-permissive]] admin-fallback escape
+	// hatch: an operator on call / mid-demo flips the gate off for a
+	// bounded window without redeploying, and every action that would
+	// have been blocked is recorded as a demote. This synthetic mirrors
+	// the kbounce + ibounce "admin_fallback" event so a single
+	// cross-product SIEM rule keyed on activity_name="admin_fallback"
+	// catches all three products' fallback-grant signals.
+	//
+	// activity_id=99 (Other); activity_name="admin_fallback"; severity
+	// Informational. The original-DENY decision row already lives in
+	// the decisions table + the audit-export stream carries the row's
+	// pause_id under unmapped.iam_jit.ext — this synthetic gives SIEM
+	// consumers a SECOND, easy-to-filter signal that does not require
+	// JOIN-ing decisions against pause_events. Per
+	// [[security-team-positioning-safety-not-surveillance]]: this is
+	// bookkeeping, not an accusation — the operator EXPLICITLY opened
+	// the pause window.
+	EventTypeAdminFallback EventType = "ADMIN_FALLBACK"
+
+	// EventTypeAdminFallbackEnd synthesizes when a pause window closes:
+	// either an operator ran `dbounce pause stop` (end_kind="manual") or
+	// the wall-clock TTL expired (end_kind="expired") or a fresh pause
+	// superseded it (end_kind="superseded"). The dual events
+	// (ADMIN_FALLBACK + ADMIN_FALLBACK_END) bracket the window so a SIEM
+	// consumer can ask "between these two timestamps, which transparent
+	// DENYs were demoted to ALLOW?" without a separate JOIN.
+	//
+	// activity_id=99 (Other); activity_name="admin_fallback_end";
+	// severity Informational. Sibling agents in ibounce + kbounce ship
+	// the same event under the same schema so one cross-product
+	// "fallback ended" rule catches all three.
+	//
+	// Cross-process emission: `dbounce pause stop` runs in a separate
+	// process from `dbounce run`, so the CLI writes a pending row to
+	// the cross-process audit-event queue (store.AddPendingAuditEvent)
+	// + the run-process drains the queue on its sweep tick + emits
+	// through the wired Exporter / RuleEngine. Wall-clock expiry is
+	// detected by whichever process next calls GetActivePause (which
+	// already GCs expired rows); the GC path writes the same queue row.
+	EventTypeAdminFallbackEnd EventType = "ADMIN_FALLBACK_END"
+
+	// EventTypeProfileInstalled synthesizes after a successful
+	// `dbounce profile install --from URL` invocation. Carries the
+	// source URL + the installed profile names + the SHA-256 of the
+	// fetched bytes so a security reviewer can answer "where did this
+	// profile come from?" without a JOIN. Pairs with the Slice 2
+	// RuleEngine.ObserveProfileInstall hook on the receiving side: the
+	// poll-loop that drains the cross-process queue calls both
+	// Exporter.Emit (so the SIEM sees the lifecycle event) AND
+	// RuleEngine.ObserveProfileInstall (so the non_org_profile_install
+	// alert fires when the URL isn't on the operator-configured
+	// org-source allowlist).
+	//
+	// activity_id=99 (Other); activity_name="profile_installed";
+	// severity Informational. Sibling agents in ibounce + kbounce ship
+	// the same event under the same schema so one cross-product
+	// "profile installed" rule catches all three.
+	//
+	// Cross-process emission: `dbounce profile install` runs in a
+	// separate process from `dbounce run`. The install command writes
+	// a pending row to the store's audit-event queue + the run-process
+	// poller drains it on its sweep tick.
+	//
+	// Per-dialect note: dbounce profiles aren't dialect-tagged in the
+	// YAML schema, but operators often distribute per-dialect bundles
+	// (pg-readonly.yaml, mysql-prod.yaml, ...). The CLI does a
+	// best-effort name-heuristic + stamps the detected dialect set
+	// under unmapped.iam_jit.ext.dialects so a SIEM dashboard can
+	// filter "profile installs that touched MySQL." Empty when no
+	// dialect can be inferred.
+	EventTypeProfileInstalled EventType = "PROFILE_INSTALLED"
 )
 
 // Product names the originating Bounce product. Stamped into
@@ -1225,6 +1299,275 @@ func NewAuditDroppedEvent(droppedSinceLast int64, host string) Event {
 				EventType:    string(EventTypeAuditDropped),
 				DroppedCount: droppedSinceLast,
 				Enforced:     false,
+			},
+		},
+	}
+}
+
+// AdminFallbackInfo carries the per-event payload for the
+// ADMIN_FALLBACK + ADMIN_FALLBACK_END synthetics. PauseID + StartedBy
+// + Reason mirror the store.PauseHistoryEntry fields the audit row
+// already references via decisions.pause_id; carrying them on the
+// synthetic lets a SIEM consumer triage from the audit-export alone
+// without JOIN-ing back to SQLite.
+//
+// EndKind is populated only for ADMIN_FALLBACK_END events:
+// "manual" (operator ran `dbounce pause stop`), "expired" (TTL ran
+// out), or "superseded" (a fresh pause overwrote it). For
+// ADMIN_FALLBACK (the open-event) EndKind is empty.
+//
+// DecisionID + StatementType + TablesTouched are populated only when
+// the ADMIN_FALLBACK is fired AS PART OF a specific decision demote
+// — they let the SIEM consumer correlate the synthetic with the
+// underlying audit row without a JOIN. Empty when the event is a
+// stand-alone "pause window opened" notice without an attached
+// decision context.
+type AdminFallbackInfo struct {
+	PauseID       int64
+	StartedBy     string
+	Reason        string
+	EndKind       string
+	DecisionID    int64
+	StatementType string
+	TablesTouched []string
+}
+
+// NewAdminFallbackEvent constructs the synthetic event the proxy fires
+// when an active pause window DEMOTES a transparent-mode DENY to
+// ALLOW. The decision row itself already stamps pause_id so this
+// synthetic is the SECOND signal (per the spec) — a SIEM consumer can
+// pin on activity_name="admin_fallback" without parsing decision
+// rows.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "admin_fallback", type_uid=600399, severity_id=1 (Informational),
+// status_id=99 (Other). Per [[security-team-positioning-safety-not-
+// surveillance]]: status_detail NAMES the demote + identifies the
+// pause window; never accuses the operator.
+//
+// Sibling agents in ibounce + kbounce ship the same event under the
+// same schema so a single cross-product SIEM rule keyed on
+// activity_name="admin_fallback" works for all three. The ext
+// payload fields are the cross-product contract.
+func NewAdminFallbackEvent(host string, info AdminFallbackInfo) Event {
+	ext := map[string]any{
+		"pause_id": info.PauseID,
+	}
+	if info.StartedBy != "" {
+		ext["started_by"] = info.StartedBy
+	}
+	if info.Reason != "" {
+		ext["reason"] = info.Reason
+	}
+	if info.DecisionID > 0 {
+		ext["decision_id"] = info.DecisionID
+	}
+	if info.StatementType != "" {
+		ext["statement_type"] = info.StatementType
+	}
+	if len(info.TablesTouched) > 0 {
+		ext["tables_touched"] = append([]string(nil), info.TablesTouched...)
+	}
+	detail := fmt.Sprintf(
+		"admin-fallback demote: transparent-mode DENY allowed under "+
+			"active pause window (pause_id=%d)", info.PauseID)
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "admin_fallback",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		API: API{
+			Operation: "admin_fallback",
+		},
+		SrcEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeAdminFallback),
+				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
+// NewAdminFallbackEndEvent constructs the synthetic event the proxy
+// fires when a pause window closes — manually, by expiry, or by
+// supersession. Brackets the open-event (NewAdminFallbackEvent) so a
+// SIEM consumer can ask "between t0 (admin_fallback) and t1
+// (admin_fallback_end), which DENYs got demoted?" without a separate
+// JOIN.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "admin_fallback_end", type_uid=600399, severity_id=1
+// (Informational), status_id=99 (Other). EndKind under
+// unmapped.iam_jit.ext.end_kind takes one of {"manual", "expired",
+// "superseded"} so a SIEM consumer can distinguish operator-initiated
+// closures from automatic ones.
+func NewAdminFallbackEndEvent(host string, info AdminFallbackInfo) Event {
+	ext := map[string]any{
+		"pause_id": info.PauseID,
+	}
+	if info.EndKind != "" {
+		ext["end_kind"] = info.EndKind
+	}
+	if info.StartedBy != "" {
+		ext["started_by"] = info.StartedBy
+	}
+	if info.Reason != "" {
+		ext["reason"] = info.Reason
+	}
+	endKind := info.EndKind
+	if endKind == "" {
+		endKind = "unknown"
+	}
+	detail := fmt.Sprintf(
+		"admin-fallback end: pause window closed (pause_id=%d, "+
+			"end_kind=%s)", info.PauseID, endKind)
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "admin_fallback_end",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		API: API{
+			Operation: "admin_fallback_end",
+		},
+		SrcEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeAdminFallbackEnd),
+				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
+// ProfileInstalledInfo carries the per-event payload for the
+// PROFILE_INSTALLED synthetic. Mirrors the InstallObservation the
+// Slice 2 RuleEngine.ObserveProfileInstall consumes (the install
+// hook fires both the lifecycle event AND, when the source isn't on
+// the operator-configured org-source allowlist, the
+// non_org_profile_install alert) — the fields are deliberately
+// identical so the cross-process queue row carries everything both
+// sinks need without a JOIN.
+//
+// Dialects is a best-effort set inferred from the installed profile
+// names (per-dialect bundles are a common operator pattern even
+// though dbounce profiles aren't dialect-tagged in YAML). Stamped
+// under unmapped.iam_jit.ext.dialects when non-empty so a SIEM
+// dashboard can filter "profile installs that touched MySQL"
+// without parsing names. Empty = no dialect could be inferred (a
+// generic / multi-dialect profile bundle); the field is omitted.
+type ProfileInstalledInfo struct {
+	SourceURL      string
+	ProfileNames   []string
+	SHA256         string
+	SHA256Verified bool
+	ProfilesPath   string
+	InstalledBy    string
+	Dialects       []string
+}
+
+// NewProfileInstalledEvent constructs the synthetic event emitted
+// after a successful `dbounce profile install --from URL`. Sibling
+// agents in ibounce + kbounce ship the same event under the same
+// schema so a single cross-product SIEM rule catches all three
+// products' install signals.
+//
+// Schema: class_uid=6003, activity_id=99 (Other), activity_name=
+// "profile_installed", type_uid=600399, severity_id=1
+// (Informational), status_id=99 (Other). Per [[security-team-
+// positioning-safety-not-surveillance]]: status_detail NAMES the
+// install + suggests org-curated distribution; never accuses the
+// operator.
+func NewProfileInstalledEvent(host string, info ProfileInstalledInfo) Event {
+	ext := map[string]any{
+		"source_url":      info.SourceURL,
+		"profile_names":   append([]string(nil), info.ProfileNames...),
+		"sha256":          info.SHA256,
+		"sha256_verified": info.SHA256Verified,
+	}
+	if info.ProfilesPath != "" {
+		ext["profiles_path"] = info.ProfilesPath
+	}
+	if info.InstalledBy != "" {
+		ext["installed_by"] = info.InstalledBy
+	}
+	if len(info.Dialects) > 0 {
+		ext["dialects"] = append([]string(nil), info.Dialects...)
+	}
+	detail := "profile install observed (" + info.SourceURL + ")"
+	if len(info.ProfileNames) > 0 {
+		detail += " — profiles: " + strings.Join(info.ProfileNames, ", ")
+	}
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   ActivityIDOther,
+		ActivityName: "profile_installed",
+		TypeUID:      ocsfTypeUIDBase + ActivityIDOther,
+		TypeName:     typeNameFor(ActivityIDOther),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDOther,
+		Status:       "Other",
+		StatusDetail: detail,
+		API: API{
+			Operation: "profile_installed",
+		},
+		SrcEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeProfileInstalled),
+				Enforced:  false,
+				Ext:       ext,
 			},
 		},
 	}

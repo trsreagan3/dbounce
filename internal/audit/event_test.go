@@ -643,6 +643,128 @@ func TestBuildVersion_DefaultIsDev(t *testing.T) {
 	assert.NotEmpty(t, BuildVersion, "BuildVersion must default to non-empty so events always have metadata.product.version")
 }
 
+// TestNewAdminFallbackEvent_OCSFShape pins the lifecycle synthetic
+// fired by the proxy when an active pause window demotes a
+// transparent-mode DENY. Sibling agents in ibounce + kbounce ship
+// the same shape; the OCSF + ext-field invariants are the cross-
+// product SIEM contract per [[security-team-audit-export]].
+func TestNewAdminFallbackEvent_OCSFShape(t *testing.T) {
+	evt := NewAdminFallbackEvent("127.0.0.1:5433", AdminFallbackInfo{
+		PauseID:       42,
+		StartedBy:     "alice",
+		Reason:        "live demo",
+		DecisionID:    1001,
+		StatementType: "DELETE",
+		TablesTouched: []string{"public.audit_log"},
+	})
+	assert.Equal(t, 6003, evt.ClassUID)
+	assert.Equal(t, ActivityIDOther, evt.ActivityID)
+	assert.Equal(t, "admin_fallback", evt.ActivityName)
+	assert.Equal(t, 600399, evt.TypeUID)
+	assert.Equal(t, ocsfSeverityInformationalID, evt.SeverityID,
+		"admin_fallback is bookkeeping, NOT an alert — severity must be Informational")
+	assert.Equal(t, StatusIDOther, evt.StatusID)
+
+	require.NotNil(t, evt.Unmapped)
+	assert.Equal(t, string(EventTypeAdminFallback), evt.Unmapped.IAMJIT.EventType)
+	require.NotNil(t, evt.Unmapped.IAMJIT.Ext)
+	assert.Equal(t, int64(42), evt.Unmapped.IAMJIT.Ext["pause_id"],
+		"ext.pause_id is the load-bearing JOIN key against pause_events")
+	assert.Equal(t, "alice", evt.Unmapped.IAMJIT.Ext["started_by"])
+	assert.Equal(t, "live demo", evt.Unmapped.IAMJIT.Ext["reason"])
+	assert.Equal(t, int64(1001), evt.Unmapped.IAMJIT.Ext["decision_id"],
+		"ext.decision_id correlates the synthetic with the underlying audit row")
+	assert.Equal(t, "DELETE", evt.Unmapped.IAMJIT.Ext["statement_type"])
+	assert.Equal(t, []string{"public.audit_log"}, evt.Unmapped.IAMJIT.Ext["tables_touched"])
+
+	require.NoError(t, assertOCSFCompliant(evt))
+}
+
+// TestNewAdminFallbackEndEvent_OCSFShape pins the close-event synthetic
+// that brackets ADMIN_FALLBACK. EndKind takes one of {"manual",
+// "expired", "superseded"} per the cross-product contract.
+func TestNewAdminFallbackEndEvent_OCSFShape(t *testing.T) {
+	for _, kind := range []string{"manual", "expired", "superseded"} {
+		t.Run(kind, func(t *testing.T) {
+			evt := NewAdminFallbackEndEvent("127.0.0.1:5433", AdminFallbackInfo{
+				PauseID:   7,
+				StartedBy: "bob",
+				Reason:    "oncall debug",
+				EndKind:   kind,
+			})
+			assert.Equal(t, 6003, evt.ClassUID)
+			assert.Equal(t, ActivityIDOther, evt.ActivityID)
+			assert.Equal(t, "admin_fallback_end", evt.ActivityName)
+			assert.Equal(t, ocsfSeverityInformationalID, evt.SeverityID,
+				"admin_fallback_end is bookkeeping; severity must be Informational")
+
+			require.NotNil(t, evt.Unmapped)
+			assert.Equal(t, string(EventTypeAdminFallbackEnd), evt.Unmapped.IAMJIT.EventType)
+			require.NotNil(t, evt.Unmapped.IAMJIT.Ext)
+			assert.Equal(t, int64(7), evt.Unmapped.IAMJIT.Ext["pause_id"])
+			assert.Equal(t, kind, evt.Unmapped.IAMJIT.Ext["end_kind"],
+				"ext.end_kind must distinguish operator-initiated closures from automatic ones")
+			require.NoError(t, assertOCSFCompliant(evt))
+		})
+	}
+}
+
+// TestNewProfileInstalledEvent_OCSFShape pins the install-lifecycle
+// synthetic emitted after `dbounce profile install --from URL`.
+// Cross-product contract per [[security-team-audit-export]]:
+// ext.{source_url, profile_names, sha256, sha256_verified} are the
+// fields the Slice 2 RuleEngine.ObserveProfileInstall hook also
+// consumes when firing the non_org_profile_install alert.
+func TestNewProfileInstalledEvent_OCSFShape(t *testing.T) {
+	evt := NewProfileInstalledEvent("127.0.0.1:5433", ProfileInstalledInfo{
+		SourceURL:      "https://internal.example/profiles.yaml",
+		ProfileNames:   []string{"pg-readonly", "mysql-prod"},
+		SHA256:         "abc123",
+		SHA256Verified: true,
+		ProfilesPath:   "/tmp/profiles.yaml",
+		InstalledBy:    "carol",
+		Dialects:       []string{"mysql", "postgres"},
+	})
+	assert.Equal(t, 6003, evt.ClassUID)
+	assert.Equal(t, ActivityIDOther, evt.ActivityID)
+	assert.Equal(t, "profile_installed", evt.ActivityName)
+	assert.Equal(t, ocsfSeverityInformationalID, evt.SeverityID,
+		"profile_installed is bookkeeping; the non_org alert fires separately when applicable")
+
+	require.NotNil(t, evt.Unmapped)
+	assert.Equal(t, string(EventTypeProfileInstalled), evt.Unmapped.IAMJIT.EventType)
+	require.NotNil(t, evt.Unmapped.IAMJIT.Ext)
+	assert.Equal(t, "https://internal.example/profiles.yaml",
+		evt.Unmapped.IAMJIT.Ext["source_url"])
+	assert.Equal(t, []string{"pg-readonly", "mysql-prod"},
+		evt.Unmapped.IAMJIT.Ext["profile_names"])
+	assert.Equal(t, "abc123", evt.Unmapped.IAMJIT.Ext["sha256"])
+	assert.Equal(t, true, evt.Unmapped.IAMJIT.Ext["sha256_verified"])
+	assert.Equal(t, "carol", evt.Unmapped.IAMJIT.Ext["installed_by"])
+	assert.Equal(t, []string{"mysql", "postgres"},
+		evt.Unmapped.IAMJIT.Ext["dialects"],
+		"per-dialect note from the spec: dialects must travel on ext.dialects")
+
+	require.NoError(t, assertOCSFCompliant(evt))
+}
+
+// TestNewProfileInstalledEvent_NoDialectsOmitted verifies the
+// per-dialect note's flip side: when no dialect could be inferred,
+// ext.dialects MUST be ABSENT (not emitted as empty) so SIEM
+// dashboards that filter "where dialects is set" don't false-positive
+// on multi-dialect bundles.
+func TestNewProfileInstalledEvent_NoDialectsOmitted(t *testing.T) {
+	evt := NewProfileInstalledEvent("127.0.0.1:5433", ProfileInstalledInfo{
+		SourceURL:    "https://internal.example/profiles.yaml",
+		ProfileNames: []string{"my-org-profile"},
+		SHA256:       "deadbeef",
+	})
+	require.NotNil(t, evt.Unmapped.IAMJIT.Ext)
+	_, hasDialects := evt.Unmapped.IAMJIT.Ext["dialects"]
+	assert.False(t, hasDialects,
+		"ext.dialects MUST be omitted when no dialect could be inferred")
+}
+
 // assertOCSFCompliant is the test-only schema validator we use in lieu
 // of a JSON-Schema library (zero new deps per slice constraints). It
 // checks every OCSF v1.1.0 class-6003 required field is present +

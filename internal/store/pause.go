@@ -51,15 +51,52 @@ func (s *Store) StartPause(reason, startedBy string, ttl time.Duration) (int64, 
 	startStr := now.Format("2006-01-02T15:04:05Z")
 	endStr := ends.Format("2006-01-02T15:04:05Z")
 
-	// Close out any active row first. end_kind="superseded" so reviewers
-	// can distinguish "operator started a fresh pause while one was
-	// running" from "operator ran stop".
+	// Close out any active row first. end_kind="superseded" so
+	// reviewers can distinguish "operator started a fresh pause while
+	// one was running" from "operator ran stop". SELECT-first so we
+	// know which rows we're about to supersede + can enqueue the
+	// matching ADMIN_FALLBACK_END synthetic events (best-effort:
+	// enqueue failure does NOT block the new-pause path because the
+	// synthetic is observability metadata, not a gating signal).
+	prior, perr := s.db.Query(
+		`SELECT id, COALESCE(reason, ''), started_by
+		 FROM pause_events
+		 WHERE ended_at_actual IS NULL`,
+	)
+	if perr != nil {
+		return 0, time.Time{}, fmt.Errorf("dbounce: supersede active pause: select: %w", perr)
+	}
+	type priorRow struct {
+		id        int64
+		reason    string
+		startedBy string
+	}
+	var supersededRows []priorRow
+	for prior.Next() {
+		var r priorRow
+		if err := prior.Scan(&r.id, &r.reason, &r.startedBy); err != nil {
+			_ = prior.Close()
+			return 0, time.Time{}, fmt.Errorf("dbounce: supersede active pause: scan: %w", err)
+		}
+		supersededRows = append(supersededRows, r)
+	}
+	if err := prior.Err(); err != nil {
+		_ = prior.Close()
+		return 0, time.Time{}, fmt.Errorf("dbounce: supersede active pause: iterate: %w", err)
+	}
+	_ = prior.Close()
+
 	if _, err := s.db.Exec(
 		`UPDATE pause_events SET ended_at_actual = ?, end_kind = 'superseded'
 		 WHERE ended_at_actual IS NULL`,
 		startStr,
 	); err != nil {
 		return 0, time.Time{}, fmt.Errorf("dbounce: supersede active pause: %w", err)
+	}
+	for _, r := range supersededRows {
+		payload := buildAdminFallbackEndPayload(r.id, r.startedBy, r.reason, "superseded")
+		_, _ = s.AddPendingAuditEvent(
+			PendingAuditEventAdminFallbackEnd, payload)
 	}
 
 	res, err := s.db.Exec(
@@ -82,6 +119,16 @@ func (s *Store) StartPause(reason, startedBy string, ttl time.Duration) (int64, 
 //
 // end_kind="manual" so reviewers can distinguish from "expired" (TTL
 // ran out) and "superseded" (a fresh pause overwrote it).
+//
+// Side effect per [[security-team-audit-export]]: enqueues an
+// ADMIN_FALLBACK_END pending audit event so the run-process's drain
+// loop picks it up + emits through the wired Exporter / RuleEngine.
+// `dbounce pause stop` runs in a separate process from `dbounce run`
+// — the SQLite queue is the cross-process channel. Best-effort:
+// enqueue failure does NOT block the user-facing pause-stop because
+// the synthetic is observability metadata, not a gating signal.
+// endedBy is recorded in the payload's started_by field for symmetry
+// with the open-event; future schema work may add an ended_by field.
 func (s *Store) StopPause(endedBy string) (int64, error) {
 	active, err := s.GetActivePause()
 	if err != nil {
@@ -98,6 +145,11 @@ func (s *Store) StopPause(endedBy string) (int64, error) {
 	); err != nil {
 		return 0, fmt.Errorf("dbounce: stop pause: %w", err)
 	}
+	payload := buildAdminFallbackEndPayload(
+		active.ID, active.StartedBy, active.Reason, "manual")
+	_, _ = s.AddPendingAuditEvent(
+		PendingAuditEventAdminFallbackEnd, payload)
+	_ = endedBy // recorded in pause history via the row already; reserved
 	return active.ID, nil
 }
 

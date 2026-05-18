@@ -181,6 +181,23 @@ func NewRuleEngine(opts RuleEngineOptions) *RuleEngine {
 	return e
 }
 
+// SetEmitForTest replaces the RuleEngine's emit sink with the
+// supplied closure. EXPORTED for cross-package tests (the
+// internal/proxy wiring tests assert which events flow through the
+// engine without spinning up a full Exporter / transport pipeline);
+// production code MUST go through SetExporter instead. Safe to call
+// concurrently with Observe* (mutex-guarded). Name has the `ForTest`
+// suffix so a future linter pass can flag accidental production
+// usage.
+func (e *RuleEngine) SetEmitForTest(emit func(context.Context, Event) error) {
+	if e == nil {
+		return
+	}
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+	e.emit = emit
+}
+
 // SetExporter wires the engine's alert emit channel to an *Exporter.
 // Safe to call concurrently with Observe* (the emit field is mutex-
 // protected). Pass nil to detach (e.g. during Shutdown so a late

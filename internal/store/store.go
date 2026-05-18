@@ -84,7 +84,16 @@ import (
 //	    proxy's burst sweeper picks it up on its next tick + calls
 //	    Server.SwapProfile. Cross-process safe because both the proxy
 //	    and the CLI / MCP server share this SQLite DB.
-const SchemaVersion = 5
+//	6 — Slice 2 cross-process audit-event queue per
+//	    [[security-team-audit-export]]: `pending_audit_events` table
+//	    that CLI processes (pause stop, profile install) write to + the
+//	    running `dbounce run` process polls + drains on its sweep
+//	    tick. Cross-process correct because every dbounce process
+//	    shares this SQLite DB. Per the Slice 2 spec: emits flow
+//	    through the SAME Exporter + RuleEngine the in-process emit
+//	    sites use so a SIEM consumer sees ONE consistent stream
+//	    regardless of which process originated the event.
+const SchemaVersion = 6
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors DBOUNCE_DB for tests and CI sandboxes that want
@@ -379,6 +388,29 @@ func (s *Store) migrate() error {
 		`CREATE TRIGGER IF NOT EXISTS decisions_no_delete
 			BEFORE DELETE ON decisions
 			BEGIN SELECT RAISE(ABORT, 'dbounce: decisions is append-only (MED-D8-07)'); END`,
+		// pending_audit_events: cross-process audit-event queue per
+		// [[security-team-audit-export]]. CLI processes (`dbounce
+		// pause stop`, `dbounce profile install`) APPEND rows; the
+		// running `dbounce run` process polls + drains on its sweep
+		// tick + emits through its wired Exporter / RuleEngine. The
+		// `payload_json` column is a free-form per-kind payload (parsed
+		// per-kind on the drain side); `kind` is one of
+		// {"admin_fallback_end", "profile_installed"} v6 — additive
+		// future kinds can be added without a schema bump.
+		//
+		// Single-table queue (no separate per-kind tables) so the
+		// drain path is one SELECT...ORDER BY id ASC + one DELETE per
+		// row. Bounded by drain cadence (1s) + the small set of
+		// originating CLI surfaces — typical depth is 0 except briefly
+		// after an install/pause-stop. No idx on kind because the
+		// drain reads ALL pending rows regardless of kind.
+		`CREATE TABLE IF NOT EXISTS pending_audit_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			payload_json TEXT NOT NULL DEFAULT '{}'
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_audit_events_id ON pending_audit_events(id)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
@@ -720,12 +752,51 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 }
 
 // GetActivePause returns the currently-active pause window, or nil
-// when none. D-Slice 1 scaffolding: always returns nil because no code
-// path inserts into pause_events yet. Defined here so /healthz can
-// already gracefully include the pause field in its JSON shape and
-// D-Slice 8 doesn't need to change /healthz signatures.
+// when none. Every call GCs any expired rows (ended_at_actual IS NULL
+// AND ends_at <= now). When a row transitions from "active" to
+// "expired" the GC also enqueues an ADMIN_FALLBACK_END pending audit
+// event so the run-process's drain loop picks it up + emits through
+// the wired Exporter / RuleEngine. Matches the StopPause manual-end
+// path so a SIEM consumer sees one consistent
+// activity_name="admin_fallback_end" signal whether the close was
+// operator-initiated or automatic per [[security-team-audit-export]].
 func (s *Store) GetActivePause() (*PauseRow, error) {
 	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+
+	// SELECT-first so we know WHICH rows are about to be GC'd; the
+	// UPDATE in the same logical step does the actual state change.
+	// Without the SELECT we'd lose the pause_id / started_by / reason
+	// information needed to populate the synthetic
+	// ADMIN_FALLBACK_END event payload — UPDATE...RETURNING isn't
+	// portable across SQLite versions packaged with modernc.org/sqlite.
+	expRows, err := s.db.Query(
+		`SELECT id, COALESCE(reason, ''), started_by
+		 FROM pause_events
+		 WHERE ended_at_actual IS NULL AND ends_at <= ?`, nowStr,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("dbounce: gc expired pauses: select: %w", err)
+	}
+	type expRow struct {
+		id        int64
+		reason    string
+		startedBy string
+	}
+	var expired []expRow
+	for expRows.Next() {
+		var r expRow
+		if err := expRows.Scan(&r.id, &r.reason, &r.startedBy); err != nil {
+			_ = expRows.Close()
+			return nil, fmt.Errorf("dbounce: gc expired pauses: scan: %w", err)
+		}
+		expired = append(expired, r)
+	}
+	if err := expRows.Err(); err != nil {
+		_ = expRows.Close()
+		return nil, fmt.Errorf("dbounce: gc expired pauses: iterate: %w", err)
+	}
+	_ = expRows.Close()
+
 	if _, err := s.db.Exec(
 		`UPDATE pause_events SET ended_at_actual = ends_at, end_kind = 'expired'
 		 WHERE ended_at_actual IS NULL AND ends_at <= ?`,
@@ -733,6 +804,18 @@ func (s *Store) GetActivePause() (*PauseRow, error) {
 	); err != nil {
 		return nil, fmt.Errorf("dbounce: gc expired pauses: %w", err)
 	}
+	// Enqueue ADMIN_FALLBACK_END events for each row we just GC'd.
+	// Best-effort: an enqueue failure is silently swallowed because
+	// the synthetic is observability metadata — the gating-critical
+	// return (active-pause answer) MUST still flow to the proxy hot
+	// path. A persistent enqueue failure surfaces as the queue depth
+	// staying high; that surfaces via /healthz.
+	for _, r := range expired {
+		payload := buildAdminFallbackEndPayload(r.id, r.startedBy, r.reason, "expired")
+		_, _ = s.AddPendingAuditEvent(
+			PendingAuditEventAdminFallbackEnd, payload)
+	}
+
 	row := s.db.QueryRow(
 		`SELECT id, started_at, ends_at, reason, started_by,
 		        COALESCE(ended_at_actual, ''), COALESCE(end_kind, '')
@@ -740,7 +823,7 @@ func (s *Store) GetActivePause() (*PauseRow, error) {
 		 ORDER BY id DESC LIMIT 1`,
 	)
 	var p PauseRow
-	err := row.Scan(&p.ID, &p.StartedAt, &p.EndsAt, &p.Reason, &p.StartedBy, &p.EndedAtActual, &p.EndKind)
+	err = row.Scan(&p.ID, &p.StartedAt, &p.EndsAt, &p.Reason, &p.StartedBy, &p.EndedAtActual, &p.EndKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -748,6 +831,35 @@ func (s *Store) GetActivePause() (*PauseRow, error) {
 		return nil, fmt.Errorf("dbounce: get active pause: %w", err)
 	}
 	return &p, nil
+}
+
+// buildAdminFallbackEndPayload is the JSON payload writers + drainers
+// share for the audit.EventTypeAdminFallbackEnd synthetic.
+// Centralized so the StopPause + GetActivePause + StartPause-supersede
+// sites build the same shape (without each importing the audit
+// package — that would create an import cycle: audit imports store).
+//
+// Schema mirrors audit.AdminFallbackInfo so the drain side
+// (proxy.runPendingAuditEventsPoller) can JSON-decode straight onto
+// it.
+func buildAdminFallbackEndPayload(pauseID int64, startedBy, reason, endKind string) string {
+	return jsonObjectFor(map[string]any{
+		"pause_id":   pauseID,
+		"started_by": startedBy,
+		"reason":     reason,
+		"end_kind":   endKind,
+	})
+}
+
+// jsonObjectFor is a thin encoding/json wrapper that returns "{}" on
+// marshal error (defensive — every caller already passes a fixed-shape
+// map of stringable primitives, so failure is impossible in practice).
+func jsonObjectFor(m map[string]any) string {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // PauseRow is the shape of an active pause window. Defined here so the

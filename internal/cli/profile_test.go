@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/trsreagan3/dbounce/internal/profile"
+	"github.com/trsreagan3/dbounce/internal/store"
 )
 
 // CLI smoke tests for `dbounce profile` subcommands. End-to-end
@@ -134,4 +135,126 @@ func TestProfileInstallDefaults_NoopWhenExists(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "existing",
 		"install-defaults must NEVER overwrite existing profiles.yaml without --force")
+}
+
+// TestInferDialectsFromProfileNames pins the per-dialect-note
+// behavior the Slice 2 wiring depends on per
+// [[security-team-audit-export]]. The emit MUST stamp
+// unmapped.iam_jit.ext.dialects from a name-heuristic so a SIEM
+// dashboard can group "profile installs that touched MySQL" without
+// parsing names.
+func TestInferDialectsFromProfileNames(t *testing.T) {
+	cases := []struct {
+		name  string
+		names []string
+		want  []string
+	}{
+		{
+			"single-pg-prefix",
+			[]string{"pg-readonly"},
+			[]string{"postgres"},
+		},
+		{
+			"mysql-suffix",
+			[]string{"prod-mysql"},
+			[]string{"mysql"},
+		},
+		{
+			"per-dialect-bundle",
+			[]string{"pg-readonly", "mysql-prod", "snowflake-export"},
+			[]string{"mysql", "postgres", "snowflake"},
+		},
+		{
+			"longhand-postgres",
+			[]string{"postgres-prod"},
+			[]string{"postgres"},
+		},
+		{
+			"shorthand-aliases",
+			[]string{"sf-export", "bq-readonly"},
+			[]string{"bigquery", "snowflake"},
+		},
+		{
+			"dedup-on-multiple",
+			[]string{"pg-prod", "pg-staging"},
+			[]string{"postgres"},
+		},
+		{
+			"no-match-empty",
+			[]string{"my-org-profile"},
+			nil,
+		},
+		{
+			"empty-input",
+			nil,
+			nil,
+		},
+		{
+			"case-insensitive",
+			[]string{"PG-Readonly", "MYSQL-PROD"},
+			[]string{"mysql", "postgres"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := inferDialectsFromProfileNames(tc.names)
+			assert.Equal(t, tc.want, got,
+				"per-dialect inference must match the spec: %v → %v", tc.names, tc.want)
+		})
+	}
+}
+
+// TestProfileInstall_EnqueuesAuditEvent verifies emit site #3 of the
+// Slice 2 wiring per [[security-team-audit-export]]: after a
+// successful install, the CLI writes a PROFILE_INSTALLED row to the
+// cross-process audit-event queue. This is Option A from the spec —
+// the run-process poller picks it up + emits through its wired
+// Exporter / RuleEngine. The CLI process itself doesn't construct an
+// exporter (single emit-path invariant).
+func TestProfileInstall_EnqueuesAuditEvent(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "p.yaml")
+	dbPath := filepath.Join(dir, "state.db")
+
+	payload := []byte("profiles:\n  pg-readonly:\n    description: pg test\n")
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	// Drive the install path directly (mirrors the CLI but lets us
+	// skip the TLS-cert dance — same coverage pattern as
+	// TestProfileInstall_RoundTrip above).
+	result, err := profile.Install(
+		t.Context(),
+		profile.InstallOptions{
+			From:         srv.URL,
+			HTTPClient:   profile.InsecureTLSClientForTests(),
+			ProfilesPath: target,
+		})
+	require.NoError(t, err)
+	require.Contains(t, result.InstalledNames, "pg-readonly")
+
+	// Drive the enqueue helper directly to mirror the CLI's
+	// post-install hook (bypasses the Cobra wiring that would
+	// otherwise try to construct a real HTTP fetch on a different
+	// URL).
+	rootCmd := newProfileCmd()
+	enqueueProfileInstalledAuditEvent(rootCmd, dbPath, "alice", result)
+
+	// Verify the row landed.
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+	rows, err := st.DrainPendingAuditEvents(0)
+	require.NoError(t, err)
+	require.Len(t, rows, 1,
+		"profile install MUST enqueue exactly one PROFILE_INSTALLED row")
+	assert.Equal(t, store.PendingAuditEventProfileInstalled, rows[0].Kind)
+	assert.Contains(t, rows[0].PayloadJSON, srv.URL,
+		"payload must carry source_url for the SIEM JOIN key")
+	assert.Contains(t, rows[0].PayloadJSON, "pg-readonly")
+	assert.Contains(t, rows[0].PayloadJSON, `"installed_by":"alice"`)
+	assert.Contains(t, rows[0].PayloadJSON, `"postgres"`,
+		"per-dialect inference must surface dialects from the profile name (pg-readonly → postgres)")
 }

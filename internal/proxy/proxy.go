@@ -453,6 +453,14 @@ type Server struct {
 	// stops promptly (per the heartbeater shutdown ordering closed in
 	// 276298f). nil-safe.
 	burstSweeperCancel context.CancelFunc
+
+	// auditEventsPollerCancel is the context.CancelFunc the Slice 2
+	// cross-process audit-event poller goroutine listens on per
+	// [[security-team-audit-export]]. Same shutdown-ordering
+	// constraint as burstSweeperCancel: invoked by Shutdown BEFORE
+	// connWG.Wait so the 1s-cadence ticker exits + the goroutine's
+	// connWG.Done fires. nil-safe.
+	auditEventsPollerCancel context.CancelFunc
 }
 
 // NewServer constructs a Server without starting it.
@@ -651,6 +659,106 @@ func (s *Server) exportDecisionRowWithAgent(row store.DecisionRow, decisionID in
 	}
 }
 
+// emitAdminFallback fires the ADMIN_FALLBACK synthetic on the wired
+// Exporter + RuleEngine per [[security-team-audit-export]] Slice 2.
+// Called from evaluateAndAuditWithAgent IMMEDIATELY AFTER the
+// decision event is exported, so the SIEM sees the decision row
+// first + then the synthetic that explains the demote.
+//
+// Nil-safe: when neither Exporter nor RuleEngine is wired (FREE-tier
+// default), the function is a no-op. Best-effort emit — the
+// ObserveDecision shape is fire-and-forget per the Slice 2 spec, and
+// a failed alert MUST NOT take down the proxy hot path.
+func (s *Server) emitAdminFallback(info audit.AdminFallbackInfo) {
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
+		return
+	}
+	// Look up the pause window's started_by + reason so the synthetic
+	// carries the human-readable triage context. Best-effort: a store
+	// lookup failure surfaces as an unannotated synthetic (still has
+	// pause_id + decision_id, which is the load-bearing JOIN key).
+	if s.store != nil {
+		if active, err := s.store.GetActivePause(); err == nil && active != nil &&
+			active.ID == info.PauseID {
+			info.StartedBy = active.StartedBy
+			info.Reason = active.Reason
+		}
+	}
+	evt := audit.NewAdminFallbackEvent(s.listenerAddr(), info)
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	if alertsOn {
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+}
+
+// emitAdminFallbackEnd fires the ADMIN_FALLBACK_END synthetic on the
+// wired Exporter + RuleEngine. Called from
+// runPendingAuditEventsPoller when an ADMIN_FALLBACK_END row is
+// drained from the cross-process queue (the queue is fed by
+// store.StopPause + store.GetActivePause's expiry GC +
+// store.StartPause's supersede branch — all three close-paths funnel
+// through the same synthetic).
+//
+// Nil-safe + best-effort identical to emitAdminFallback.
+func (s *Server) emitAdminFallbackEnd(info audit.AdminFallbackInfo) {
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
+		return
+	}
+	evt := audit.NewAdminFallbackEndEvent(s.listenerAddr(), info)
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	if alertsOn {
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+}
+
+// emitProfileInstalled fires the PROFILE_INSTALLED synthetic on the
+// wired Exporter AND the non_org_profile_install alert (via
+// RuleEngine.ObserveProfileInstall) per the Slice 2 spec. Called from
+// runPendingAuditEventsPoller when a PROFILE_INSTALLED row is drained
+// from the cross-process queue (the queue is fed by `dbounce profile
+// install --from URL` which runs in a SEPARATE process from `dbounce
+// run` — Option A: SQLite queue with 1s drain cadence per the spec).
+//
+// Nil-safe + best-effort. The RuleEngine.ObserveProfileInstall hook
+// pattern-matches the source URL against the operator-configured
+// org-source allowlist + fires a SECURITY_ALERT when the URL isn't
+// on the allowlist — that alert AND this lifecycle event flow through
+// the same Exporter so the SIEM sees both signals chronologically.
+func (s *Server) emitProfileInstalled(info audit.ProfileInstalledInfo) {
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
+		return
+	}
+	evt := audit.NewProfileInstalledEvent(s.listenerAddr(), info)
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	if alertsOn {
+		// Lifecycle observe path (so the synthetic itself counts in
+		// rule-engine stats / no-fires-on-synthetics guard).
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+		// Non-org-source alert path: this is the load-bearing
+		// observability signal per the Slice 2 spec — the rule
+		// engine's non_org_profile_install matcher fires here.
+		s.alertEngine.ObserveProfileInstall(context.Background(),
+			audit.InstallObservation{
+				SourceURL:      info.SourceURL,
+				ProfileNames:   info.ProfileNames,
+				SHA256:         info.SHA256,
+				SHA256Verified: info.SHA256Verified,
+			})
+	}
+}
+
 // emitSessionEnded fires a SESSION_ENDED synthetic event for the
 // connection identified by sessionID. Called from the per-protocol
 // connection-close path (PG forwarder + observation-only PG loop +
@@ -737,6 +845,22 @@ func (s *Server) Serve() error {
 	s.burstSweeperCancel = sweepCancel
 	go s.runBurstSweeper(sweepCtx)
 
+	// [[security-team-audit-export]] Slice 2 cross-process audit-event
+	// poller. Drains store.pending_audit_events rows enqueued by
+	// out-of-process CLI commands (`dbounce pause stop`, `dbounce
+	// profile install`, the GetActivePause expiry-GC path) + emits
+	// them through the wired Exporter / RuleEngine. Same goroutine
+	// shape + connWG-joined / cancel-driven shutdown ordering as
+	// runBurstSweeper. Faster tick cadence (1s vs the burst sweeper's
+	// 5s) because operators expect lifecycle signals — especially
+	// admin-fallback-end on `pause stop` — to land in the SIEM
+	// promptly. Per the spec d82ded9 sync-prompt poll precedent: the
+	// 1s cadence balances "SIEM expects prompt visibility" against
+	// "no busy-loop CPU burn when the queue is empty."
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	s.auditEventsPollerCancel = pollCancel
+	go s.runPendingAuditEventsPoller(pollCtx)
+
 	mgmtAddr := fmt.Sprintf("%s:%d", s.cfg.MgmtHost, s.cfg.MgmtPort)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
@@ -810,6 +934,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// sweeper's ticker indefinitely.
 	if s.burstSweeperCancel != nil {
 		s.burstSweeperCancel()
+	}
+	// [[security-team-audit-export]] Slice 2 audit-event poller —
+	// same shutdown ordering as the burst sweeper.
+	if s.auditEventsPollerCancel != nil {
+		s.auditEventsPollerCancel()
 	}
 	done := make(chan struct{})
 	go func() {
@@ -1126,6 +1255,26 @@ func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 	// preserves the legacy event shape for callers that haven't yet
 	// threaded agent context.
 	s.exportDecisionRowWithAgent(row, decisionID, sessionID)
+
+	// #252 Slice 2 wiring per [[security-team-audit-export]]: when a
+	// transparent-mode DENY was DEMOTED to ALLOW by an active pause
+	// window, fire an ADMIN_FALLBACK synthetic alongside the decision
+	// event. dbounce's equivalent of the kbounce + ibounce
+	// "admin-fallback grant" emit site. The decision row itself
+	// already carries pause_id under unmapped.iam_jit.ext; this
+	// synthetic gives SIEM consumers a SECOND, easy-to-filter signal
+	// (activity_name="admin_fallback") without parsing decision rows.
+	// Fires AFTER the decision-event emit so a SIEM consumer sees
+	// the decision in chronological order before the synthetic that
+	// brackets it.
+	if pauseDemoted && pauseID != nil {
+		s.emitAdminFallback(audit.AdminFallbackInfo{
+			PauseID:       *pauseID,
+			DecisionID:    decisionID,
+			StatementType: ps.StatementType,
+			TablesTouched: ps.TablesTouched,
+		})
+	}
 
 	// D-Slice 8 prompt-on-deny enqueue. We only enqueue when:
 	//   - prompt-on-deny is enabled

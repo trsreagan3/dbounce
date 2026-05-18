@@ -9,15 +9,18 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/trsreagan3/dbounce/internal/profile"
+	"github.com/trsreagan3/dbounce/internal/store"
 )
 
 // newProfileCmd implements `dbounce profile ...`.
@@ -221,6 +224,8 @@ func newProfileInstallCmd() *cobra.Command {
 		force          bool
 		timeoutSecs    int
 		profilesPath   string
+		dbPath         string
+		actor          string
 	)
 	cmd := &cobra.Command{
 		Use:   "install --from URL [--sha256 HEX] [--force] [--timeout 10]",
@@ -280,6 +285,20 @@ install refuses without --force.`,
 			fmt.Fprintln(cmd.OutOrStdout(),
 				"These profiles are READ-ONLY (sourced from URL); "+
 					"edit the upstream YAML + re-install to update.")
+
+			// [[security-team-audit-export]] Slice 2: enqueue a
+			// PROFILE_INSTALLED row on the cross-process audit-event
+			// queue. The running `dbounce run` process polls + drains
+			// the queue (proxy.runPendingAuditEventsPoller, 1s
+			// cadence) + emits through its wired Exporter +
+			// RuleEngine. Best-effort: an enqueue failure does NOT
+			// fail the install — the install itself already succeeded
+			// + the synthetic is observability metadata. We surface a
+			// stderr line so an operator who's set up the audit-
+			// export pipeline can see the queue write failed
+			// (typically: state.db permission denied / disk full).
+			enqueueProfileInstalledAuditEvent(
+				cmd, dbPath, resolveActor(actor), result)
 			return nil
 		},
 	}
@@ -297,7 +316,123 @@ install refuses without --force.`,
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.dbounce/profiles.yaml). "+
 			"Honors DBOUNCE_PROFILES_PATH env var if unset.")
+	cmd.Flags().StringVar(&dbPath, "db", "",
+		"SQLite DB path used for the cross-process audit-event queue "+
+			"(default: ~/.dbounce/state.db, or DBOUNCE_DB env). The "+
+			"running `dbounce run` process drains the queue + emits "+
+			"a PROFILE_INSTALLED event through its configured "+
+			"audit-export transports.")
+	cmd.Flags().StringVar(&actor, "actor", "",
+		"Operator id recorded as installed_by on the audit event. "+
+			"Defaults to $USER then 'unknown'.")
 	return cmd
+}
+
+// enqueueProfileInstalledAuditEvent writes the cross-process row the
+// running `dbounce run` process drains on its 1s tick per
+// [[security-team-audit-export]] Slice 2. Best-effort — failure is
+// surfaced via stderr but does NOT fail the install (the install
+// itself already succeeded + the synthetic is observability metadata).
+//
+// Dialect inference: dbounce profiles aren't dialect-tagged in YAML,
+// but operators often distribute per-dialect bundles (pg-readonly,
+// mysql-prod, snowflake-export, ...). We extract dialect tokens from
+// the installed profile names so a SIEM dashboard can filter
+// "profile installs that touched MySQL." Empty when no dialect token
+// matches — the field is omitted from the emit per the
+// audit.ProfileInstalledInfo contract.
+func enqueueProfileInstalledAuditEvent(
+	cmd *cobra.Command, dbPath, actor string, result *profile.InstallResult,
+) {
+	st, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"dbounce: note: open state.db for audit-event enqueue failed: %v "+
+				"(install succeeded; PROFILE_INSTALLED audit event NOT emitted)\n", err)
+		return
+	}
+	defer st.Close()
+
+	payload := map[string]any{
+		"source_url":      result.SourceURL,
+		"profile_names":   result.InstalledNames,
+		"sha256":          result.SHA256,
+		"sha256_verified": result.SHA256Verified,
+		"profiles_path":   result.ProfilesPath,
+		"installed_by":    actor,
+	}
+	dialects := inferDialectsFromProfileNames(result.InstalledNames)
+	if len(dialects) > 0 {
+		payload["dialects"] = dialects
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"dbounce: note: marshal PROFILE_INSTALLED payload failed: %v "+
+				"(install succeeded; audit event NOT emitted)\n", err)
+		return
+	}
+	if _, err := st.AddPendingAuditEvent(
+		store.PendingAuditEventProfileInstalled, string(b)); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"dbounce: note: enqueue PROFILE_INSTALLED audit event failed: %v "+
+				"(install succeeded; the running `dbounce run` process "+
+				"will not see this install on its next drain tick)\n", err)
+	}
+}
+
+// inferDialectsFromProfileNames extracts dialect tokens from the
+// installed profile names. dbounce profiles aren't dialect-tagged in
+// YAML, but operators commonly include the dialect as a name prefix
+// or suffix (pg-readonly, mysql-prod, snowflake-export, ...). This
+// matches token-by-token against the known dialect set + returns the
+// matched dialects sorted (deterministic shape for SIEM dashboards
+// that group by the field value).
+//
+// Match is case-insensitive substring on dash-/underscore-bounded
+// tokens within each profile name. Returns the deduped + sorted set;
+// empty when no dialect token matches.
+func inferDialectsFromProfileNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	// Token aliases per dialect — kept in sync with parser.Dialect +
+	// the cross-product dbounce dialect set. "pg" matches "postgres"
+	// because operators frequently use the shorthand in profile
+	// names ("pg-readonly").
+	aliases := map[string]string{
+		"postgres":  "postgres",
+		"postgresql": "postgres",
+		"pg":        "postgres",
+		"mysql":     "mysql",
+		"snowflake": "snowflake",
+		"sf":        "snowflake",
+		"bigquery":  "bigquery",
+		"bq":        "bigquery",
+	}
+	seen := map[string]struct{}{}
+	for _, name := range names {
+		lower := strings.ToLower(name)
+		// Tokenize on dash + underscore + dot — the common separators
+		// in profile naming conventions.
+		tokens := strings.FieldsFunc(lower, func(r rune) bool {
+			return r == '-' || r == '_' || r == '.'
+		})
+		for _, tok := range tokens {
+			if d, ok := aliases[tok]; ok {
+				seen[d] = struct{}{}
+			}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for d := range seen {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // newProfileInstallDefaultsCmd implements `dbounce profile
