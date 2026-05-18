@@ -133,6 +133,12 @@ Start the wire-protocol listener.
   `~/.dbounce/state.db`, override with `DBOUNCE_DB`).
 - `--dialect postgres` — wire-protocol dialect. Only `postgres`
   recognized in D-Slice 1.
+- `--preset security-observe` — single-flag shortcut for the
+  canonical security-team observation deployment shape (transparent
+  mode + JSONL audit + 30s heartbeat + 30s audit-export health
+  poll). See `docs/DEPLOYMENT-PRESETS.md` for the framework +
+  override semantics; same preset name + same semantics across all
+  four Bounce products.
 
 ### `dbounce audit tail`
 

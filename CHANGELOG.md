@@ -5,6 +5,41 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### `--preset security-observe` deployment preset (#254, 2026-05-19)
+
+- **`dbounce run --preset security-observe`** — single-flag shortcut
+  for the canonical security-team observation deployment shape.
+  Equivalent to the explicit flag bundle `--mode transparent
+  --default-policy allow --audit-log-path ~/.dbounce/audit/dbounce.jsonl
+  --heartbeat-interval 30s --audit-export-health-interval 30s`.
+  Designed for the "gather data first; author profile second"
+  starting position per `[[bouncer-mode-selection-for-agents]]` +
+  the cross-product security-team audit-export memo.
+- HARD override on `--mode` (the entire point of the preset is
+  transparent); passing `--preset security-observe --mode cooperative`
+  errors fast with a clear "drop the preset OR drop the explicit flag"
+  message.
+- SOFT overrides on `--audit-log-path` / `--heartbeat-interval` /
+  `--audit-export-health-interval` / `--default-policy` (operators
+  have different SIEM destinations + cadences).
+- Startup banner names the preset + every derived setting with
+  hard/soft annotation (suppressed when `--quiet-banner` is set,
+  matching the LOW-D8-13 quiet posture).
+- Same preset NAME + same override semantics ship across ibounce /
+  kbounce / gbounce per `[[cross-product-agent-parity]]`. Framework
+  + the post-v1.0 roadmap (`dev-loop`, `production-strict`,
+  `compliance-audit`) are documented at `docs/DEPLOYMENT-PRESETS.md`
+  but explicitly NOT shipped in this slice per
+  `[[deliberate-feature-completion]]`.
+- The cross-product `--alert-rules` setting is implicitly not in
+  dbounce's preset (dbounce never registered the flag; its rule
+  framework is the audit-export-health-interval poll instead).
+- Per `[[security-team-positioning-safety-not-surveillance]]`:
+  preset description + banner use neutral language.
+- Per `[[self-host-zero-billing-dependency]]`: the preset does not
+  configure `--audit-webhook-url`, so a self-hosted security-observe
+  deployment phones home to nothing without an operator action.
+
 ### Schema endpoint + audit-webhook presets surface (#276 + #259, 2026-05-18)
 
 Cross-product `[[cross-product-agent-parity]]` rollout matching the

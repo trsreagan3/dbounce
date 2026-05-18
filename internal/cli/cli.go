@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -515,6 +516,11 @@ func newRunCmd() *cobra.Command {
 		// #271 — bearer token for GET /audit/events when the mgmt port
 		// is bound off-loopback. Empty = loopback-only (no auth gate).
 		auditEventsToken string
+		// #254 — deployment preset. Single-flag shortcut for a common
+		// deployment shape (only `security-observe` in v1.0). Resolved
+		// BEFORE downstream validation so license / SSRF / loopback
+		// gates see the preset-resolved values.
+		deploymentPreset string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -535,6 +541,63 @@ forwarding.
 Ctrl+C exits cleanly (graceful shutdown).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// #254 — deployment preset resolution. Runs BEFORE any
+			// downstream parsing / validation so the preset-resolved
+			// values flow through everything that follows. HARD-
+			// override conflicts (e.g. --preset security-observe
+			// --mode cooperative) fail-fast here with a "drop one OR
+			// the other" message. SOFT overrides flow through. The
+			// preset BANNER lines are stashed for printing alongside
+			// the existing startup banner.
+			var presetBannerLines []string
+			if deploymentPreset != "" {
+				preset := GetPreset(deploymentPreset, "dbounce")
+				if preset == nil {
+					return fmt.Errorf(
+						"dbounce: unknown --preset %q; available: security-observe",
+						deploymentPreset)
+				}
+				operatorChanged := map[string]bool{
+					"mode":                         cmd.Flags().Changed("mode"),
+					"default-policy":               cmd.Flags().Changed("default-policy"),
+					"audit-log-path":               cmd.Flags().Changed("audit-log-path"),
+					"heartbeat-interval":           cmd.Flags().Changed("heartbeat-interval"),
+					"audit-export-health-interval": cmd.Flags().Changed("audit-export-health-interval"),
+				}
+				currentValues := map[string]string{
+					"mode":                         modeStr,
+					"default-policy":               defaultPolStr,
+					"audit-log-path":               auditLogPath,
+					"heartbeat-interval":           heartbeatIntervalStr,
+					"audit-export-health-interval": auditExportHealthIntervalStr,
+				}
+				res, err := ApplyPreset(preset, operatorChanged, currentValues, nil)
+				if err != nil {
+					return err
+				}
+				// Rebind the locals from the preset where the operator
+				// did not override.
+				for _, key := range res.DerivedKeys {
+					pv := preset.Values[key]
+					switch key {
+					case "mode":
+						modeStr = pv.Value
+					case "default-policy":
+						defaultPolStr = pv.Value
+					case "audit-log-path":
+						auditLogPath = pv.Value
+						if d := filepath.Dir(auditLogPath); d != "" {
+							_ = os.MkdirAll(d, 0o700)
+						}
+					case "heartbeat-interval":
+						heartbeatIntervalStr = pv.Value
+					case "audit-export-health-interval":
+						auditExportHealthIntervalStr = pv.Value
+					}
+				}
+				presetBannerLines = FormatBanner(preset, res)
+			}
+
 			mode, err := proxy.ParseMode(modeStr)
 			if err != nil {
 				return err
@@ -933,6 +996,18 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				Quiet:                quietBanner,
 				AuditExporter:        auditExporter,
 			})
+			// #254 — preset-derivation banner sits AFTER the standard
+			// startup banner so the operator sees which settings came
+			// from the preset (vs. their own flags / env). Suppressed
+			// when --quiet-banner is set, mirroring the LOW-D8-13 quiet
+			// posture for the rest of the banner. Same format across
+			// all four Bounce products per [[cross-product-agent-
+			// parity]].
+			if !quietBanner {
+				for _, line := range presetBannerLines {
+					fmt.Fprintln(os.Stderr, line)
+				}
+			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -1236,6 +1311,21 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"mgmt port is bound externally. Empty + loopback mgmt-host = "+
 			"no auth (the loopback bind is the trust anchor). Empty + "+
 			"external mgmt-host = dbounce refuses to start.")
+	// #254 — deployment preset. Single-flag shortcut for a common
+	// deployment shape. v1.0 ships only `security-observe` per
+	// [[deliberate-feature-completion]]; the framework supports more
+	// (see docs/DEPLOYMENT-PRESETS.md for the roadmap).
+	cmd.Flags().StringVar(&deploymentPreset, "preset", "",
+		"#254 — single-flag shortcut for a common deployment shape. "+
+			"security-observe = transparent mode + JSONL audit + 30s "+
+			"heartbeat + 30s audit-export health poll. Designed for the "+
+			"security-team 'gather data first; author profile second' "+
+			"starting shape per [[bouncer-mode-selection-for-agents]]. "+
+			"Some preset values are HARD (e.g. --mode for security-observe "+
+			"— the entire point of the preset is transparent); passing "+
+			"them with a different value is an error. Others are SOFT "+
+			"(e.g. --audit-log-path); the operator's value wins. Startup "+
+			"banner shows which settings are derived from the preset.")
 	return cmd
 }
 
