@@ -448,6 +448,15 @@ func newRunCmd() *cobra.Command {
 		auditWebhookToken     string
 		auditWebhookBatchSize int
 		allowInternalWebhook  bool
+		// #257 webhook presets: vendor-native body/header shapes
+		// applied at send-time. The canonical OCSF event in the
+		// JSONL log file is unchanged; only the webhook body
+		// picks up the vendor overlay. Per [[audit-webhook-presets]]
+		// + [[cross-product-agent-parity]] the same flag names ship
+		// across kbounce / dbounce / ibounce.
+		auditWebhookPreset        string
+		auditWebhookTags          string
+		auditWebhookSentinelTable string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -728,10 +737,15 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			// operator's license-rejected case never opens a webhook
 			// connection / log file. Both transports are optional;
 			// neither configured = no audit-export (FREE-tier default).
+			//
+			// #257 webhook presets: vendor-native body/header overlays
+			// are passed through to the WebhookPusher; the preset
+			// adapter dispatches per-batch at send-time.
 			auditExporter, exporterErr := buildAuditExporter(
 				auditLogPath, auditLogFsync,
 				auditWebhookURL, auditWebhookToken,
 				auditWebhookBatchSize, allowInternalWebhook,
+				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
 				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 				upstreamURL,
 			)
@@ -1000,6 +1014,35 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"influenced webhook URLs (same gate as MED-D8-06 closure on "+
 			"--upstream). Pass only when the webhook collector is a "+
 			"legitimate intranet endpoint.")
+	// #257 webhook presets — vendor-native body/header overlays applied
+	// at send-time. The canonical OCSF event in the JSONL log file is
+	// UNCHANGED — these flags ONLY affect the webhook wire shape. Per
+	// [[cross-product-agent-parity]] the same names ship in kbounce +
+	// ibounce.
+	cmd.Flags().StringVar(&auditWebhookPreset, "audit-webhook-preset", "generic",
+		"Webhook body/header shape: generic | datadog | splunk-hec | sentinel. "+
+			"generic (default) = backward-compat Bearer auth + NDJSON OCSF body. "+
+			"datadog = DD-API-KEY header + ddsource/service/ddtags/status/message "+
+			"overlay onto the OCSF event. splunk-hec = `Splunk <token>` auth + "+
+			"HEC event-wrapped NDJSON with sourcetype=iam_jit:bouncer:dbounce. "+
+			"sentinel = Microsoft Sentinel Log Analytics workspace HMAC-SHA256-"+
+			"signed SharedKey auth (URL must be the workspace's "+
+			"<workspace-id>.ods.opinsights.azure.com/api/logs endpoint + "+
+			"--audit-webhook-token must be the workspace shared key). #257.")
+	cmd.Flags().StringVar(&auditWebhookTags, "audit-webhook-tags", "",
+		"Free-form tags appended to the datadog preset's ddtags (format "+
+			"k1:v1,k2:v2). Ignored by other presets. Vendor-side parsing applies "+
+			"— dbounce does NOT pre-validate the tag syntax (a malformed tag "+
+			"surfaces as a Datadog API 400 + retry-failure visible via the "+
+			"dbounce_audit_export_status MCP tool).")
+	cmd.Flags().StringVar(&auditWebhookSentinelTable, "audit-webhook-sentinel-table",
+		"IamJitBouncer",
+		"Log Analytics custom-table name (Log-Type header) for the sentinel "+
+			"preset. Default IamJitBouncer is the shared cross-product table "+
+			"per [[audit-webhook-presets]] — one custom-log table holds "+
+			"dbounce + kbounce + ibounce rows; operators who prefer per-product "+
+			"tables override this per-deployment. Sentinel custom-log tables "+
+			"have a max name length of 100 chars + must match [A-Za-z0-9_]+.")
 	return cmd
 }
 
@@ -1016,6 +1059,7 @@ func buildAuditExporter(
 	logPath string, logFsync bool,
 	webhookURL, webhookToken string, webhookBatchSize int,
 	allowInternalWebhook bool,
+	webhookPreset, webhookTags, webhookSentinelTable string,
 	listenerHost, upstreamURL string,
 ) (*audit.Exporter, error) {
 	var logWriter *audit.LogWriter
@@ -1046,12 +1090,25 @@ func buildAuditExporter(
 			}
 			return nil, err
 		}
+		// #257 preset selection — parsed here so an unknown name fails
+		// at CLI parse with the valid-set error rather than as an
+		// opaque WebhookPusher construction error.
+		preset, err := audit.ParsePreset(webhookPreset)
+		if err != nil {
+			if logWriter != nil {
+				_ = logWriter.Shutdown(context.Background())
+			}
+			return nil, err
+		}
 		p, err := audit.NewWebhookPusher(audit.WebhookOptions{
-			URL:           webhookURL,
-			Token:         webhookToken,
-			BatchSize:     webhookBatchSize,
-			Host:          listenerHost,
-			AllowInternal: allowInternalWebhook,
+			URL:                 webhookURL,
+			Token:               webhookToken,
+			BatchSize:           webhookBatchSize,
+			Host:                listenerHost,
+			AllowInternal:       allowInternalWebhook,
+			Preset:              preset,
+			PresetExtraTags:     webhookTags,
+			PresetSentinelTable: webhookSentinelTable,
 		})
 		if err != nil {
 			if logWriter != nil {

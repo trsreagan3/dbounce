@@ -38,7 +38,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -61,6 +60,13 @@ type WebhookPusher struct {
 	batchSize  int
 	host       string // proxy listener host for synthesizing AUDIT_DROPPED
 	httpClient *http.Client
+	// preset names the vendor adapter (generic/datadog/splunk-hec/
+	// sentinel). The deliver loop dispatches every batch through
+	// BuildRequest(preset, batch) so vendor-specific URL/headers/body
+	// shapes are applied at send-time. The canonical OCSF event in
+	// the JSONL log file is unaffected. See internal/audit/presets.go
+	// for the per-preset adapter implementations.
+	preset PresetConfig
 
 	ch         chan Event
 	doneCh     chan struct{}
@@ -119,6 +125,26 @@ type WebhookOptions struct {
 	RetryInitialBackoff time.Duration
 	// RetryMaxBackoff caps the exponential growth. Default 32s.
 	RetryMaxBackoff time.Duration
+	// Preset names the vendor adapter (default generic ≡ pre-preset
+	// wire shape — Bearer auth + NDJSON OCSF body). Per the
+	// [[audit-webhook-presets]] memo the operator picks via the
+	// --audit-webhook-preset flag. Empty / unrecognized falls back to
+	// generic.
+	Preset Preset
+	// PresetExtraTags is the --audit-webhook-tags value appended to
+	// the datadog preset's ddtags. Stored at construction so other
+	// presets that may consume free-form tags later can read it
+	// without an options-shape change.
+	PresetExtraTags string
+	// PresetSentinelTable is the --audit-webhook-sentinel-table value
+	// (default IamJitBouncer per [[audit-webhook-presets]]). Used as
+	// the Log-Type header by the sentinel preset.
+	PresetSentinelTable string
+	// PresetProduct overrides the product name the per-preset
+	// overlays stamp (default the package Product const). Operators
+	// who run multiple dbounce instances behind one collector can set
+	// this per-deployment to disambiguate.
+	PresetProduct string
 }
 
 // MaxWebhookBatchSize bounds batch-size at CLI parse + Normalize time.
@@ -198,6 +224,24 @@ func NewWebhookPusher(opts WebhookOptions) (*WebhookPusher, error) {
 			},
 		}
 	}
+	// Preset config — Normalize fills defaults (generic if empty,
+	// product=dbounce if blank, sentinel table=IamJitBouncer) +
+	// validates per-preset prerequisites (sentinel: URL contains a
+	// workspace-id subdomain + token decodes as base64). Per
+	// [[deliberate-feature-completion]] this fires BEFORE the worker
+	// goroutine starts so an operator with a typo'd sentinel URL
+	// fails at startup, not at the first decision.
+	presetCfg := PresetConfig{
+		Preset:        opts.Preset,
+		URL:           opts.URL,
+		Token:         opts.Token,
+		Product:       opts.PresetProduct,
+		ExtraTags:     opts.PresetExtraTags,
+		SentinelTable: opts.PresetSentinelTable,
+	}
+	if err := presetCfg.Normalize(); err != nil {
+		return nil, err
+	}
 	w := &WebhookPusher{
 		url:        opts.URL,
 		parsedURL:  parsed,
@@ -205,6 +249,7 @@ func NewWebhookPusher(opts WebhookOptions) (*WebhookPusher, error) {
 		batchSize:  opts.BatchSize,
 		host:       opts.Host,
 		httpClient: client,
+		preset:     presetCfg,
 		ch:         make(chan Event, opts.QueueSize),
 		doneCh:     make(chan struct{}),
 	}
@@ -308,23 +353,34 @@ func (w *WebhookPusher) deliver(batch []Event, maxAttempts int, initialBackoff, 
 	w.inFlight.Add(int64(len(batch)))
 	defer w.inFlight.Add(-int64(len(batch)))
 
-	body, err := w.encodeBody(batch)
-	if err != nil {
-		w.recordErr(fmt.Errorf("encode batch (%d events): %w", len(batch), err))
-		w.dropped.Add(int64(len(batch)))
-		w.bumpDroppedSince(int64(len(batch)))
-		return
-	}
-
 	backoff := initialBackoff
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, w.url, bytes.NewReader(body))
+		// Per [[audit-webhook-presets]]: BuildRequest is called PER
+		// DELIVERY ATTEMPT — not pre-computed across retries — because
+		// the sentinel preset's HMAC signature includes x-ms-date,
+		// which would expire between the first attempt + a slow
+		// retry. For generic/datadog/splunk-hec the per-attempt rebuild
+		// is a few hundred bytes of allocation; not worth the
+		// complexity of caching.
+		parts, err := BuildRequest(w.preset, batch)
+		if err != nil {
+			w.recordErr(fmt.Errorf("build request (attempt %d/%d): %w", attempt, maxAttempts, err))
+			w.dropped.Add(int64(len(batch)))
+			w.bumpDroppedSince(int64(len(batch)))
+			return
+		}
+		targetURL := parts.URL
+		if targetURL == "" {
+			targetURL = w.url
+		}
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(parts.Body))
 		if err != nil {
 			w.recordErr(fmt.Errorf("build request (attempt %d/%d): %w", attempt, maxAttempts, err))
 			break
 		}
-		req.Header.Set("Content-Type", "application/x-ndjson")
-		req.Header.Set("Authorization", "Bearer "+w.token)
+		for k, v := range parts.Headers {
+			req.Header.Set(k, v)
+		}
 		req.Header.Set("User-Agent", "dbounce-audit-export/"+SchemaVersion)
 		resp, err := w.httpClient.Do(req)
 		if err != nil {
@@ -373,21 +429,6 @@ func (w *WebhookPusher) deliver(batch []Event, maxAttempts int, initialBackoff, 
 			return
 		}
 	}
-}
-
-// encodeBody emits one JSON object per line (NDJSON) — same shape as
-// the JSONL log file. Lets the operator point one collector at both
-// the file (via Fluent Bit) + the webhook (via direct subscribe)
-// without per-transport schema-detection.
-func (w *WebhookPusher) encodeBody(batch []Event) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for _, e := range batch {
-		if err := enc.Encode(e); err != nil {
-			return nil, err
-		}
-	}
-	return buf.Bytes(), nil
 }
 
 // nextBackoff doubles backoff but caps at maxBackoff. Exponential
