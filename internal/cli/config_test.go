@@ -67,9 +67,12 @@ func TestBuildConfigBundle_EmptyFreshDB(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
-	assert.Equal(t, configBundleFormat, bundle.Format)
-	assert.Equal(t, configBundleFormatVersion, bundle.FormatVersion)
-	assert.Equal(t, store.SchemaVersion, bundle.SchemaVersion)
+	assert.Equal(t, ConfigProduct, bundle.Product,
+		"post-#288: product is the cross-product magic; was `format` pre-reconciliation")
+	assert.Equal(t, ConfigSchemaVersion, bundle.SchemaVersion,
+		"post-#288: schema_version is string semver \"1.0\"; was int `format_version: 1` pre-reconciliation")
+	assert.Equal(t, store.SchemaVersion, bundle.StoreSchemaVersion,
+		"post-#288: store-schema version is `store_schema_version`; was `schema_version` (int) pre-reconciliation")
 	assert.Equal(t, "postgres", bundle.RuntimeConfig.Dialect)
 	assert.Equal(t, "tester", bundle.ExportedBy)
 	assert.Empty(t, bundle.Rules,
@@ -133,29 +136,49 @@ func TestBuildConfigBundle_RuleDialectInference(t *testing.T) {
 	assert.NotEmpty(t, bundle.RulePack.Version)
 }
 
-func TestValidateBundle_RejectsWrongFormat(t *testing.T) {
-	b := &ConfigBundle{Format: "kbounce.config", FormatVersion: 1, SchemaVersion: 1, RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"}}
-	err := validateBundle(b, proxy.DialectPostgres, false)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "format")
+// canonBundle returns the post-#288 minimal valid bundle. Tests use it
+// as a base + override the fields they're exercising. Replaces the
+// pre-#288 `Format`/`FormatVersion`/int-`SchemaVersion` literal sets.
+func canonBundle() *ConfigBundle {
+	return &ConfigBundle{
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		StoreSchemaVersion: 1,
+		RuntimeConfig:      RuntimeConfigBlock{Dialect: "postgres"},
+	}
 }
 
-func TestValidateBundle_RejectsFutureFormatVersion(t *testing.T) {
-	b := &ConfigBundle{Format: configBundleFormat, FormatVersion: configBundleFormatVersion + 1, SchemaVersion: 1, RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"}}
+func TestValidateBundle_RejectsWrongProduct(t *testing.T) {
+	b := canonBundle()
+	b.Product = "kbounce"
 	err := validateBundle(b, proxy.DialectPostgres, false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "newer than this binary supports")
+	assert.Contains(t, err.Error(), "product",
+		"post-#288: cross-product reject keys on `product` not `format`")
 }
 
 func TestValidateBundle_RejectsFutureSchemaVersion(t *testing.T) {
-	b := &ConfigBundle{Format: configBundleFormat, FormatVersion: 1, SchemaVersion: store.SchemaVersion + 5, RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"}}
+	b := canonBundle()
+	b.SchemaVersion = "2.0"
 	err := validateBundle(b, proxy.DialectPostgres, false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "schema_version")
+	assert.Contains(t, err.Error(), "schema_version",
+		"post-#288: wire-format-version mismatch surfaces on `schema_version`")
+}
+
+func TestValidateBundle_RejectsFutureStoreSchemaVersion(t *testing.T) {
+	b := canonBundle()
+	b.StoreSchemaVersion = store.SchemaVersion + 5
+	err := validateBundle(b, proxy.DialectPostgres, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "store_schema_version",
+		"post-#288: store-version mismatch surfaces on `store_schema_version` "+
+			"(renamed from pre-#288 `schema_version` to break field-name collision)")
 }
 
 func TestValidateBundle_RejectsDialectMismatch(t *testing.T) {
-	b := &ConfigBundle{Format: configBundleFormat, FormatVersion: 1, SchemaVersion: 1, RuntimeConfig: RuntimeConfigBlock{Dialect: "mysql"}}
+	b := canonBundle()
+	b.RuntimeConfig.Dialect = "mysql"
 	err := validateBundle(b, proxy.DialectPostgres, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dialect")
@@ -163,13 +186,15 @@ func TestValidateBundle_RejectsDialectMismatch(t *testing.T) {
 }
 
 func TestValidateBundle_ForceOverridesDialectMismatch(t *testing.T) {
-	b := &ConfigBundle{Format: configBundleFormat, FormatVersion: 1, SchemaVersion: 1, RuntimeConfig: RuntimeConfigBlock{Dialect: "mysql"}}
+	b := canonBundle()
+	b.RuntimeConfig.Dialect = "mysql"
 	err := validateBundle(b, proxy.DialectPostgres, true)
 	require.NoError(t, err)
 }
 
 func TestValidateBundle_RequiresDialect(t *testing.T) {
-	b := &ConfigBundle{Format: configBundleFormat, FormatVersion: 1, SchemaVersion: 1, RuntimeConfig: RuntimeConfigBlock{Dialect: ""}}
+	b := canonBundle()
+	b.RuntimeConfig.Dialect = ""
 	err := validateBundle(b, proxy.DialectPostgres, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dialect")
@@ -255,7 +280,10 @@ func TestConfigExportCmd_StdoutMode(t *testing.T) {
 
 	var bundle ConfigBundle
 	require.NoError(t, json.Unmarshal(out.Bytes(), &bundle))
-	assert.Equal(t, configBundleFormat, bundle.Format)
+	assert.Equal(t, ConfigProduct, bundle.Product,
+		"post-#288: cross-product magic is `product` (was `format`)")
+	assert.Equal(t, ConfigSchemaVersion, bundle.SchemaVersion,
+		"post-#288: wire-format version is string semver \"1.0\" (was int `format_version: 1`)")
 	assert.Equal(t, "postgres", bundle.RuntimeConfig.Dialect)
 }
 
@@ -276,9 +304,9 @@ func TestConfigImportCmd_AppendsRulesAndSkipsExisting(t *testing.T) {
 	require.NoError(t, st.Close())
 
 	bundle := &ConfigBundle{
-		Format:        configBundleFormat,
-		FormatVersion: 1,
-		SchemaVersion: store.SchemaVersion,
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		StoreSchemaVersion: store.SchemaVersion,
 		ExportedAt:    "2026-05-18T00:00:00Z",
 		RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"},
 		Rules: []ConfigRule{
@@ -299,7 +327,7 @@ func TestConfigImportCmd_AppendsRulesAndSkipsExisting(t *testing.T) {
 		"--db", dbPath,
 		"--profiles-path", profilesPath,
 		"--dialect", "postgres",
-		"--input", bundlePath,
+		"--in", bundlePath,
 		"--actor", "tester",
 	})
 	require.NoError(t, cmd.Execute())
@@ -335,9 +363,9 @@ func TestConfigImportCmd_DryRunWritesNothing(t *testing.T) {
 	bundlePath := filepath.Join(dir, "bundle.json")
 
 	bundle := &ConfigBundle{
-		Format:        configBundleFormat,
-		FormatVersion: 1,
-		SchemaVersion: store.SchemaVersion,
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		StoreSchemaVersion: store.SchemaVersion,
 		ExportedAt:    "2026-05-18T00:00:00Z",
 		RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"},
 		Rules: []ConfigRule{
@@ -357,7 +385,7 @@ func TestConfigImportCmd_DryRunWritesNothing(t *testing.T) {
 		"--db", dbPath,
 		"--profiles-path", profilesPath,
 		"--dialect", "postgres",
-		"--input", bundlePath,
+		"--in", bundlePath,
 		"--dry-run",
 		"--actor", "tester",
 	})
@@ -388,9 +416,9 @@ func TestConfigImportCmd_DialectMismatchRefused(t *testing.T) {
 	bundlePath := filepath.Join(dir, "bundle.json")
 
 	bundle := &ConfigBundle{
-		Format:        configBundleFormat,
-		FormatVersion: 1,
-		SchemaVersion: store.SchemaVersion,
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		StoreSchemaVersion: store.SchemaVersion,
 		ExportedAt:    "2026-05-18T00:00:00Z",
 		RuntimeConfig: RuntimeConfigBlock{Dialect: "snowflake"},
 		Profiles:      ProfilesBlock{},
@@ -405,7 +433,7 @@ func TestConfigImportCmd_DialectMismatchRefused(t *testing.T) {
 	cmd.SetArgs([]string{
 		"--db", dbPath,
 		"--dialect", "postgres",
-		"--input", bundlePath,
+		"--in", bundlePath,
 	})
 	err = cmd.Execute()
 	require.Error(t, err)
@@ -417,7 +445,7 @@ func TestConfigImportCmd_DialectMismatchRefused(t *testing.T) {
 	cmd2.SetArgs([]string{
 		"--db", dbPath,
 		"--dialect", "postgres",
-		"--input", bundlePath,
+		"--in", bundlePath,
 		"--force",
 	})
 	require.NoError(t, cmd2.Execute())
@@ -485,7 +513,7 @@ func TestConfigRoundTrip_RulesAndProfilesPreserved(t *testing.T) {
 		"--db", dstDB,
 		"--profiles-path", dstProfiles,
 		"--dialect", "postgres",
-		"--input", bundlePath,
+		"--in", bundlePath,
 		"--actor", "tester",
 	})
 	require.NoError(t, imp.Execute())
@@ -518,9 +546,9 @@ func TestConfigImportCmd_NonLocalProfileSkipped(t *testing.T) {
 	bundlePath := filepath.Join(dir, "bundle.json")
 
 	bundle := &ConfigBundle{
-		Format:        configBundleFormat,
-		FormatVersion: 1,
-		SchemaVersion: store.SchemaVersion,
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		StoreSchemaVersion: store.SchemaVersion,
 		ExportedAt:    "2026-05-18T00:00:00Z",
 		RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"},
 		Profiles: ProfilesBlock{
@@ -544,7 +572,7 @@ func TestConfigImportCmd_NonLocalProfileSkipped(t *testing.T) {
 		"--db", dbPath,
 		"--profiles-path", profilesPath,
 		"--dialect", "postgres",
-		"--input", bundlePath,
+		"--in", bundlePath,
 		"--actor", "tester",
 	})
 	require.NoError(t, cmd.Execute())
@@ -611,17 +639,314 @@ func TestWriteBundleAtomic_OverwritesExisting(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
 }
 
-func TestConfigImportCmd_RequiresInput(t *testing.T) {
+func TestConfigImportCmd_RequiresIn(t *testing.T) {
 	cmd := newConfigImportCmd()
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	cmd.SetArgs([]string{"--dialect", "postgres"})
 	err := cmd.Execute()
 	require.Error(t, err)
-	// cobra surfaces "required flag(s) \"input\" not set" — message
-	// shape stable across cobra v1.x.
+	// Post-#288: the RunE rather than cobra's required-flag mechanism
+	// surfaces "--in PATH is required" (because --in and --input are
+	// aliases — neither being individually required by cobra; the RunE
+	// rejects when both are unset). Accept either form to ride a
+	// future cobra phrasing change.
 	assert.True(t,
-		strings.Contains(err.Error(), "input") ||
+		strings.Contains(err.Error(), "--in") ||
 			strings.Contains(err.Error(), "required"),
-		"expected the missing --input flag to be surfaced; got %q", err.Error())
+		"expected the missing --in flag to be surfaced; got %q", err.Error())
+}
+
+// TestConfigImportCmd_DeprecatedInputAliasStillWorks asserts that the
+// pre-#288 `--input PATH` form (and its `-i` shorthand) still works.
+// A deprecation warning lands on stderr so the operator knows to
+// update the script before a future major version drops the alias.
+func TestConfigImportCmd_DeprecatedInputAliasStillWorks(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	profilesPath := filepath.Join(dir, "profiles.yaml")
+	bundlePath := filepath.Join(dir, "bundle.json")
+
+	bundle := &ConfigBundle{
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		StoreSchemaVersion: store.SchemaVersion,
+		ExportedAt:         "2026-05-18T00:00:00Z",
+		RuntimeConfig:      RuntimeConfigBlock{Dialect: "postgres"},
+		Profiles:           ProfilesBlock{},
+	}
+	raw, err := json.MarshalIndent(bundle, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(bundlePath, raw, 0o600))
+
+	for _, args := range [][]string{
+		{"--input", bundlePath},
+		{"-i", bundlePath},
+	} {
+		cmd := newConfigImportCmd()
+		out := &bytes.Buffer{}
+		stderr := &bytes.Buffer{}
+		cmd.SetOut(out)
+		cmd.SetErr(stderr)
+		cmd.SetArgs(append([]string{
+			"--db", dbPath,
+			"--profiles-path", profilesPath,
+			"--dialect", "postgres",
+		}, args...))
+		require.NoError(t, cmd.Execute(),
+			"deprecated alias %v must still work", args)
+		assert.Contains(t, stderr.String(), "deprecation",
+			"deprecated alias %v must print a stderr deprecation warning",
+			args)
+		assert.Contains(t, stderr.String(), "--in",
+			"deprecation warning must name the new flag")
+	}
+}
+
+// TestConfigImportCmd_InAndInputMutuallyExclusive — passing both
+// flags simultaneously must be rejected with a clear message. An
+// operator half-completing a flag rename should get an explicit error
+// rather than silent precedence.
+func TestConfigImportCmd_InAndInputMutuallyExclusive(t *testing.T) {
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "bundle.json")
+	bundle := &ConfigBundle{
+		SchemaVersion: ConfigSchemaVersion,
+		Product:       ConfigProduct,
+		RuntimeConfig: RuntimeConfigBlock{Dialect: "postgres"},
+		Profiles:      ProfilesBlock{},
+	}
+	raw, err := json.MarshalIndent(bundle, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(bundlePath, raw, 0o600))
+
+	cmd := newConfigImportCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{
+		"--dialect", "postgres",
+		"--in", bundlePath,
+		"--input", bundlePath,
+	})
+	err = cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "aliases",
+		"--in + --input together must be rejected with an `aliases` message")
+}
+
+// TestConfig_Import_LegacyWireShape asserts that a pre-#288 export
+// (`format: "dbounce.config"` + `format_version: 1` + int
+// `schema_version` naming the store-schema version) imports cleanly
+// into the new binary. The importer rewrites the legacy fields onto
+// the canonical shape + prints a stderr deprecation warning. Loadbearing
+// compat invariant for old exports on disk per the #288 memo.
+func TestConfig_Import_LegacyWireShape(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	profilesPath := filepath.Join(dir, "profiles.yaml")
+	bundlePath := filepath.Join(dir, "legacy.json")
+
+	// Hand-craft a pre-#288 export shape: `format` + `format_version`
+	// + int `schema_version` naming the store version.
+	legacy := map[string]any{
+		"format":         "dbounce.config",
+		"format_version": 1,
+		"schema_version": store.SchemaVersion, // int — pre-#288 store version
+		"exported_at":    "2026-05-17T00:00:00Z",
+		"runtime_config": map[string]any{"dialect": "postgres"},
+		"rules": []any{
+			map[string]any{"pattern": "SELECT:public.*", "effect": "allow"},
+		},
+		"profiles": map[string]any{"items": []any{}},
+	}
+	raw, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(bundlePath, raw, 0o600))
+
+	cmd := newConfigImportCmd()
+	out := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(stderr)
+	cmd.SetArgs([]string{
+		"--db", dbPath,
+		"--profiles-path", profilesPath,
+		"--dialect", "postgres",
+		"--in", bundlePath,
+	})
+	require.NoError(t, cmd.Execute(),
+		"pre-#288 wire-shape bundles MUST import cleanly into the new binary")
+	assert.Contains(t, stderr.String(), "deprecation",
+		"legacy wire shape MUST trigger a stderr deprecation warning")
+	assert.Contains(t, stderr.String(), "format",
+		"deprecation warning must name the legacy fields")
+
+	// The imported rule landed.
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	rs, err := st.ListRules()
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	require.Len(t, rs, 1, "legacy bundle's rule MUST land in the store")
+	assert.Equal(t, "SELECT:public.*", rs[0].Rule.Pattern)
+}
+
+// TestConfig_Import_LegacyTestdataFile pins the
+// `testdata/legacy-pre-288-wire-shape.json` golden file as a
+// regression watchdog. The file lives in the repo so a future
+// shape-normalizer change cannot silently drop legacy compat without
+// the test surfacing the regression.
+func TestConfig_Import_LegacyTestdataFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	profilesPath := filepath.Join(dir, "profiles.yaml")
+
+	src, err := os.ReadFile("testdata/legacy-pre-288-wire-shape.json")
+	require.NoError(t, err,
+		"testdata fixture must exist; the legacy compat invariant is load-bearing")
+	bundlePath := filepath.Join(dir, "legacy.json")
+	require.NoError(t, os.WriteFile(bundlePath, src, 0o600))
+
+	cmd := newConfigImportCmd()
+	stderr := &bytes.Buffer{}
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(stderr)
+	cmd.SetArgs([]string{
+		"--db", dbPath,
+		"--profiles-path", profilesPath,
+		"--dialect", "postgres",
+		"--in", bundlePath,
+	})
+	require.NoError(t, cmd.Execute(),
+		"the testdata legacy fixture MUST keep importing across binary upgrades")
+	assert.Contains(t, stderr.String(), "deprecation")
+}
+
+// TestConfig_Import_LegacyWrongProductRefused — a pre-#288 bundle whose
+// `format` magic names a different product MUST be refused before the
+// rewrite step succeeds (preserving the cross-product reject
+// semantic).
+func TestConfig_Import_LegacyWrongProductRefused(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	bundlePath := filepath.Join(dir, "wrong.json")
+
+	wrong := map[string]any{
+		"format":         "kbounce.config", // wrong product
+		"format_version": 1,
+		"schema_version": 1,
+		"exported_at":    "2026-05-17T00:00:00Z",
+		"runtime_config": map[string]any{"dialect": "postgres"},
+		"rules":          []any{},
+		"profiles":       map[string]any{"items": []any{}},
+	}
+	raw, err := json.Marshal(wrong)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(bundlePath, raw, 0o600))
+
+	cmd := newConfigImportCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{
+		"--db", dbPath,
+		"--dialect", "postgres",
+		"--in", bundlePath,
+	})
+	err = cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "kbounce.config",
+		"legacy wrong-product refusal must name the offending format")
+}
+
+// TestConfig_Roundtrip_OldExportImportsCleanly — the load-bearing
+// cross-version round-trip: an old-shape export imports into the new
+// binary + can be RE-exported in the new canonical shape. Compat is
+// one-way (new binaries read old; new binaries always write new).
+func TestConfig_Roundtrip_OldExportImportsCleanly(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	profilesPath := filepath.Join(dir, "profiles.yaml")
+	bundlePath := filepath.Join(dir, "legacy.json")
+	reExportPath := filepath.Join(dir, "re-export.json")
+
+	legacy := map[string]any{
+		"format":         "dbounce.config",
+		"format_version": 1,
+		"schema_version": store.SchemaVersion,
+		"exported_at":    "2026-05-17T00:00:00Z",
+		"runtime_config": map[string]any{"dialect": "postgres"},
+		"rules":          []any{},
+		"profiles":       map[string]any{"items": []any{}},
+	}
+	raw, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(bundlePath, raw, 0o600))
+
+	// Import the legacy file into the new binary.
+	imp := newConfigImportCmd()
+	imp.SetOut(&bytes.Buffer{})
+	imp.SetErr(&bytes.Buffer{})
+	imp.SetArgs([]string{
+		"--db", dbPath,
+		"--profiles-path", profilesPath,
+		"--dialect", "postgres",
+		"--in", bundlePath,
+	})
+	require.NoError(t, imp.Execute())
+
+	// Re-export. The new export MUST carry the canonical shape.
+	exp := newConfigExportCmd()
+	exp.SetOut(&bytes.Buffer{})
+	exp.SetErr(&bytes.Buffer{})
+	exp.SetArgs([]string{
+		"--db", dbPath,
+		"--profiles-path", profilesPath,
+		"--dialect", "postgres",
+		"--output", reExportPath,
+		"--actor", "tester",
+	})
+	require.NoError(t, exp.Execute())
+	reRaw, err := os.ReadFile(reExportPath)
+	require.NoError(t, err)
+	var re ConfigBundle
+	require.NoError(t, json.Unmarshal(reRaw, &re))
+	assert.Equal(t, ConfigSchemaVersion, re.SchemaVersion,
+		"re-export MUST canonicalize to string \"1.0\"")
+	assert.Equal(t, ConfigProduct, re.Product,
+		"re-export MUST carry the `product` field")
+
+	// The new export MUST NOT carry the pre-#288 deprecated field
+	// names; the wire converged on the new shape.
+	assert.NotContains(t, string(reRaw), `"format":`,
+		"new exports MUST NOT carry the pre-#288 `format` field")
+	assert.NotContains(t, string(reRaw), `"format_version":`,
+		"new exports MUST NOT carry the pre-#288 `format_version` field")
+}
+
+// TestConfig_NormalizeLegacyBundleShape_NewShapePassthrough —
+// the normalizer must be a no-op on already-canonical bundles. A
+// post-#288 export round-trips through the normalizer unchanged.
+func TestConfig_NormalizeLegacyBundleShape_NewShapePassthrough(t *testing.T) {
+	canon := map[string]any{
+		"schema_version":       "1.0",
+		"product":              "dbounce",
+		"exported_at":          "2026-05-18T00:00:00Z",
+		"store_schema_version": store.SchemaVersion,
+		"runtime_config":       map[string]any{"dialect": "postgres"},
+		"rules":                []any{},
+		"profiles":              map[string]any{"items": []any{}},
+	}
+	raw, err := json.Marshal(canon)
+	require.NoError(t, err)
+	stderr := &bytes.Buffer{}
+	out, legacy, err := normalizeLegacyBundleShape(raw, stderr)
+	require.NoError(t, err)
+	assert.False(t, legacy, "canonical bundles MUST NOT be flagged legacy")
+	assert.Equal(t, "", stderr.String(),
+		"canonical bundles MUST NOT trigger a deprecation warning")
+	// Re-decode the output and confirm it carries the same fields.
+	var back map[string]any
+	require.NoError(t, json.Unmarshal(out, &back))
+	assert.Equal(t, "1.0", back["schema_version"])
+	assert.Equal(t, "dbounce", back["product"])
 }

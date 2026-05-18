@@ -2,20 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/trsreagan3/dbounce/schemas/dbounce-config.schema.json",
   "title": "dbounce config export/import bundle",
-  "description": "Portable, human-reviewable snapshot of a dbounce deployment's runtime configuration. Produced by `dbounce config export`; consumed by `dbounce config import`. Per [[basic-app-hygiene-features]] TIER 1 #1.\n\nDialect handling: runtime_config.dialect names one of the four supported dialects. Each profile may declare which dialects it applies to (preserved on round-trip). The active rule pack is referenced by name+version (NOT embedded — pack content ships with the binary).\n\nSchema additions are backwards-compatible: importers MUST tolerate unknown top-level fields + unknown sub-fields under rules/profiles items. format_version bumps only on a real shape break.",
+  "description": "Portable, human-reviewable snapshot of a dbounce deployment's runtime configuration. Produced by `dbounce config export`; consumed by `dbounce config import`. Per [[basic-app-hygiene-features]] TIER 1 #1.\n\nWire-shape parity (#288): top-level `schema_version` (string semver) + `product` field match ibounce + gbounce + kbounce so one cross-product backup script reads identically across the suite. The pre-#288 shape (`format: \"dbounce.config\"` + `format_version: 1` (int) + int `schema_version` naming the store-schema version) is still accepted by the importer; it's normalized to the canonical shape before validation runs, with a stderr deprecation warning. The compat window stays open across the full v1.x line.\n\nDialect handling: runtime_config.dialect names one of the four supported dialects. Each profile may declare which dialects it applies to (preserved on round-trip). The active rule pack is referenced by name+version (NOT embedded — pack content ships with the binary).\n\nSchema additions are backwards-compatible: importers MUST tolerate unknown top-level fields + unknown sub-fields under rules/profiles items.",
   "type": "object",
-  "required": ["format", "format_version", "exported_at", "schema_version", "runtime_config", "rules", "profiles"],
+  "required": ["schema_version", "product", "exported_at", "store_schema_version", "runtime_config", "rules", "profiles"],
   "additionalProperties": true,
   "properties": {
-    "format": {
+    "schema_version": {
       "type": "string",
-      "const": "dbounce.config",
-      "description": "Magic identifier for this bundle shape. Sibling agents in ibounce + kbounce ship the same field with their own magic string (`ibounce.config`, `kbounce.config`) so a SIEM or unified config tool can fan out per product."
+      "enum": ["1.0"],
+      "description": "Wire-format version (string semver). Currently \"1.0\" per the #288 cross-product reconciliation. Bumps to \"1.1\" (additive) or \"2.0\" (breaking) preserve the parser shape across version drift. The pre-#288 shape used int 1 here to mean the STORE schema version — importers accept that legacy form and rename it to `store_schema_version` before validation."
     },
-    "format_version": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Bundle-format version. v1 is the initial shape. Importers reject bundles whose format_version > the importer's max known version."
+    "product": {
+      "type": "string",
+      "enum": ["dbounce"],
+      "description": "Product name. Must be \"dbounce\" for a dbounce import — the importer refuses bundles from sibling Bounce products. Replaces the pre-#288 `format: \"dbounce.config\"` magic string (same semantic, the cross-product-canonical field name)."
     },
     "exported_at": {
       "type": "string",
@@ -30,10 +30,14 @@
       "type": "string",
       "description": "The exporter's `dbounce --version` string. Informational; importers MAY warn on a major-version mismatch but MUST NOT reject."
     },
-    "schema_version": {
+    "source_hostname_hash": {
+      "type": "string",
+      "description": "sha256[:12] of os.Hostname() at export time. Privacy-preserving attribution: a reviewer can tell two bundles produced on different hosts apart without leaking the literal hostname into a file the operator may share. Matches the kbounce + ibounce + gbounce + dbounce-backup-metadata convention."
+    },
+    "store_schema_version": {
       "type": "integer",
       "minimum": 1,
-      "description": "The store.SchemaVersion at export time. Import refuses when the importer's schema_version < exported schema_version (older binary cannot read a newer bundle). Equal or newer importer schema_version is always accepted (additive migrations only — see store.go)."
+      "description": "The store.SchemaVersion at export time. Import refuses when the importer's store schema is older than the exporter's (older binary cannot read a newer-schema bundle). Equal or newer importer store-schema is always accepted (additive migrations only — see store.go). Renamed from pre-#288 `schema_version` to break the field-name collision with the new wire-format `schema_version` (string semver)."
     },
     "runtime_config": {
       "type": "object",

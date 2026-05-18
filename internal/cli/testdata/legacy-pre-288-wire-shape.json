@@ -1,0 +1,27 @@
+{
+  "format": "dbounce.config",
+  "format_version": 1,
+  "schema_version": 1,
+  "exported_at": "2026-05-17T00:00:00Z",
+  "exported_by": "tester",
+  "dbounce_version": "v0.9.0-pre-288",
+  "runtime_config": {
+    "dialect": "postgres"
+  },
+  "rule_pack": {
+    "name": "postgres",
+    "embedded": true
+  },
+  "rules": [
+    {
+      "id": 1,
+      "pattern": "SELECT:public.*",
+      "effect": "allow",
+      "note": "pre-#288 export"
+    }
+  ],
+  "profiles": {
+    "active": "",
+    "items": []
+  }
+}

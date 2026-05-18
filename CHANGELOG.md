@@ -5,6 +5,42 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Cross-product config-export wire reconciliation (#288, 2026-05-18)
+
+Closes `[[cross-product-agent-parity]]`-#288. The `dbounce config
+export/import` wire shape now matches ibounce + gbounce + kbounce
+exactly so a single cross-product backup workflow targets every Bounce
+product with one CLI shape.
+
+- **`schema_version`** is now `"1.0"` (string semver) instead of int
+  `format_version: 1`. Bumps to `"1.1"` (additive) or `"2.0"`
+  (breaking) preserve the parser shape across version drift.
+- **`format: "dbounce.config"`** magic string is DROPPED. The
+  cross-product-canonical `product: "dbounce"` field carries the same
+  cross-product-reject semantic with the same field name the other
+  Bounce products use.
+- **`schema_version: <int>` (pre-#288: STORE schema version)** renamed
+  to **`store_schema_version: <int>`** to break the field-name
+  collision with the new wire-format `schema_version`.
+- **`--in PATH`** is the primary `config import` flag (matches
+  ibounce + gbounce + kbounce). `--input PATH` / `-i PATH` stay as
+  DEPRECATED aliases — still work, print a stderr deprecation warning.
+- **`source_hostname_hash`** field added — sha256[:12] of os.Hostname()
+  per the same privacy-preserving attribution convention used by
+  `dbounce backup` metadata + the sibling Bounce products.
+- **Backwards compat** — pre-#288 exports (`format` + `format_version`
+  + int `schema_version`) import cleanly into the new binary. The
+  importer rewrites the legacy fields onto the canonical shape before
+  schema validation runs + prints a stderr deprecation warning. The
+  compat window stays open across the full v1.x line.
+- **Testdata fixture** —
+  `internal/cli/testdata/legacy-pre-288-wire-shape.json` pins a
+  pre-#288 export as a regression watchdog so a future shape-
+  normalizer change cannot silently drop legacy compat.
+- **Docs** — new `docs/CONFIG-EXPORT-IMPORT.md` covers the wire shape,
+  CLI flags, cross-product parity contract, and backwards-compat
+  window.
+
 ### SQLite backup + restore (#279, 2026-05-18)
 
 Two new top-level subcommands ship online backup + structured restore of

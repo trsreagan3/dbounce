@@ -14,8 +14,9 @@
 //
 // What ships in the bundle (schema: schemas/dbounce-config.schema.json):
 //
-//   - format + format_version + exported_at + exported_by +
-//     dbounce_version + schema_version  — provenance for the reviewer
+//   - schema_version + product + dbounce_version + exported_at +
+//     exported_by + source_hostname_hash + store_schema_version
+//                                          — provenance for the reviewer
 //   - runtime_config.dialect              — load-bearing; importer
 //                                           refuses on a mismatch
 //                                           unless --force
@@ -87,9 +88,12 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,38 +109,68 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// configBundleFormat is the magic string identifying the bundle shape.
-// Importers reject bundles whose format string doesn't match. Sibling
-// agents in ibounce + kbounce use their own product-namespaced strings
-// (ibounce.config / kbounce.config) so a mistyped product can't silently
-// land on the wrong binary.
-const configBundleFormat = "dbounce.config"
+// ConfigSchemaVersion is the wire-format version of the bundle JSON.
+// String semver per the #288 cross-product reconciliation: lets us bump
+// "1.0" → "1.1" (additive) vs "2.0" (breaking) without changing the
+// parser shape. Matches the ibounce + gbounce + kbounce shape so a
+// customer's single cross-product backup parser handles every Bounce
+// product identically.
+const ConfigSchemaVersion = "1.0"
 
-// configBundleFormatVersion is the bundle-shape version. v1 = initial
-// release. Bumps only on a real shape break (additive fields are
-// backwards-compatible — importers tolerate unknown fields by design).
-const configBundleFormatVersion = 1
+// ConfigProduct is the product name stamped into every export.
+// Refusing imports whose `product` field doesn't match is the
+// load-bearing "you can't import a kbounce / ibounce / gbounce export
+// into dbounce" guard. Replaces the pre-#288 `format` magic string
+// (which carried the same semantic by a different name); the importer
+// still accepts the legacy `format: "dbounce.config"` shape for
+// backwards compat.
+const ConfigProduct = "dbounce"
+
+// legacyBundleFormat is the pre-#288 magic string. New exports do NOT
+// emit it; the importer accepts it (alongside the legacy `format_version`
+// int) so old exports on disk stay readable indefinitely.
+const legacyBundleFormat = "dbounce.config"
+
+// legacyBundleFormatVersion is the pre-#288 wire value (raw int 1).
+// New exports always emit the string-semver `schema_version` form, but
+// importers accept the int form across the v1.x compat window.
+const legacyBundleFormatVersion = 1
 
 // ConfigBundle is the on-disk JSON shape. The schema lives at
 // schemas/dbounce-config.schema.json and is the authoritative
 // definition; this struct mirrors it for the marshal/unmarshal path.
 //
+// Wire-shape reconciliation (#288): the top-level field order matches
+// ibounce + gbounce + kbounce so a SIEM / backup-script parser sees
+// the same shape across the suite:
+//
+//   schema_version       — string semver ("1.0"); was `format_version` (int 1)
+//   product              — "dbounce"; was carried only inside the `format` magic
+//   dbounce_version      — informational
+//   exported_at          — ISO-8601 UTC
+//   source_hostname_hash — sha256[:12] of os.Hostname()
+//   store_schema_version — the store.SchemaVersion at export time (was
+//                          named `schema_version` pre-#288; renamed to
+//                          break the field-name collision with the new
+//                          wire-format `schema_version`)
+//
 // `omitempty` on every optional field keeps the export terse — a fresh
 // install with no rules + no profiles produces a small bundle a
 // reviewer can read in one screen.
 type ConfigBundle struct {
-	Format         string             `json:"format"`
-	FormatVersion  int                `json:"format_version"`
-	ExportedAt     string             `json:"exported_at"`
-	ExportedBy     string             `json:"exported_by,omitempty"`
-	DbounceVersion string             `json:"dbounce_version,omitempty"`
-	SchemaVersion  int                `json:"schema_version"`
-	RuntimeConfig  RuntimeConfigBlock `json:"runtime_config"`
-	RulePack       *RulePackRef       `json:"rule_pack,omitempty"`
-	Rules          []ConfigRule       `json:"rules"`
-	Profiles       ProfilesBlock      `json:"profiles"`
-	Pause          *PauseBlock        `json:"pause,omitempty"`
-	Tasks          []TaskBlock        `json:"tasks,omitempty"`
+	SchemaVersion      string             `json:"schema_version"`
+	Product            string             `json:"product"`
+	DbounceVersion     string             `json:"dbounce_version,omitempty"`
+	ExportedAt         string             `json:"exported_at"`
+	ExportedBy         string             `json:"exported_by,omitempty"`
+	SourceHostnameHash string             `json:"source_hostname_hash,omitempty"`
+	StoreSchemaVersion int                `json:"store_schema_version"`
+	RuntimeConfig      RuntimeConfigBlock `json:"runtime_config"`
+	RulePack           *RulePackRef       `json:"rule_pack,omitempty"`
+	Rules              []ConfigRule       `json:"rules"`
+	Profiles           ProfilesBlock      `json:"profiles"`
+	Pause              *PauseBlock        `json:"pause,omitempty"`
+	Tasks              []TaskBlock        `json:"tasks,omitempty"`
 }
 
 // RuntimeConfigBlock carries the dialect (the load-bearing per-dialect
@@ -355,8 +389,8 @@ importer with a different --dialect will refuse the bundle.`,
 			// config_change.dialects can filter "exports of the
 			// snowflake surface."
 			details := map[string]any{
-				"format":         configBundleFormat,
-				"format_version": configBundleFormatVersion,
+				"product":        ConfigProduct,
+				"schema_version": ConfigSchemaVersion,
 				"dialect":        string(dialect),
 				"rule_count":     len(bundle.Rules),
 				"profile_count":  len(bundle.Profiles.Items),
@@ -397,15 +431,16 @@ importer with a different --dialect will refuse the bundle.`,
 
 func newConfigImportCmd() *cobra.Command {
 	var (
-		dbPath       string
-		profilesPath string
-		dialectStr   string
-		inPath       string
-		dryRun       bool
-		force        bool
-		replace      bool
-		actor        string
-		asJSON       bool
+		dbPath        string
+		profilesPath  string
+		dialectStr    string
+		inPath        string // primary flag per #288 — matches ibounce / gbounce / kbounce
+		legacyInPath  string // pre-#288 --input/-i alias
+		dryRun        bool
+		force         bool
+		replace       bool
+		actor         string
+		asJSON        bool
 	)
 	cmd := &cobra.Command{
 		Use:   "import",
@@ -419,10 +454,22 @@ Per [[creates-never-mutates]]:
     unless --replace is passed)
   - operational state (pause, tasks) is NOT re-played
 
+Cross-product flag parity per #288: ` + "`--in PATH`" + ` is the primary
+form (matches ibounce + gbounce + kbounce so one cross-product backup
+script can target every Bounce product). ` + "`--input PATH`" + ` /
+` + "`-i PATH`" + ` are preserved as DEPRECATED aliases — they still
+work but print a stderr deprecation warning.
+
 Dialect compatibility: the importer refuses bundles whose
 runtime_config.dialect does NOT match --dialect; override with --force
 at your own risk (the rule patterns may carry table-glob prefixes that
 do not exist in the target dialect's schema).
+
+Backwards compatibility: pre-#288 exports carrying the legacy
+` + "`format` / `format_version`" + ` fields (and an int
+` + "`schema_version`" + ` that named the store-schema version) import
+cleanly into this binary. The importer normalizes them to the canonical
+shape and prints a stderr deprecation warning.
 
 Use --dry-run to preview what the import would change without writing
 anything.`,
@@ -432,16 +479,41 @@ anything.`,
 			if err != nil {
 				return err
 			}
-			if inPath == "" || inPath == "-" {
-				return errors.New("--input is required (use a file path; stdin not supported v1.0)")
+			// Resolve source from --in (primary) or --input/-i
+			// (deprecated alias per #288). Both set: refuse with a
+			// clear message; neither set: require --in.
+			source := inPath
+			if source == "" && legacyInPath != "" {
+				source = legacyInPath
+				fmt.Fprintln(cmd.ErrOrStderr(),
+					"dbounce: deprecation: --input/-i PATH is renamed to "+
+						"--in PATH for cross-product parity (ibounce + gbounce + "+
+						"kbounce all use --in). The --input/-i aliases still work "+
+						"but will be removed in a future major version. Update "+
+						"your scripts to --in PATH.")
+			} else if inPath != "" && legacyInPath != "" {
+				return errors.New(
+					"dbounce: --in and --input/-i are aliases for the same flag; pass " +
+						"exactly one (prefer --in; --input/-i is deprecated)")
 			}
-			raw, err := os.ReadFile(inPath)
+			if source == "" || source == "-" {
+				return errors.New("dbounce: --in PATH is required (stdin not supported v1.0)")
+			}
+			raw, err := os.ReadFile(source)
 			if err != nil {
-				return fmt.Errorf("read bundle %q: %w", inPath, err)
+				return fmt.Errorf("read bundle %q: %w", source, err)
+			}
+			// Normalize pre-#288 wire shapes (format / format_version / int
+			// schema_version) onto the canonical shape so the downstream
+			// json.Unmarshal hits the renamed fields cleanly. Deprecation
+			// warnings ride cmd.ErrOrStderr().
+			normalized, _, nerr := normalizeLegacyBundleShape(raw, cmd.ErrOrStderr())
+			if nerr != nil {
+				return fmt.Errorf("parse bundle %q: %w", source, nerr)
 			}
 			var bundle ConfigBundle
-			if uerr := json.Unmarshal(raw, &bundle); uerr != nil {
-				return fmt.Errorf("parse bundle %q: %w", inPath, uerr)
+			if uerr := json.Unmarshal(normalized, &bundle); uerr != nil {
+				return fmt.Errorf("parse bundle %q: %w", source, uerr)
 			}
 			if verr := validateBundle(&bundle, dialect, force); verr != nil {
 				return verr
@@ -469,7 +541,7 @@ anything.`,
 					prefix = "DRY-RUN: "
 				}
 				fmt.Fprintf(w, "%simported dbounce config bundle from %s (dialect=%s)\n",
-					prefix, inPath, bundle.RuntimeConfig.Dialect)
+					prefix, source, bundle.RuntimeConfig.Dialect)
 				fmt.Fprintf(w, "  rules:    %d added, %d skipped (%d errored)\n",
 					result.RulesImported, result.RulesSkipped, len(result.RuleErrors))
 				fmt.Fprintf(w, "  profiles: %d added, %d skipped (%d errored)\n",
@@ -493,10 +565,10 @@ anything.`,
 			// observe planning activity in addition to apply activity
 			// can filter on it.
 			details := map[string]any{
-				"format":            configBundleFormat,
-				"format_version":    bundle.FormatVersion,
+				"product":           bundle.Product,
+				"schema_version":    bundle.SchemaVersion,
 				"dialect":           bundle.RuntimeConfig.Dialect,
-				"path":              inPath,
+				"path":              source,
 				"rules_imported":    result.RulesImported,
 				"rules_skipped":     result.RulesSkipped,
 				"profiles_imported": result.ProfilesImported,
@@ -539,8 +611,15 @@ anything.`,
 		"profiles.yaml path (default: ~/.dbounce/profiles.yaml, or DBOUNCE_PROFILES_PATH env).")
 	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
 		"Runtime dialect of the target deployment. Importer refuses on mismatch unless --force.")
-	cmd.Flags().StringVarP(&inPath, "input", "i", "",
-		"Input bundle path. Required.")
+	cmd.Flags().StringVar(&inPath, "in", "",
+		"Input bundle path. Required (or pass the deprecated --input / -i alias).")
+	cmd.Flags().StringVarP(&legacyInPath, "input", "i", "",
+		"DEPRECATED: pre-#288 alias for --in PATH. Still works, prints "+
+			"a stderr deprecation warning. Update scripts to --in.")
+	// MarkDeprecated would hide --input from --help; we keep it
+	// visible so an operator who runs `dbounce config import --help`
+	// after migrating from an older binary sees the explicit note
+	// rather than wondering where --input went.
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
 		"Parse + validate + simulate without writing anything.")
 	cmd.Flags().BoolVar(&force, "force", false,
@@ -552,7 +631,6 @@ anything.`,
 			"Defaults to $USER then 'unknown'.")
 	cmd.Flags().BoolVar(&asJSON, "json", false,
 		"Emit a machine-readable JSON summary instead of the human banner.")
-	_ = cmd.MarkFlagRequired("input")
 	return cmd
 }
 
@@ -659,12 +737,13 @@ func buildConfigBundle(p buildBundleParams) (*ConfigBundle, error) {
 	pack := rulePackFor(p.Dialect)
 
 	bundle := &ConfigBundle{
-		Format:         configBundleFormat,
-		FormatVersion:  configBundleFormatVersion,
-		ExportedAt:     time.Now().UTC().Format(time.RFC3339),
-		ExportedBy:     p.ExportedBy,
-		DbounceVersion: versionString(),
-		SchemaVersion:  store.SchemaVersion,
+		SchemaVersion:      ConfigSchemaVersion,
+		Product:            ConfigProduct,
+		DbounceVersion:     versionString(),
+		ExportedAt:         time.Now().UTC().Format(time.RFC3339),
+		ExportedBy:         p.ExportedBy,
+		SourceHostnameHash: sourceHostnameHash(),
+		StoreSchemaVersion: store.SchemaVersion,
 		RuntimeConfig: RuntimeConfigBlock{
 			Dialect: string(p.Dialect),
 		},
@@ -679,6 +758,23 @@ func buildConfigBundle(p buildBundleParams) (*ConfigBundle, error) {
 		Tasks: taskBlocks,
 	}
 	return bundle, nil
+}
+
+// sourceHostnameHash returns the sha256[:12] hex digest of os.Hostname().
+// Matches the privacy-preserving attribution pattern used by the SQLite
+// backup metadata (#279) + the ibounce + gbounce config exports per
+// [[cross-product-agent-parity]]: an operator can tell two bundles
+// produced on different hosts apart without leaking the literal
+// hostname into a file they may share with a reviewer or check into a
+// config repo. Empty hostname → empty string (caller's omitempty drops
+// the field).
+func sourceHostnameHash() string {
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(h))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // profileToConfig projects a profile.Profile to its export shape. The
@@ -816,31 +912,32 @@ func writeBundleAtomic(path string, b []byte) error {
 
 // validateBundle runs the cross-version + cross-dialect guards. Called
 // AFTER json.Unmarshal so callers can inspect malformed-shape errors
-// separately from dialect / version mismatches.
+// separately from dialect / version mismatches. Assumes the bundle has
+// already passed through normalizeLegacyBundleShape (which rewrites
+// pre-#288 wire fields onto the new `product` + `schema_version` shape);
+// validateBundle treats both old and new exports identically here.
 func validateBundle(b *ConfigBundle, dialect proxy.Dialect, force bool) error {
 	if b == nil {
 		return errors.New("bundle is nil")
 	}
-	if b.Format != configBundleFormat {
+	if b.Product != ConfigProduct {
 		return fmt.Errorf(
-			"bundle format %q is not %q (was this produced by a different product? sibling agents in ibounce + kbounce use their own format strings)",
-			b.Format, configBundleFormat)
+			"bundle product %q is not %q (was this produced by a different product? sibling agents in ibounce + kbounce + gbounce use their own product names)",
+			b.Product, ConfigProduct)
 	}
-	if b.FormatVersion < 1 {
-		return fmt.Errorf("bundle format_version must be >= 1 (got %d)", b.FormatVersion)
-	}
-	if b.FormatVersion > configBundleFormatVersion {
+	if b.SchemaVersion != ConfigSchemaVersion {
 		return fmt.Errorf(
-			"bundle format_version %d is newer than this binary supports (max %d). "+
-				"Upgrade dbounce or downgrade the bundle producer.",
-			b.FormatVersion, configBundleFormatVersion)
+			"bundle schema_version %q is not the supported version %q. "+
+				"Upgrade dbounce or re-export the bundle on a binary that "+
+				"matches the import target.",
+			b.SchemaVersion, ConfigSchemaVersion)
 	}
-	if b.SchemaVersion > store.SchemaVersion {
+	if b.StoreSchemaVersion > store.SchemaVersion {
 		return fmt.Errorf(
-			"bundle schema_version %d is newer than this binary's store.SchemaVersion %d. "+
+			"bundle store_schema_version %d is newer than this binary's store.SchemaVersion %d. "+
 				"Upgrade dbounce; running an older binary against a newer-schema bundle "+
 				"can silently drop fields.",
-			b.SchemaVersion, store.SchemaVersion)
+			b.StoreSchemaVersion, store.SchemaVersion)
 	}
 	if b.RuntimeConfig.Dialect == "" {
 		return errors.New("bundle runtime_config.dialect is required")
@@ -853,6 +950,123 @@ func validateBundle(b *ConfigBundle, dialect proxy.Dialect, force bool) error {
 			b.RuntimeConfig.Dialect, dialect)
 	}
 	return nil
+}
+
+// normalizeLegacyBundleShape rewrites a pre-#288 dbounce export onto
+// the post-#288 canonical shape so json.Unmarshal hits the renamed
+// fields cleanly. Returns the (possibly modified) payload + a flag
+// indicating whether a legacy shape was actually seen. Bundles that
+// already carry the new shape pass through unchanged.
+//
+// The transformations:
+//   - `format: "dbounce.config"` → dropped (carried into `product`
+//     synthetically; the legacy magic string only ever named dbounce)
+//   - `format_version: 1` (int)  → `schema_version: "1.0"` (string)
+//   - existing `schema_version: N` (int store-version) → renamed
+//     to `store_schema_version: N`
+//   - `product` field synthesized as "dbounce"
+//
+// Per the #288 reconciliation memo: importers MUST tolerate the old
+// shape indefinitely (or at minimum across the entire v1.x line) so
+// exports on disk stay readable across binary upgrades. A stderr
+// deprecation warning is written to deprecationOut (when non-nil)
+// per encountered legacy shape so a scripted operator sees the
+// heads-up exactly once per import.
+func normalizeLegacyBundleShape(raw []byte, deprecationOut io.Writer) ([]byte, bool, error) {
+	var head map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &head); err != nil {
+		// Defer the descriptive error to the downstream json.Unmarshal —
+		// it surfaces the same parse failure with the typed-struct
+		// context.
+		return raw, false, nil
+	}
+
+	// Detect legacy shape by the presence of `format` OR `format_version`.
+	// New shape never carries either field (the marshal-side struct
+	// has no Format / FormatVersion fields).
+	_, hasFormat := head["format"]
+	formatVersionRaw, hasFormatVersion := head["format_version"]
+	if !hasFormat && !hasFormatVersion {
+		// Already-new shape: nothing to do. The downstream Unmarshal
+		// hits the canonical fields directly.
+		return raw, false, nil
+	}
+
+	// Validate the legacy `format` magic when present. We REFUSE
+	// non-dbounce magic strings before doing the rewrite so a bundle
+	// claiming a different product surfaces with the cross-product
+	// error rather than getting silently rebranded to dbounce.
+	if hasFormat {
+		var formatStr string
+		if err := json.Unmarshal(head["format"], &formatStr); err == nil {
+			if formatStr != legacyBundleFormat {
+				return nil, false, fmt.Errorf(
+					"bundle format %q is not %q (was this produced by a different product? sibling agents in ibounce + kbounce + gbounce use their own product names — cross-product import not supported)",
+					formatStr, legacyBundleFormat)
+			}
+		}
+	}
+
+	// Validate the legacy `format_version` is the only known value (1).
+	// Higher values would be future shapes we don't understand; refuse
+	// rather than silently coerce.
+	if hasFormatVersion {
+		var fv int
+		if err := json.Unmarshal(formatVersionRaw, &fv); err == nil {
+			if fv != legacyBundleFormatVersion {
+				return nil, false, fmt.Errorf(
+					"bundle format_version %d is not the legacy known value %d. "+
+						"Upgrade dbounce or re-export the bundle on a matching binary.",
+					fv, legacyBundleFormatVersion)
+			}
+		}
+	}
+
+	// The pre-#288 `schema_version` was the STORE schema version (int).
+	// Rename it to `store_schema_version` so the new wire-level
+	// `schema_version: "1.0"` (string) can take the canonical slot.
+	if oldSV, present := head["schema_version"]; present {
+		// Confirm it's int-shaped (the legacy shape). String-shaped
+		// schema_version on a bundle that also carried `format` would
+		// be a hand-edited file; preserve it as a parse error
+		// downstream rather than silently re-typing.
+		var asInt int
+		if err := json.Unmarshal(oldSV, &asInt); err == nil {
+			head["store_schema_version"] = oldSV
+		}
+	}
+
+	// Synthesize the new top-level fields.
+	prod, err := json.Marshal(ConfigProduct)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal product: %w", err)
+	}
+	head["product"] = prod
+	canonSV, err := json.Marshal(ConfigSchemaVersion)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal schema_version: %w", err)
+	}
+	head["schema_version"] = canonSV
+
+	// Drop the legacy magic fields.
+	delete(head, "format")
+	delete(head, "format_version")
+
+	out, err := json.Marshal(head)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-marshal payload: %w", err)
+	}
+
+	if deprecationOut != nil {
+		fmt.Fprintln(deprecationOut,
+			"dbounce: deprecation: import uses pre-#288 wire shape "+
+				"(`format`/`format_version` fields, int store-schema_version). "+
+				"This dbounce understands it but future major versions will "+
+				"refuse it. Re-export with this binary to upgrade to the "+
+				"canonical `product`+`schema_version: \"1.0\"` shape.")
+	}
+
+	return out, true, nil
 }
 
 // ImportResult is what applyBundle returns + what the --json mode
