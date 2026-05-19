@@ -5,6 +5,49 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Per-org notification routing engine (#280, 2026-05-19; ENTERPRISE tier)
+
+- **`dbounce run --alert-routes ROUTES.yaml`** activates the multi-
+  destination routing engine. Each event is matched against the
+  YAML's `routes:` list (per-route `match` block with `equals` /
+  `gte` / `lte` / `gt` / `lt` / `in` / `match` (regex) / `glob`
+  operators; AND-within / OR-across); matching routes dispatch the
+  event to their declared `destinations:` (`webhook` per #257 preset,
+  `pagerduty` via the documented Events API v2, `slack` via incoming-
+  webhook). No SDK deps; raw HTTP POSTs against the documented
+  vendor endpoints.
+- `on_match: stop` (**default**) short-circuits subsequent routes;
+  `on_match: continue` enables fan-out for catch-all archive routes.
+- Secrets resolved via `${ENV_VAR}` interpolation; literal tokens in
+  the YAML are refused at load time. Resolved secrets render as
+  `<8-char-prefix>***` in the dry-run output + status surfaces; raw
+  tokens never appear in logs, status, or error messages.
+- **`dbounce config preview-routes --routes ROUTES.yaml --event sample.json`**
+  dry-runs a sample event against the file and prints which routes
+  matched + the masked destinations each match would dispatch to.
+  Mandatory pre-deploy validation; no HTTP traffic is sent.
+- Backward compat: when `--alert-routes` is unset, the existing
+  `--audit-webhook-url` path is unchanged. When both are set, the
+  routing engine wins + the single-webhook is ignored with a
+  warning at startup.
+- Additive `Exporter.Routes` field so the existing Slice 1 / #257
+  / #258 wiring stays untouched; the Exporter fan-out routes events
+  via the engine instead of the single-webhook when both are
+  configured.
+- Per `[[enterprise-self-host-only]]`: ENTERPRISE-tier feature;
+  license gate currently surfaces `ErrRoutesLicenseRequired`
+  (placeholder until #235 license-file plumbing lands — same shape
+  as the existing webhook + alert-rules gates).
+- Per `[[creates-never-mutates]]` the engine never mutates the event
+  it routes. Per `[[no-hosted-saas]]` + `[[self-host-zero-billing-
+  dependency]]` every destination is operator-configured.
+- Per `[[cross-product-agent-parity]]` ibounce + kbouncer ship the
+  same `--alert-routes` flag name + YAML schema + match operators +
+  destination types.
+- Documented at `docs/PER-ORG-NOTIFICATION-ROUTING.md`; the canonical
+  cross-product reference lives at the iam-roles repo
+  `docs/PER-ORG-NOTIFICATION-ROUTING.md`.
+
 ### AWS Security Lake audit-export adapter (#258, 2026-05-19)
 
 - **`dbounce run --security-lake-bucket BUCKET --security-lake-region REGION

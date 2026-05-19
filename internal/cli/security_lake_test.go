@@ -13,6 +13,7 @@ import (
 func TestSecurityLakeBucketRequiresRegion(t *testing.T) {
 	_, err := buildAuditExporter(
 		"", false, "", "", 0, false, "", "", "",
+		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "",
 		"my-bucket", "", "", 0,
@@ -25,6 +26,7 @@ func TestSecurityLakeBucketRequiresRegion(t *testing.T) {
 func TestSecurityLakeRegionRequiresBucket(t *testing.T) {
 	_, err := buildAuditExporter(
 		"", false, "", "", 0, false, "", "", "",
+		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "",
 		"", "us-east-1", "", 0,

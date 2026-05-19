@@ -37,6 +37,11 @@ import (
 type Exporter struct {
 	Log       *LogWriter
 	Webhook   *WebhookPusher
+	// #280 — per-org routing engine. Nil disables; non-nil takes
+	// precedence over Webhook on every Emit (the CLI parse-time gate
+	// already warned the operator if both --alert-routes and
+	// --audit-webhook-url were passed).
+	Routes    *RoutesEngine
 	Heartbeat *Heartbeater
 	// HealthMonitor is the [[audit-export-failure-visibility]] poll
 	// goroutine that fires the audit_export_degraded alert when the
@@ -97,8 +102,8 @@ func (e *Exporter) Enabled() bool {
 	if e == nil {
 		return false
 	}
-	return e.Log != nil || e.Webhook != nil || e.Recorder != nil ||
-		e.SecurityLake != nil
+	return e.Log != nil || e.Webhook != nil || e.Routes != nil ||
+		e.Recorder != nil || e.SecurityLake != nil
 }
 
 // EmitDecision projects a store.DecisionRow into the cross-product
@@ -133,7 +138,12 @@ func (e *Exporter) emit(ctx context.Context, evt Event) error {
 			errs = append(errs, err)
 		}
 	}
-	if e.Webhook != nil {
+	// #280 — routes engine takes precedence over the single webhook
+	// pusher when both are wired (the CLI rejects that combo at parse
+	// time; this is the defense-in-depth runtime check).
+	if e.Routes != nil {
+		e.Routes.Push(ctx, evt)
+	} else if e.Webhook != nil {
 		if err := e.Webhook.Push(ctx, evt); err != nil {
 			errs = append(errs, err)
 		}
@@ -188,6 +198,11 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 		if err := e.Webhook.Shutdown(ctx); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// #280 — routes engine teardown drains the queue + waits for the
+	// worker. Idempotent.
+	if e.Routes != nil {
+		e.Routes.Close()
 	}
 	// #285 — recorder shutdown atomic-renames every still-open
 	// session's .partial -> .ndjson. SIGKILL-leftover .partials are

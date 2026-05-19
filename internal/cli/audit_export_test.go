@@ -22,7 +22,7 @@ import (
 // TestBuildAuditExporter_NoFlags_ReturnsNilNil verifies the FREE-tier
 // default — no audit-export wired.
 func TestBuildAuditExporter_NoFlags_ReturnsNilNil(t *testing.T) {
-	e, err := buildAuditExporter("", false, "", "", 0, false, "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0)
+	e, err := buildAuditExporter("", false, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0)
 	require.NoError(t, err)
 	assert.Nil(t, e, "no audit-export flags = no exporter (FREE-tier default)")
 }
@@ -32,7 +32,7 @@ func TestBuildAuditExporter_NoFlags_ReturnsNilNil(t *testing.T) {
 func TestBuildAuditExporter_LogOnly_FreeTier(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.jsonl")
-	e, err := buildAuditExporter(path, false, "", "", 0, false, "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0)
+	e, err := buildAuditExporter(path, false, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0)
 	require.NoError(t, err, "log-only transport must work without a license (FREE tier)")
 	require.NotNil(t, e)
 	require.True(t, e.Enabled())
@@ -56,6 +56,7 @@ func TestBuildAuditExporter_WebhookWithoutLicense_Rejected(t *testing.T) {
 	_, err := buildAuditExporter("", false,
 		"https://collector.example.com/audit", "some-token", 1, false,
 		"", "", "",
+		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "", "", "", "", 0)
 	require.Error(t, err)
@@ -77,6 +78,7 @@ func TestBuildAuditExporter_WebhookWithLicenseOverride(t *testing.T) {
 	e, err := buildAuditExporter("", false,
 		"https://93.184.216.34/audit", "test-token", 1, false,
 		"", "", "",
+		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "", "", "", "", 0)
 	require.NoError(t, err)
@@ -85,11 +87,39 @@ func TestBuildAuditExporter_WebhookWithLicenseOverride(t *testing.T) {
 	require.NoError(t, e.Shutdown(context.Background()))
 }
 
+// TestBuildAuditExporter_AlertRoutesLicensePlaceholderRejects pins
+// the #280 Enterprise license gate for the per-org routing engine.
+// Same placeholder shape as the webhook gate; both wait on #235.
+func TestBuildAuditExporter_AlertRoutesLicensePlaceholderRejects(t *testing.T) {
+	dir := t.TempDir()
+	_, err := buildAuditExporter("", false,
+		"", "", 0, false,
+		"", "", "",
+		dir+"/routes.yaml",
+		0, 0, 0,
+		"127.0.0.1:5433", "", "", "", "", "", 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, audit.ErrRoutesLicenseRequired,
+		"--alert-routes must return ErrRoutesLicenseRequired until license-file plumbing lands")
+	assert.Contains(t, err.Error(), "#235",
+		"error message should direct the operator to the tracking issue")
+}
+
+// TestRunCmdRegistersAlertRoutesFlag confirms the #280 --alert-routes
+// flag is registered on `dbounce run`. Cross-product parity (ibounce
+// + kbouncer) ships the same flag name + YAML schema.
+func TestRunCmdRegistersAlertRoutesFlag(t *testing.T) {
+	cmd := newRunCmd()
+	require.NotNil(t, cmd.Flags().Lookup("alert-routes"),
+		"--alert-routes flag must be registered on `dbounce run`")
+}
+
 // TestBuildAuditExporter_TokenWithoutURL_Rejected: token without a URL
 // is almost certainly a typo / forgotten flag; fail-fast.
 func TestBuildAuditExporter_TokenWithoutURL_Rejected(t *testing.T) {
 	_, err := buildAuditExporter("", false, "", "stray-token", 0, false,
 		"", "", "",
+		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "", "", "", "", 0)
 	require.Error(t, err)
@@ -112,6 +142,7 @@ func TestStartupBanner_TokenNeverPresent(t *testing.T) {
 		filepath.Join(dir, "audit.jsonl"), false,
 		"https://93.184.216.34/audit", tok, 1, false,
 		"", "", "",
+		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "", "", "", "", 0)
 	require.NoError(t, err)

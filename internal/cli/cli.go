@@ -504,6 +504,11 @@ func newRunCmd() *cobra.Command {
 		auditWebhookPreset        string
 		auditWebhookTags          string
 		auditWebhookSentinelTable string
+		// #280 — per-org notification routing engine. YAML config path;
+		// empty disables the engine (the single --audit-webhook-url
+		// path stays available). Enterprise-tier (license-gated;
+		// placeholder error until #235 license-file plumbing lands).
+		auditAlertRoutesPath string
 		// Heartbeat — periodic OCSF liveness event + in-process gap
 		// watchdog per [[prompt-injection-disable-bouncer-threat]].
 		// Default OFF (heartbeatInterval == 0). Sibling agents in
@@ -972,6 +977,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				auditWebhookURL, auditWebhookToken,
 				auditWebhookBatchSize, allowInternalWebhook,
 				auditWebhookPreset, auditWebhookTags, auditWebhookSentinelTable,
+				auditAlertRoutesPath,
 				heartbeatInterval, heartbeatGap,
 				auditExportHealthInterval,
 				fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
@@ -1288,6 +1294,18 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"dbounce + kbounce + ibounce rows; operators who prefer per-product "+
 			"tables override this per-deployment. Sentinel custom-log tables "+
 			"have a max name length of 100 chars + must match [A-Za-z0-9_]+.")
+	cmd.Flags().StringVar(&auditAlertRoutesPath, "alert-routes", "",
+		"#280 (ENTERPRISE tier — license-gated) — YAML file describing "+
+			"per-org notification routing. When set, the multi-destination "+
+			"routing engine activates: each event is matched against the "+
+			"configured routes' match blocks + dispatched to the route's "+
+			"destinations (webhook / pagerduty / slack). When unset, the "+
+			"existing single-webhook --audit-webhook-url path stays exactly "+
+			"as today (zero regression). Secrets must use ${ENV_VAR} "+
+			"interpolation; literal tokens in the YAML are refused. Use "+
+			"`dbounce config preview-routes` to dry-run a sample event "+
+			"against the file before deploying. Setting BOTH --alert-routes "+
+			"and --audit-webhook-url ignores the latter (with a warning).")
 	// Heartbeat — periodic OCSF liveness event + in-process gap
 	// watchdog per [[prompt-injection-disable-bouncer-threat]]. Default
 	// OFF preserves the safety-not-surveillance posture; opt-in via
@@ -1404,6 +1422,7 @@ func buildAuditExporter(
 	webhookURL, webhookToken string, webhookBatchSize int,
 	allowInternalWebhook bool,
 	webhookPreset, webhookTags, webhookSentinelTable string,
+	alertRoutesPath string,
 	heartbeatInterval, heartbeatGap time.Duration,
 	auditExportHealthInterval time.Duration,
 	listenerHost, upstreamURL string,
@@ -1425,6 +1444,13 @@ func buildAuditExporter(
 		return nil, errors.New(
 			"dbounce: --security-lake-region requires --security-lake-bucket " +
 				"(passing region without a target bucket has no effect)")
+	}
+	// #280 — per-org routing engine license gate. Same placeholder
+	// shape as licensedForAuditWebhook; both wait on #235. The
+	// alternative-with-routes-engine path can't fail without going
+	// through this gate, so we surface the error before any IO.
+	if alertRoutesPath != "" {
+		return nil, audit.ErrRoutesLicenseRequired
 	}
 	var logWriter *audit.LogWriter
 	if logPath != "" {
@@ -1498,6 +1524,7 @@ func buildAuditExporter(
 	// audit-export-health monitor is configured, the exporter is a
 	// no-op (FREE-tier default).
 	if logWriter == nil && webhookPusher == nil &&
+		alertRoutesPath == "" &&
 		heartbeatInterval == 0 && auditExportHealthInterval == 0 &&
 		recordSessionsDir == "" && securityLakeBucket == "" {
 		return nil, nil

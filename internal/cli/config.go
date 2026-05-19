@@ -96,11 +96,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/packs"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
@@ -312,6 +314,112 @@ JSON schema: schemas/dbounce-config.schema.json (in-tree).`,
 	cmd.RunE = parentRequiresSubcommand("config", cmd)
 	cmd.AddCommand(newConfigExportCmd())
 	cmd.AddCommand(newConfigImportCmd())
+	cmd.AddCommand(newConfigPreviewRoutesCmd())
+	return cmd
+}
+
+// newConfigPreviewRoutesCmd is the #280 dry-run subcommand.
+//
+// Loads an --alert-routes YAML + evaluates a single OCSF event JSON
+// file against every route, printing which routes matched + the
+// masked destinations each match would dispatch to. No HTTP traffic
+// is sent.
+//
+// Per [[per-org-notification-routing]] this is mandatory pre-deploy
+// validation — YAML routing is dense + error-prone.
+func newConfigPreviewRoutesCmd() *cobra.Command {
+	var (
+		routesPath string
+		eventPath  string
+	)
+	cmd := &cobra.Command{
+		Use:   "preview-routes",
+		Short: "Dry-run a sample event against an --alert-routes YAML",
+		Long: `Load the --alert-routes YAML + show which routes a sample
+event would match and which destinations those routes would dispatch to.
+
+No HTTP traffic is sent. Secrets render as <first-8-char>*** prefixes
+so the operator can confirm the right env vars resolved without
+printing tokens.
+
+Example:
+
+    $ export SOC_SPLUNK_HEC_TOKEN=...
+    $ dbounce config preview-routes \
+          --routes ~/.iam-jit/dbounce-routes.yaml \
+          --event sample-event.json
+`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := audit.LoadRoutesConfig(routesPath)
+			if err != nil {
+				return err
+			}
+			// #G304 read-only path; operator passes the path.
+			raw, err := os.ReadFile(filepath.Clean(eventPath)) // #nosec G304
+			if err != nil {
+				return fmt.Errorf(
+					"dbounce: could not read --event file %q: %w",
+					eventPath, err)
+			}
+			var event map[string]any
+			if err := json.Unmarshal(raw, &event); err != nil {
+				return fmt.Errorf(
+					"dbounce: --event file %q is not valid JSON: %w",
+					eventPath, err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "routes config: %s\n", routesPath)
+			fmt.Fprintf(cmd.OutOrStdout(), "event: %s\n", eventPath)
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"total routes defined: %d\n", len(cfg.Routes))
+			secrets := cfg.SecretsUsed()
+			if len(secrets) > 0 {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"secrets resolved (env-var name + masked prefix):")
+				for _, kv := range secrets {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"  %s (%s)\n", kv[0], kv[1])
+				}
+			}
+			hits := audit.SelectRoutes(event, cfg.Routes)
+			if len(hits) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"no routes matched this event.")
+				return nil
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"matched %d route(s):\n", len(hits))
+			for _, r := range hits {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"  - %s (on_match=%s)\n", r.Name, r.OnMatch)
+				for _, d := range r.Destinations {
+					fields := d.Masked()
+					keys := make([]string, 0, len(fields))
+					for k := range fields {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					parts := make([]string, 0, len(fields))
+					for _, k := range keys {
+						parts = append(parts,
+							fmt.Sprintf("%s=%v", k, fields[k]))
+					}
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"      destination: %s\n",
+						strings.Join(parts, ", "))
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&routesPath, "routes", "",
+		"Path to the --alert-routes YAML file to evaluate.")
+	cmd.Flags().StringVar(&eventPath, "event", "",
+		"Path to a JSON file containing one OCSF event to evaluate.")
+	_ = cmd.MarkFlagRequired("routes")
+	_ = cmd.MarkFlagRequired("event")
+	_ = cmd.MarkFlagFilename("routes", "yaml", "yml")
+	_ = cmd.MarkFlagFilename("event", "json")
 	return cmd
 }
 
