@@ -468,6 +468,50 @@ type Server struct {
 	// connWG.Wait so the 1s-cadence ticker exits + the goroutine's
 	// connWG.Done fires. nil-safe.
 	auditEventsPollerCancel context.CancelFunc
+
+	// totalAgentHeadersRejected (#318 / §A16) counts inbound
+	// `application_name` values that match the canonical
+	// `iam-jit-agent:NAME:SESSIONID` cross-bouncer prefix but fail
+	// validation. Surfaced via /healthz so operators see agent-config
+	// drift (e.g. an agent setting application_name to a shell-injection
+	// payload). Mirrors gbounce + ibounce + kbouncer counter of the same
+	// name byte-for-byte per [[cross-product-agent-parity]].
+	totalAgentHeadersRejected atomic.Int64
+}
+
+// recordRejectedAgentTag bumps the per-Server rejection counter + logs
+// one stderr line for an `application_name=iam-jit-agent:...` value
+// that failed validation. Mirrors gbounce's `logAgentHeaderRejected`
+// + ibounce's `_log_agent_header_rejected` + kbouncer's
+// `recordRejectedAgentHeader` — same wire-protocol-equivalent
+// rejection-surface so operators get the same signal across the suite.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: surfacing
+// the rejection is SAFETY (operator sees attribution gap); the
+// truncation + control-char stripping are privacy-shaped (a malicious
+// value can't reposition the operator's terminal cursor). The raw
+// value is NEVER written into the audit event regardless.
+func (s *Server) recordRejectedAgentTag(rawValue string) {
+	if s == nil {
+		return
+	}
+	s.totalAgentHeadersRejected.Add(1)
+	truncated := rawValue
+	if len(truncated) > 64 {
+		truncated = truncated[:64] + "..."
+	}
+	clean := make([]byte, 0, len(truncated))
+	for i := 0; i < len(truncated); i++ {
+		c := truncated[i]
+		if c < 0x20 || c > 0x7e {
+			clean = append(clean, '?')
+		} else {
+			clean = append(clean, c)
+		}
+	}
+	log.Warn().
+		Str("application_name", string(clean)).
+		Msg("dbounce: rejected invalid iam-jit-agent: application_name tag — connection audited as anonymous")
 }
 
 // NewServer constructs a Server without starting it.
@@ -1182,12 +1226,23 @@ func (s *Server) serveConn(conn net.Conn) {
 // detection. The session id ALWAYS gets minted (so SESSION_ENDED can
 // fire on close + audit rows have the correlation key) even when no
 // application_name was sent — name falls back to "unknown".
+//
+// #318 / §A16 — when application_name carries the canonical
+// `iam-jit-agent:NAME:SESSIONID` cross-bouncer tag, the parsed
+// SESSIONID is used as the registered session id (instead of a fresh
+// v7 UUID) so cross-bouncer correlation by `agent.session_id` resolves
+// across all four products. Invalid tags bump the per-Server
+// rejection counter + log to stderr. The raw value is NEVER written
+// into the audit event.
 func (s *Server) registerPGAgentFromBody(body []byte) string {
 	if s.agentRegistry == nil {
 		return ""
 	}
 	params := audit.ParsePGStartupParams(body)
-	name, rawAppName := audit.ParsePGStartupAppName(params)
+	name, sessionID, rawAppName, tagInvalid := audit.ParsePGStartupAppNameWithSession(params)
+	if tagInvalid {
+		s.recordRejectedAgentTag(rawAppName)
+	}
 	agent := audit.Agent{
 		Name:         name,
 		DetectedFrom: audit.DetectedFromPGAppName,
@@ -1198,6 +1253,13 @@ func (s *Server) registerPGAgentFromBody(body []byte) string {
 		// "unknown" inside Mint.
 		agent.Name = ""
 		agent.DetectedFrom = audit.DetectedFromUnknown
+	}
+	// #318 — when the agent supplied a session id via the canonical
+	// tag, register under THAT session id so cross-bouncer correlation
+	// works. MintWithSessionID falls back to a fresh v7 when the
+	// session id is empty or invalid.
+	if sessionID != "" {
+		return s.agentRegistry.MintWithSessionID(agent, sessionID)
 	}
 	return s.agentRegistry.Mint(agent)
 }
@@ -1618,23 +1680,25 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	// bypass; making it loud closes the gap.
 	type HealthzAuditExportHealth = audit.ExportHealth
 	payload := struct {
-		Status              string                    `json:"status"`
-		Mode                string                    `json:"mode"`
-		DefaultPolicy       string                    `json:"default_policy"`
-		Dialect             string                    `json:"dialect"`
-		ActiveProfile       string                    `json:"active_profile"`
-		DecisionsCount      int64                     `json:"decisions_count"`
-		LookupErrorsCounter int64                     `json:"lookup_errors_counter"`
-		Pause               *HealthzPause             `json:"pause"`
-		AuditExport         *HealthzAuditExport       `json:"audit_export,omitempty"`
-		AuditExportHealth   *HealthzAuditExportHealth `json:"audit_export_health,omitempty"`
+		Status                    string                    `json:"status"`
+		Mode                      string                    `json:"mode"`
+		DefaultPolicy             string                    `json:"default_policy"`
+		Dialect                   string                    `json:"dialect"`
+		ActiveProfile             string                    `json:"active_profile"`
+		DecisionsCount            int64                     `json:"decisions_count"`
+		LookupErrorsCounter       int64                     `json:"lookup_errors_counter"`
+		TotalAgentHeadersRejected int64                     `json:"total_agent_headers_rejected"`
+		Pause                     *HealthzPause             `json:"pause"`
+		AuditExport               *HealthzAuditExport       `json:"audit_export,omitempty"`
+		AuditExportHealth         *HealthzAuditExportHealth `json:"audit_export_health,omitempty"`
 	}{
-		Status:              "ok",
-		Mode:                string(s.cfg.Mode),
-		DefaultPolicy:       string(s.cfg.DefaultPolicy),
-		Dialect:             string(s.cfg.Dialect),
-		ActiveProfile:       s.ActiveProfileName(),
-		LookupErrorsCounter: LookupErrorsCount(),
+		Status:                    "ok",
+		Mode:                      string(s.cfg.Mode),
+		DefaultPolicy:             string(s.cfg.DefaultPolicy),
+		Dialect:                   string(s.cfg.Dialect),
+		ActiveProfile:             s.ActiveProfileName(),
+		LookupErrorsCounter:       LookupErrorsCount(),
+		TotalAgentHeadersRejected: s.totalAgentHeadersRejected.Load(),
 	}
 	if s.store != nil {
 		if n, err := s.store.CountDecisions(); err == nil {

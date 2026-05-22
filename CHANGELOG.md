@@ -5,6 +5,67 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #318 / §A16 — cross-bouncer agent-attribution parity for SQL (2026-05-22)
+
+Closes the SQL slice of the cross-bouncer correlation gap surfaced by
+the NanoClaw integration test. dbounce sees the SQL wire protocol, not
+HTTP, so the canonical agent-attribution channel is the PostgreSQL
+`application_name` startup parameter rather than an `X-Agent-*` HTTP
+header. The convention `application_name=iam-jit-agent:NAME:SESSIONID`
+(documented at `iam-roles/docs/AGENT-ATTRIBUTION.md` §SQL) is the
+wire-protocol equivalent of the HTTP path — a SIEM query on
+`unmapped.iam_jit.agent.session_id=X` now resolves across dbounce
+events alongside ibounce / kbouncer / gbounce ones.
+
+- `internal/audit/agent_context.go`:
+  - New `IsValidAgentName()` mirroring gbounce + ibounce + kbouncer's
+    regex `^[A-Za-z0-9._-]{1,64}$` byte-for-byte. `IsValidSessionID()`
+    already lived in `recorder.go` — reused for the canonical tag
+    validation.
+  - New `AgentAppNameTagPrefix` constant + `ParseAgentTagFromAppName()`
+    helper that extracts `(name, sessionID, ok)` from the
+    `iam-jit-agent:NAME:SESSIONID` shape.
+  - New `ParsePGStartupAppNameWithSession()` — extended `application_name`
+    parser that ALSO returns the parsed session id when the canonical
+    tag was supplied, plus a `tagInvalid` bool the caller can use to
+    bump a rejection counter. Existing `ParsePGStartupAppName()`
+    delegates to it (backwards compatible).
+  - New `AgentRegistry.MintWithSessionID()` — the cross-bouncer variant
+    that registers an agent under a CALLER-SUPPLIED session id (instead
+    of a fresh UUID v7), so the agent's declared session_id flows
+    through to every audit event for that connection. Invalid session
+    ids fall back to the existing `Mint` path so the SESSION_ENDED
+    bookend still fires.
+- `internal/proxy/proxy.go`:
+  - `registerPGAgentFromBody` uses the new parser + `MintWithSessionID`.
+    Invalid tags bump a new per-Server `totalAgentHeadersRejected`
+    atomic counter + log the truncated raw value (control chars
+    replaced with `?`) so a malicious application_name can't reposition
+    the operator's terminal cursor. The raw value is NEVER written
+    into the audit event.
+  - `/healthz` payload now includes `total_agent_headers_rejected`
+    (matches gbounce + ibounce + kbouncer fields of the same name).
+- New tests:
+  - `internal/audit/agent_headers_318_test.go` — canonical cross-product
+    test names (`TestApplicationName_AgentParsing_HappyPath`,
+    `TestApplicationName_NoAgentTag_FallbackToUA`,
+    `TestAgentHeaders_HappyPath`,
+    `TestAgentHeaders_NoHeaders_FallbackToUserAgent`,
+    `TestAgentHeaders_InvalidName_Rejected`,
+    `TestAgentHeaders_NameOnly_PartialDetection`,
+    `TestApplicationName_AgentParsing_RejectsInvalidSessionID`,
+    `TestApplicationName_AgentParsing_AcceptsUUIDv4`,
+    `TestIsValidAgentName_MatchesGbounceRegex`,
+    `TestAgentRegistry_MintWithSessionID_PreservesSuppliedID`,
+    `TestAgentRegistry_MintWithSessionID_InvalidFallsBackToMint`).
+  - `internal/proxy/agent_headers_318_test.go` — proxy-level wiring
+    tests covering happy path, invalid-tag counter bump, no-tag
+    fallback, and the anonymous-mint path.
+
+`docs/AGENT-ATTRIBUTION.md` + `docs/KNOWN-CAVEATS.md` §A16 live in the
+iam-roles repo (cross-product reference); they're updated alongside
+this slice with the SQL `application_name` convention documented.
+
 ### #311 / §A10 — robust audit-log retention (2026-05-22)
 
 Cross-product launch-blocker resolved. `dbounce` now rotates `audit.jsonl`

@@ -44,12 +44,89 @@
 package audit
 
 import (
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// #318 / §A16 — cross-bouncer agent-attribution regexes. Mirror gbounce
+// + ibounce + kbouncer byte-for-byte so a SIEM filter on
+// `unmapped.iam_jit.agent.name=X` / `agent.session_id=X` is portable
+// across all four Bounce products.
+//
+// dbounce sees the SQL wire protocol, not HTTP, so the canonical agent
+// declaration is the PostgreSQL `application_name` startup parameter
+// (MySQL `_program_name` connection-attribute is the equivalent). When
+// the operator sets:
+//
+//	application_name = iam-jit-agent:claude-code:01968d6a-9c12-7a4b-b6f8-3b8e4c0d1aef
+//
+// dbounce splits on `:`, validates `NAME` against `agentNameRe` +
+// `SESSIONID` against `sessionIDRe`, and stamps the parsed pieces onto
+// the same `unmapped.iam_jit.agent.{name, session_id, detected_from}`
+// block the HTTP-shaped Bouncers populate. `detected_from=pg_app_name`
+// flags the SQL provenance so a SIEM filter can distinguish wire-
+// protocol-attributed events from HTTP-attributed ones.
+
+var agentNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// IsValidAgentName returns true when s matches the canonical
+// X-Agent-Name shape ([A-Za-z0-9._-]{1,64}). Cross-product invariant:
+// a name accepted by dbounce MUST be accepted by every other Bouncer.
+func IsValidAgentName(s string) bool { return agentNameRe.MatchString(s) }
+
+// IsValidSessionID is defined in recorder.go (same package); it
+// validates `[A-Za-z0-9_-]{1,128}` — the canonical X-Agent-Session-Id
+// shape. UUIDs (v4 + v7 + v6) all fit — operators may use any UUID
+// flavor. We re-export reference here for #318 / §A16 callers that
+// want symmetry with `IsValidAgentName` next to the cross-bouncer
+// regex documentation.
+
+// AgentAppNameTagPrefix is the canonical `application_name` prefix that
+// declares an iam-jit agent attribution per the
+// [[cross-product-agent-parity]] convention. The full shape is:
+//
+//	iam-jit-agent:NAME:SESSIONID
+//
+// Documented at iam-roles/docs/AGENT-ATTRIBUTION.md §SQL.
+const AgentAppNameTagPrefix = "iam-jit-agent:"
+
+// ParseAgentTagFromAppName attempts to extract `(name, sessionID, ok)`
+// from a PG `application_name` value of the documented shape:
+//
+//	iam-jit-agent:NAME:SESSIONID
+//
+// Returns ok=false when the prefix doesn't match (the caller falls
+// through to the existing known-client app-name table). When the
+// prefix matches but either piece fails the validation regex, ok=false
+// AND `name` / `sessionID` carry the raw invalid pieces so the caller
+// can log the rejection + bump a counter.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: validation
+// failures are SAFETY signal (operator visibility) — the raw value is
+// truncated by the rejection-log helper before any stderr output, so
+// shell-injection payloads can't pivot through the log.
+func ParseAgentTagFromAppName(appName string) (name, sessionID string, ok bool) {
+	if !strings.HasPrefix(appName, AgentAppNameTagPrefix) {
+		return "", "", false
+	}
+	tail := strings.TrimPrefix(appName, AgentAppNameTagPrefix)
+	// Expect exactly NAME:SESSIONID. A missing colon = malformed; we
+	// return raw + false so the caller bumps the rejection counter.
+	idx := strings.Index(tail, ":")
+	if idx < 0 {
+		return tail, "", false
+	}
+	rawName := tail[:idx]
+	rawSessionID := tail[idx+1:]
+	if !IsValidAgentName(rawName) || !IsValidSessionID(rawSessionID) {
+		return rawName, rawSessionID, false
+	}
+	return rawName, rawSessionID, true
+}
 
 // DetectedFrom names which signal produced the agent fingerprint. Used
 // in the OCSF unmapped.iam_jit.agent.detected_from field so a SIEM
@@ -219,6 +296,34 @@ func (r *AgentRegistry) Mint(a Agent) string {
 	return sid
 }
 
+// MintWithSessionID is the #318 / §A16 variant that registers the agent
+// under a CALLER-SUPPLIED session id (sourced from the canonical
+// `application_name=iam-jit-agent:NAME:SESSIONID` tag). Used so the
+// session id the agent declared is the one that lands on every
+// dbounce audit event for that connection — the load-bearing
+// invariant for cross-bouncer correlation by `agent.session_id`.
+//
+// The supplied sid MUST have already passed `IsValidSessionID` (the
+// caller — registerPGAgentFromBody — validates as part of tag parsing).
+// An empty / invalid sid falls back to `Mint` behaviour (fresh UUID v7)
+// to preserve the SESSION_ENDED bookend.
+func (r *AgentRegistry) MintWithSessionID(a Agent, sid string) string {
+	if !IsValidSessionID(sid) {
+		return r.Mint(a)
+	}
+	a.SessionID = sid
+	if a.Name == "" {
+		a.Name = "unknown"
+	}
+	if a.DetectedFrom == "" {
+		a.DetectedFrom = DetectedFromUnknown
+	}
+	r.mu.Lock()
+	r.sessions[sid] = a
+	r.mu.Unlock()
+	return sid
+}
+
 // Lookup returns the Agent for a session id + a found bool. Concurrent-
 // safe.
 func (r *AgentRegistry) Lookup(sid string) (Agent, bool) {
@@ -312,6 +417,7 @@ func ParsePGStartupParams(body []byte) map[string]string {
 //
 // Mapping:
 //
+//	"iam-jit-agent:NAME:SESSIONID"         → name="NAME" (cross-bouncer #318)
 //	"psql"                                 → name="psql"
 //	"pgcli"                                → name="pgcli"
 //	"psycopg2"                             → name="psycopg2"
@@ -320,35 +426,83 @@ func ParsePGStartupParams(body []byte) map[string]string {
 //	"cursor"                               → name="cursor"
 //	any other non-empty value              → name=<the literal value>
 //
+// The `iam-jit-agent:NAME:SESSIONID` shape (#318 / §A16) is the canonical
+// cross-bouncer agent-attribution channel for SQL connections — it's
+// the wire-protocol equivalent of HTTP's `X-Agent-Name` +
+// `X-Agent-Session-Id` headers. When the shape parses cleanly,
+// `name`=NAME (validated) — the SESSIONID is extracted via
+// ParsePGStartupAppNameWithSession below.
+//
 // Per the memo: we don't try to magic-detect "this is really Claude
 // Code calling psql under the hood" — that's a process-tree heuristic
 // which dbounce v1.0 explicitly defers. The application_name we record
 // is what the immediate client declared.
 func ParsePGStartupAppName(params map[string]string) (name, raw string) {
+	name, _, raw, _ = ParsePGStartupAppNameWithSession(params)
+	return name, raw
+}
+
+// ParsePGStartupAppNameWithSession is the cross-bouncer #318 / §A16
+// variant that also returns the parsed session id when the canonical
+// `iam-jit-agent:NAME:SESSIONID` shape was supplied. Returns
+// `(name, sessionID, raw, tagInvalid)` where:
+//
+//   - `name` is the canonical agent name (validated when from the tag
+//     prefix; raw / known-client when from the legacy fallback).
+//   - `sessionID` is the validated session id (empty unless the tag
+//     prefix was supplied AND both pieces passed validation).
+//   - `raw` is the unmodified application_name parameter value
+//     (empty when no application_name was sent).
+//   - `tagInvalid` is true ONLY when the iam-jit-agent: prefix matched
+//     but the parsed pieces failed validation — the caller bumps the
+//     rejection counter + logs in that case.
+//
+// Per [[cross-product-agent-parity]] the parsed `name` + `sessionID`
+// land on the same `unmapped.iam_jit.agent.{name, session_id}` block
+// that gbounce / ibounce / kbouncer populate from HTTP headers; a SIEM
+// query on `agent.session_id=X` resolves across all four products.
+func ParsePGStartupAppNameWithSession(params map[string]string) (name, sessionID, raw string, tagInvalid bool) {
 	raw = strings.TrimSpace(params["application_name"])
 	if raw == "" {
-		return "", ""
+		return "", "", "", false
+	}
+	// #318 — cross-bouncer canonical tag has the highest precedence.
+	// When the prefix matches but validation fails, surface
+	// `tagInvalid=true` so the caller can log + count the rejection.
+	if strings.HasPrefix(raw, AgentAppNameTagPrefix) {
+		tagName, tagSession, ok := ParseAgentTagFromAppName(raw)
+		if ok {
+			return tagName, tagSession, raw, false
+		}
+		// Tag prefix matched but a piece failed validation. We DO NOT
+		// stamp the malformed pieces onto the audit event — fall
+		// through to known-client / verbatim handling on the raw value
+		// (which won't match anything meaningful + lands at name=raw)
+		// AND flag the rejection.
+		_ = tagName
+		_ = tagSession
+		return "", "", raw, true
 	}
 	lower := strings.ToLower(raw)
 	switch {
 	case lower == "psql":
-		return "psql", raw
+		return "psql", "", raw, false
 	case lower == "pgcli":
-		return "pgcli", raw
+		return "pgcli", "", raw, false
 	case strings.Contains(lower, "psycopg"):
-		return "psycopg2", raw
+		return "psycopg2", "", raw, false
 	case strings.Contains(lower, "jdbc"):
-		return "pg-jdbc", raw
+		return "pg-jdbc", "", raw, false
 	case lower == "claude-code" || strings.HasPrefix(lower, "claude-code/"):
-		return "claude-code", raw
+		return "claude-code", "", raw, false
 	case lower == "cursor" || strings.HasPrefix(lower, "cursor/"):
-		return "cursor", raw
+		return "cursor", "", raw, false
 	case lower == "codex" || strings.HasPrefix(lower, "codex/"):
-		return "codex", raw
+		return "codex", "", raw, false
 	case lower == "devin" || strings.HasPrefix(lower, "devin/"):
-		return "devin", raw
+		return "devin", "", raw, false
 	default:
-		return raw, raw
+		return raw, "", raw, false
 	}
 }
 
