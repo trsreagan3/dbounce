@@ -1426,6 +1426,8 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 			FunctionsCalled:  ps.FunctionsCalled,
 			IsDML:            ps.IsDML,
 			IsDDL:            ps.IsDDL,
+			IsDCL:            ps.IsDCL,
+			DCLTargetsPublic: ps.DCLTargetsPublic,
 			HasMutatingNode:  ps.HasMutatingNode,
 			IsExplain:        ps.IsExplain,
 			IsExplainAnalyze: ps.IsExplainAnalyze,

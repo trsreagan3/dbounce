@@ -295,6 +295,129 @@ func TestEvaluate_AllowRules_PatternMatch(t *testing.T) {
 	assert.Equal(t, SourceProfileAllow, v.Source)
 }
 
+// DCL-floor regression tests. Per task #302 / KNOWN-CAVEATS §A5: the
+// safe-default profile MUST refuse `GRANT ALL PRIVILEGES ... TO PUBLIC`
+// (and the ALTER DEFAULT PRIVILEGES equivalent) before the allow_baseline
+// classifier even gets a chance to look at them. The DCL floor lives at
+// Order 2.5 in profile.Evaluate.
+
+func TestEvaluate_SafeDefault_DeniesGrantAllToPublic(t *testing.T) {
+	// THE canonical hostile shape from the UAT (Variant A + Variant C
+	// H3 attempts). Pre-fix: parser returned StatementType=UNKNOWN +
+	// IsDML/IsDDL=false, so allow_baseline didn't match (not a read) and
+	// deny_ast_mutating_nodes didn't match (no mutating flags). Profile
+	// abstained → fell through to default-allow → grant succeeded.
+	//
+	// Post-fix: parser sets IsDCL + DCLTargetsPublic; safe-default's
+	// deny_dcl_targets_public floor fires BEFORE allow_baseline + denies.
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+	v := sd.Evaluate(&ParsedStatement{
+		StatementType:    "GRANT",
+		IsDCL:            true,
+		DCLTargetsPublic: true,
+	})
+	assert.True(t, v.Denied, "GRANT ... TO PUBLIC MUST deny under safe-default (task #302 / §A5)")
+	assert.Equal(t, SourceProfile, v.Source)
+	assert.Contains(t, v.Reason, "PUBLIC")
+}
+
+func TestEvaluate_SafeDefault_DeniesAlterDefaultPrivilegesGrantToPublic(t *testing.T) {
+	// The future-objects variant. Just as dangerous as a direct GRANT —
+	// makes every future object in the schema world-accessible.
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+	v := sd.Evaluate(&ParsedStatement{
+		StatementType:    "ALTER_PRIVILEGES",
+		IsDCL:            true,
+		DCLTargetsPublic: true,
+	})
+	assert.True(t, v.Denied,
+		"ALTER DEFAULT PRIVILEGES ... GRANT ... TO PUBLIC MUST deny under safe-default")
+	assert.Equal(t, SourceProfile, v.Source)
+}
+
+func TestEvaluate_SafeDefault_AllowsGrantToSpecificUser(t *testing.T) {
+	// Spec from task #302: `GRANT SELECT ON TABLE x TO specific_user` →
+	// safe-default allows (it's not PUBLIC + safe-default doesn't deny
+	// generic DCL — that's an explicit operator policy choice, not the
+	// hard floor). The profile abstains; the proxy's default-policy
+	// fall-through allows.
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+	v := sd.Evaluate(&ParsedStatement{
+		StatementType:    "GRANT",
+		IsDCL:            true,
+		DCLTargetsPublic: false,
+		TablesTouched:    []string{"public.users"},
+	})
+	assert.False(t, v.Denied,
+		"GRANT to a specific user (not PUBLIC) MUST NOT trip the safe-default DCL floor")
+	assert.False(t, v.Allowed,
+		"safe-default abstains on non-PUBLIC GRANT; proxy default-policy decides")
+}
+
+func TestEvaluate_SafeDefault_AllowsRevokeFromPublic(t *testing.T) {
+	// Per task #302 spec: REVOKE ... FROM PUBLIC is cleanup. The parser
+	// never sets DCLTargetsPublic for REVOKE so the floor doesn't fire.
+	ps, err := LoadProfiles("")
+	require.NoError(t, err)
+	sd, err := ps.Active("safe-default")
+	require.NoError(t, err)
+	v := sd.Evaluate(&ParsedStatement{
+		StatementType:    "REVOKE",
+		IsDCL:            true,
+		DCLTargetsPublic: false, // parser invariant: never true for REVOKE
+	})
+	assert.False(t, v.Denied, "REVOKE ... FROM PUBLIC is cleanup; MUST NOT deny")
+}
+
+func TestEvaluate_DCLFloor_NotConsultedWhenDisabled(t *testing.T) {
+	// A profile without deny_dcl_targets_public must NOT fire the floor
+	// even when the parsed shape has DCLTargetsPublic=true. Confirms the
+	// floor is an opt-in policy switch, not a hidden hard-coded behavior.
+	p := &Profile{
+		Name:                 "no-dcl-floor",
+		DenyASTMutatingNodes: true,
+		// DenyDCLTargetsPublic intentionally unset (zero value = false).
+	}
+	v := p.Evaluate(&ParsedStatement{
+		StatementType:    "GRANT",
+		IsDCL:            true,
+		DCLTargetsPublic: true,
+	})
+	assert.False(t, v.Denied,
+		"deny_dcl_targets_public is opt-in; profiles without it must not deny on DCL")
+}
+
+func TestEvaluate_DCLFloor_FiresBeforeAllowBaseline(t *testing.T) {
+	// LOAD-BEARING ordering check: the DCL floor must fire BEFORE the
+	// allow_baseline classifier. If the order were reversed, a future
+	// baseline that treated GRANT as "read-only-ish" could let a
+	// PUBLIC-targeting grant through. Pin the order with an explicit
+	// regression.
+	p := &Profile{
+		Name:                 "ordering-check",
+		AllowBaseline:        BaselineSQLReadOnly,
+		DenyASTMutatingNodes: true,
+		DenyDCLTargetsPublic: true,
+	}
+	v := p.Evaluate(&ParsedStatement{
+		StatementType:    "GRANT",
+		IsDCL:            true,
+		DCLTargetsPublic: true,
+	})
+	assert.True(t, v.Denied)
+	assert.Equal(t, SourceProfile, v.Source,
+		"DCL floor source must be profile, not profile.allow")
+}
+
 func TestProfile_IsLocalSource(t *testing.T) {
 	assert.True(t, (&Profile{}).IsLocalSource())
 	assert.True(t, (&Profile{Source: "local"}).IsLocalSource())

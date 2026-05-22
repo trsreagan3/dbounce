@@ -78,10 +78,19 @@ const (
 	StmtLoad           = "LOAD" // MySQL LOAD DATA INFILE / LOAD XML — exfil-shape verb
 	StmtVacuum         = "VACUUM"
 	StmtComment        = "COMMENT"
-	StmtShow           = "SHOW"    // MySQL SHOW TABLES / SHOW VARIABLES (informational read)
-	StmtUse            = "USE"     // MySQL USE <db>
-	StmtUnknown        = "UNKNOWN" // parse succeeded but classifier didn't match
-	StmtUnparseable    = "UNPARSEABLE"
+	StmtShow           = "SHOW" // MySQL SHOW TABLES / SHOW VARIABLES (informational read)
+	StmtUse            = "USE"  // MySQL USE <db>
+	// DCL (Data Control Language) — privilege management. Per task #302
+	// + KNOWN-CAVEATS §A5: before this slice, `GRANT ALL PRIVILEGES ...
+	// TO PUBLIC` classified as UNKNOWN and slipped past safe-default. The
+	// parser now surfaces three explicit DCL operations + the
+	// `dcl_targets_public` predicate so the profile evaluator can refuse
+	// PUBLIC-targeting grants outright.
+	StmtGrant            = "GRANT"            // GRANT ... ON ... TO ... (object privileges + role-grants)
+	StmtRevoke           = "REVOKE"           // REVOKE ... ON ... FROM ... (cleanup is safe by default)
+	StmtAlterPrivileges  = "ALTER_PRIVILEGES" // ALTER DEFAULT PRIVILEGES ... GRANT/REVOKE ...
+	StmtUnknown          = "UNKNOWN"          // parse succeeded but classifier didn't match
+	StmtUnparseable      = "UNPARSEABLE"
 )
 
 // ParsedStatement is dbounce's normalized handle on an inbound SQL
@@ -113,6 +122,23 @@ type ParsedStatement struct {
 	// IsDDL is true for CREATE / ALTER / DROP / TRUNCATE / COMMENT /
 	// RENAME.
 	IsDDL bool
+	// IsDCL is true for GRANT / REVOKE / ALTER DEFAULT PRIVILEGES — the
+	// privilege-management family. Surfaced as a first-class predicate
+	// so profiles can reason about privilege escalation without keyword-
+	// sniffing the raw SQL. Per task #302 / KNOWN-CAVEATS §A5: before
+	// this field existed the parser returned StatementType=UNKNOWN for
+	// these statements and the safe-default profile let `GRANT ALL ...
+	// TO PUBLIC` slip through.
+	IsDCL bool
+	// DCLTargetsPublic is true when the statement's grantee list includes
+	// the special PG `PUBLIC` pseudo-role — i.e., a GRANT that fans out
+	// to every database role. The safe-default profile treats this as a
+	// hard deny (privilege escalation to all sessions). Also true for
+	// `ALTER DEFAULT PRIVILEGES ... GRANT ... TO PUBLIC`.
+	//
+	// Always false for REVOKE — revoking from PUBLIC is a cleanup
+	// operation and stays advisory under safe-default.
+	DCLTargetsPublic bool
 	// HasMutatingNode is the Layer-2 backstop: AST walker found at least
 	// one mutating node anywhere in the tree, regardless of nesting
 	// depth. Catches CTE-wrapped writes whose top-level keyword is WITH

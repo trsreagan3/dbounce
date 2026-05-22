@@ -42,7 +42,7 @@ profiles:
     # always succeeds.
 
   safe-default:
-    description: "Cross-product safe-by-default — pure SELECT statements pass via the sql_read_only baseline; mutations (INSERT/UPDATE/DELETE/DDL/CALL/CTE-wrapped writes) deny via the AST-walk Layer 2 backstop. NOT a confidentiality boundary — reads of sensitive tables still pass; pair with deny_keywords to block known-sensitive table names."
+    description: "Cross-product safe-by-default — pure SELECT statements pass via the sql_read_only baseline; mutations (INSERT/UPDATE/DELETE/DDL/CALL/CTE-wrapped writes) deny via the AST-walk Layer 2 backstop; GRANT-to-PUBLIC denied unconditionally via the DCL floor. NOT a confidentiality boundary — reads of sensitive tables still pass; pair with deny_keywords to block known-sensitive table names."
     # Pure SELECT classifier: SELECT / EXPLAIN (without ANALYZE) /
     # SHOW pass the baseline; everything else falls to the AST-walk
     # backstop below.
@@ -55,6 +55,14 @@ profiles:
     # VACUUM). LOAD-BEARING: catches CTE-wrapped UPDATEs whose
     # top-level keyword is WITH/SELECT.
     deny_ast_mutating_nodes: true
+    # DCL floor — privilege management. Fires BEFORE the allow_baseline
+    # classifier on any statement where DCLTargetsPublic=true (i.e.,
+    # `GRANT ... TO PUBLIC` or `ALTER DEFAULT PRIVILEGES ... GRANT ...
+    # TO PUBLIC`). REVOKE statements never trip this — revoke FROM
+    # PUBLIC is cleanup. Per task #302 / KNOWN-CAVEATS §A5: without this
+    # floor, parser classified DCL as UNKNOWN and `GRANT ALL PRIVILEGES
+    # ON DATABASE x TO PUBLIC` slipped through.
+    deny_dcl_targets_public: true
     # No deny_actions list here — the AST-walk backstop above is
     # the comprehensive net. deny_actions is reserved for community
     # profiles that want finer carve-outs (e.g. allow INSERT but deny

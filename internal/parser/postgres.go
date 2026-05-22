@@ -104,12 +104,14 @@ func parsePostgres(raw string) *ParsedStatement {
 			out.MutatingNodeType = "WITH-WRITE"
 		}
 	}
-	// IsDML / IsDDL derivation from StatementType + walker findings.
+	// IsDML / IsDDL / IsDCL derivation from StatementType + walker findings.
 	switch out.StatementType {
 	case StmtInsert, StmtUpdate, StmtDelete, StmtMerge:
 		out.IsDML = true
 	case StmtDDL, StmtTruncate, StmtComment:
 		out.IsDDL = true
+	case StmtGrant, StmtRevoke, StmtAlterPrivileges:
+		out.IsDCL = true
 	}
 	return out
 }
@@ -182,6 +184,31 @@ func classifyTopLevel(n *pg_query.Node) string {
 		*pg_query.Node_RenameStmt,
 		*pg_query.Node_IndexStmt:
 		return StmtDDL
+	// DCL — privilege management. Per task #302 / KNOWN-CAVEATS §A5:
+	// before this slice these classified as UNKNOWN and slipped past
+	// the safe-default profile (default-allow). The GrantStmt /
+	// GrantRoleStmt nodes both carry an IsGrant bool that distinguishes
+	// GRANT (true) from REVOKE (false); we surface that as the
+	// StatementType so profile rules can reason about direction. The
+	// `dcl_targets_public` predicate is set by the walker (see
+	// walkNode below).
+	case *pg_query.Node_GrantStmt:
+		if v.GrantStmt != nil && !v.GrantStmt.IsGrant {
+			return StmtRevoke
+		}
+		return StmtGrant
+	case *pg_query.Node_GrantRoleStmt:
+		if v.GrantRoleStmt != nil && !v.GrantRoleStmt.IsGrant {
+			return StmtRevoke
+		}
+		return StmtGrant
+	case *pg_query.Node_AlterDefaultPrivilegesStmt:
+		// `ALTER DEFAULT PRIVILEGES ... GRANT/REVOKE ...` is its own
+		// statement type because it sets the privilege-default for
+		// future objects in a schema. Always classified as
+		// ALTER_PRIVILEGES regardless of inner direction — the future-
+		// objects shape is what matters for the profile gate.
+		return StmtAlterPrivileges
 	}
 	// CTE-style queries arrive as SelectStmt wrappers around the inner
 	// node; classifyTopLevel doesn't see them as WITH-WRITE — the
@@ -428,11 +455,83 @@ func walkNode(n *pg_query.Node, ctx *walkCtx) {
 				walkNode(item, ctx)
 			}
 		}
+	case *pg_query.Node_GrantStmt:
+		// Privilege grant on an object (TABLE / SCHEMA / DATABASE /
+		// SEQUENCE / FUNCTION / etc.). Walker surfaces:
+		//   - touched tables (so table-scope rules still apply)
+		//   - dcl_targets_public when any grantee is the PUBLIC pseudo-role
+		// REVOKE direction (IsGrant=false) NEVER sets dcl_targets_public —
+		// revoking FROM PUBLIC is cleanup and the safe-default profile lets
+		// it through.
+		if v.GrantStmt != nil {
+			for _, obj := range v.GrantStmt.Objects {
+				if obj == nil {
+					continue
+				}
+				if rng, ok := obj.Node.(*pg_query.Node_RangeVar); ok && rng.RangeVar != nil {
+					ctx.tables[qualify(rng.RangeVar)] = struct{}{}
+				}
+			}
+			if v.GrantStmt.IsGrant && granteesIncludePublic(v.GrantStmt.Grantees) {
+				ctx.parsed.DCLTargetsPublic = true
+			}
+		}
+	case *pg_query.Node_GrantRoleStmt:
+		// `GRANT role_a TO role_b` — role membership grant. Same
+		// dcl_targets_public predicate semantics: only the grant
+		// direction with PUBLIC as grantee sets the predicate. Note
+		// that PostgreSQL itself forbids granting role membership TO
+		// PUBLIC, but the predicate stays consistent across both
+		// GrantStmt shapes so downstream callers don't have to dispatch
+		// on the inner type.
+		if v.GrantRoleStmt != nil && v.GrantRoleStmt.IsGrant {
+			if granteesIncludePublic(v.GrantRoleStmt.GranteeRoles) {
+				ctx.parsed.DCLTargetsPublic = true
+			}
+		}
+	case *pg_query.Node_AlterDefaultPrivilegesStmt:
+		// `ALTER DEFAULT PRIVILEGES ... GRANT ... TO PUBLIC` is the
+		// dangerous shape — it makes EVERY future object in a schema
+		// world-accessible. We recurse into the inner Action (a
+		// GrantStmt) so granteesIncludePublic fires consistently.
+		if v.AlterDefaultPrivilegesStmt != nil && v.AlterDefaultPrivilegesStmt.Action != nil {
+			action := v.AlterDefaultPrivilegesStmt.Action
+			if action.IsGrant && granteesIncludePublic(action.Grantees) {
+				ctx.parsed.DCLTargetsPublic = true
+			}
+		}
 	case *pg_query.Node_RawStmt:
 		if v.RawStmt != nil {
 			walkNode(v.RawStmt.Stmt, ctx)
 		}
 	}
+}
+
+// granteesIncludePublic returns true when any node in the grantee list
+// resolves to the PG `PUBLIC` pseudo-role (either via Roletype =
+// ROLESPEC_PUBLIC or, defensively, Rolename = "public" case-insensitive).
+//
+// pg_query parses bare `PUBLIC` as Roletype = ROLESPEC_PUBLIC so the
+// first check catches the canonical syntax. The Rolename fallback is
+// defensive: a future libpg_query version that surfaces PUBLIC via the
+// Rolename field instead of Roletype keeps working without a code change.
+func granteesIncludePublic(grantees []*pg_query.Node) bool {
+	for _, g := range grantees {
+		if g == nil {
+			continue
+		}
+		rs, ok := g.Node.(*pg_query.Node_RoleSpec)
+		if !ok || rs.RoleSpec == nil {
+			continue
+		}
+		if rs.RoleSpec.Roletype == pg_query.RoleSpecType_ROLESPEC_PUBLIC {
+			return true
+		}
+		if strings.EqualFold(rs.RoleSpec.Rolename, "public") {
+			return true
+		}
+	}
+	return false
 }
 
 // flagMutating records that a mutating node was found during the walk.

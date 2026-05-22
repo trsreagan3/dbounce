@@ -180,6 +180,20 @@ type ParsedStatement struct {
 	// COMMENT.
 	IsDDL bool
 
+	// IsDCL is true for GRANT / REVOKE / ALTER DEFAULT PRIVILEGES — the
+	// privilege-management family. Surfaced from the parser so the
+	// profile evaluator can refuse PUBLIC-targeting grants without
+	// having to keyword-sniff the raw SQL. Per task #302 / KNOWN-CAVEATS
+	// §A5 (the dbounce DCL-classifier gap fix).
+	IsDCL bool
+
+	// DCLTargetsPublic is true when a GRANT (or ALTER DEFAULT
+	// PRIVILEGES ... GRANT) statement lists the PG `PUBLIC` pseudo-role
+	// as a grantee. The safe-default profile treats this as a hard deny
+	// (privilege escalation to all sessions). Always false for REVOKE —
+	// revoking FROM PUBLIC is cleanup.
+	DCLTargetsPublic bool
+
 	// HasMutatingNode is the Layer-2 AST-walk backstop signal. True
 	// when ANY AST node anywhere in the tree mutates state. Catches
 	// CTE-wrapped writes whose top-level keyword is WITH/SELECT plus
@@ -246,6 +260,22 @@ type Profile struct {
 	// [[structured-classifier-backstop-pattern]] — it catches
 	// CTE-wrapped writes that look like SELECT at the top.
 	DenyASTMutatingNodes bool `yaml:"deny_ast_mutating_nodes,omitempty"`
+
+	// DenyDCLTargetsPublic, when true, hard-denies any statement whose
+	// parsed shape has DCLTargetsPublic=true. The intended target is
+	// `GRANT ALL PRIVILEGES ... TO PUBLIC` (and the equivalent ALTER
+	// DEFAULT PRIVILEGES shape) — both fan privilege out to every
+	// database role, which is the canonical safe-default-tripping
+	// failure mode per KNOWN-CAVEATS §A5 / task #302. Fires BEFORE the
+	// allow_baseline classifier so a permissive sql_read_only baseline
+	// can't accidentally let a privilege escalation through. REVOKE
+	// statements never set DCLTargetsPublic (revoke FROM PUBLIC is
+	// cleanup) so REVOKE traffic passes this gate unchanged. ExemptActions
+	// + ExemptResources are NOT consulted for this floor — a PUBLIC-
+	// targeting GRANT is the kind of statement an operator should have
+	// to write explicitly as an allow_rule, not implicitly inherit via
+	// a per-table carve-out.
+	DenyDCLTargetsPublic bool `yaml:"deny_dcl_targets_public,omitempty"`
 
 	// DenyActions lists statement types that always deny when the
 	// profile is active, regardless of allow_rules. Each entry is a
@@ -572,6 +602,28 @@ func (p *Profile) Evaluate(ps *ParsedStatement) Verdict {
 		}
 	}
 
+	// Order 2.5: DCL-targets-public hard floor. Per task #302 /
+	// KNOWN-CAVEATS §A5: a `GRANT ALL PRIVILEGES ... TO PUBLIC` is a
+	// privilege escalation that fans out to every database role and
+	// MUST NOT slip past safe-default. We deny BEFORE the allow_baseline
+	// classifier so the sql_read_only baseline (which is permissive by
+	// design — it only inspects read-vs-write shape, not privilege
+	// targets) can't accidentally let a PUBLIC-targeting grant through.
+	// ExemptActions / ExemptResources are NOT consulted — a PUBLIC-
+	// targeting GRANT must be written as an explicit allow_rule, not
+	// implicitly carved out.
+	if p.DenyDCLTargetsPublic && ps.DCLTargetsPublic {
+		return Verdict{
+			Denied: true,
+			Reason: fmt.Sprintf(
+				"profile %q: DCL targets PUBLIC — %s grants privilege to every "+
+					"database role; safe-default refuses privilege escalation to PUBLIC",
+				p.Name, ps.StatementType),
+			Source:      SourceProfile,
+			ProfileName: p.Name,
+		}
+	}
+
 	// Order 3: allow_baseline + AST-walk Layer 2 backstop.
 	// The classifier returns three possible outcomes:
 	//
@@ -699,6 +751,14 @@ func isSQLReadOnly(ps *ParsedStatement) bool {
 
 // isMutatingShape returns true when the parsed statement has any
 // mutating signal. Used by the AST-walk backstop.
+//
+// DCL (GRANT / REVOKE / ALTER DEFAULT PRIVILEGES) is intentionally NOT
+// in the mutating set here. The DCL hard-floor lives at
+// `DenyDCLTargetsPublic` (Order 2.5) which fires ONLY on the dangerous
+// PUBLIC-targeting shape; routine GRANTs to specific users (the common
+// admin shape) deserve their own per-deployment policy via allow_rules
+// rather than being implicitly denied by the read-only baseline.
+// Per KNOWN-CAVEATS §A5 + task #302.
 func isMutatingShape(ps *ParsedStatement) bool {
 	if ps == nil {
 		return false

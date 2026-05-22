@@ -5,6 +5,87 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### GRANT/REVOKE/DCL classifier (#302, 2026-05-22; HIGH)
+
+- **Bug:** `GRANT ALL PRIVILEGES ON DATABASE x TO PUBLIC` and the
+  equivalent `ALTER DEFAULT PRIVILEGES ... GRANT ... TO PUBLIC` slipped
+  through the `safe-default` profile. The parser classified DCL
+  (privilege-management) statements as `StatementType=UNKNOWN`,
+  `IsDML=false`, `IsDDL=false`, so the `sql_read_only` allow_baseline
+  abstained (not a read), `deny_ast_mutating_nodes` abstained (no
+  mutating flag), and the call fell through to default-allow. UAT
+  Variant A + Variant C both confirmed the H3 hostile attempt succeeded
+  pre-fix; KNOWN-CAVEATS §A5 in `iam-roles/docs/`. HIGH severity —
+  privilege escalation to every database role is the kind of statement
+  safe-default exists to refuse.
+- **Root cause:** `internal/parser/postgres.go` didn't dispatch on
+  `pg_query.Node_GrantStmt`, `Node_GrantRoleStmt`, or
+  `Node_AlterDefaultPrivilegesStmt`. Three of the most common attacker-
+  shaped statements rendered as `UNKNOWN` and the profile evaluator had
+  no signal to gate on.
+- **Fix:**
+  - New parser statement-type constants: `StmtGrant` (`GRANT`),
+    `StmtRevoke` (`REVOKE`), `StmtAlterPrivileges` (`ALTER_PRIVILEGES`).
+    `GrantStmt` + `GrantRoleStmt` map to `StmtGrant` / `StmtRevoke`
+    based on the `IsGrant` bool; `AlterDefaultPrivilegesStmt` always
+    maps to `StmtAlterPrivileges` (the future-objects shape is what
+    matters for the safe-default gate regardless of inner direction).
+  - New `ParsedStatement.IsDCL` predicate so downstream rules can match
+    on the DCL family without keyword-sniffing the raw SQL.
+  - New `ParsedStatement.DCLTargetsPublic` predicate — set by the walker
+    when any grantee resolves to PG's `PUBLIC` pseudo-role (either via
+    `RoleSpecType_ROLESPEC_PUBLIC` or a defensive case-insensitive match
+    on the rolename). REVOKE direction NEVER sets this predicate per the
+    task spec — revoking FROM PUBLIC is cleanup and a safe-default that
+    blocks cleanup is a worse failure than allowing the original grant.
+  - New `Profile.DenyDCLTargetsPublic` field. Fires at **Order 2.5** in
+    the profile composition (after deny_keywords / deny_actions, BEFORE
+    `allow_baseline`) so a permissive sql_read_only baseline can't
+    accidentally let a PUBLIC-targeting grant through. ExemptActions +
+    ExemptResources are NOT consulted for this floor — a PUBLIC-targeting
+    GRANT must be written as an explicit allow_rule, not implicitly
+    carved out via a per-table exemption.
+  - `safe-default` profile in `internal/profile/defaults.yaml` now sets
+    `deny_dcl_targets_public: true` so the hard floor is on by default.
+  - Wired the new predicates through `proxy.decide`'s
+    `profile.ParsedStatement` construction.
+- **Regression coverage:**
+  - **Parser** (`internal/parser/postgres_test.go`):
+    - `TestParse_GrantAllPrivilegesToPublic`
+    - `TestParse_GrantSelectOnTableToSpecificUser`
+    - `TestParse_GrantCaseInsensitivePublic`
+    - `TestParse_RevokeFromPublic`
+    - `TestParse_RevokeFromSpecificUser`
+    - `TestParse_AlterDefaultPrivilegesGrantToPublic`
+    - `TestParse_AlterDefaultPrivilegesGrantToSpecificUser`
+    - `TestParse_GrantRoleToUser`
+    - `TestParse_GrantMultipleGranteesIncludesPublic`
+  - **Profile** (`internal/profile/profile_test.go`):
+    - `TestEvaluate_SafeDefault_DeniesGrantAllToPublic`
+    - `TestEvaluate_SafeDefault_DeniesAlterDefaultPrivilegesGrantToPublic`
+    - `TestEvaluate_SafeDefault_AllowsGrantToSpecificUser`
+    - `TestEvaluate_SafeDefault_AllowsRevokeFromPublic`
+    - `TestEvaluate_DCLFloor_NotConsultedWhenDisabled`
+    - `TestEvaluate_DCLFloor_FiresBeforeAllowBaseline`
+- **End-to-end verification:** dbounce was launched against the dogfood
+  Postgres with `--profile safe-default --mode transparent
+  --default-policy allow`. psycopg2 replayed the four task-spec
+  scenarios + a baseline SELECT; all five returned the expected
+  verdict:
+  - `GRANT ALL PRIVILEGES ON DATABASE postgres TO PUBLIC` → DENIED
+    (`profile "safe-default": DCL targets PUBLIC ...`)
+  - `GRANT SELECT ON TABLE pg_stat_activity TO postgres` → ALLOWED
+    (non-PUBLIC; profile abstains; default-policy allows)
+  - `REVOKE ALL PRIVILEGES ON DATABASE postgres FROM PUBLIC` → ALLOWED
+    (cleanup direction; predicate never set)
+  - `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO PUBLIC`
+    → DENIED (the future-objects variant of the same hostile shape)
+  - `SELECT 1` → ALLOWED (pure read via sql_read_only baseline; no
+    regression on the existing safe-default behavior)
+- Closes KNOWN-CAVEATS §A5. Per `[[creates-never-mutates]]`: the fix
+  ADDS new classifier shapes + a new policy field; it never silently
+  widens an existing rule.
+
 ### #306 + #307 — canonicalize `go install` as the install path; no checked-in `bin/` (2026-05-22)
 
 Closes KNOWN-CAVEATS §A8. The repository never tracked `bin/dbounce`

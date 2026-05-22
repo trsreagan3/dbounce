@@ -350,6 +350,109 @@ func TestParse_Vacuum(t *testing.T) {
 	assert.Equal(t, StmtVacuum, ps.StatementType)
 }
 
+// DCL (Data Control Language) classification — privilege management.
+// Per task #302 / KNOWN-CAVEATS §A5: before this slice, GRANT/REVOKE/
+// ALTER DEFAULT PRIVILEGES classified as StmtUnknown and the safe-default
+// profile let `GRANT ALL PRIVILEGES ... TO PUBLIC` slip through.
+// These tests pin the classifier + the DCLTargetsPublic predicate.
+
+func TestParse_GrantAllPrivilegesToPublic(t *testing.T) {
+	// The canonical hostile shape per UAT Variant A + Variant C: a
+	// GRANT that fans privilege out to every database role. Parser MUST
+	// surface StmtGrant + IsDCL=true + DCLTargetsPublic=true so the
+	// safe-default profile's deny_dcl_targets_public floor can refuse
+	// it. Before #302 fix: classified as UNKNOWN, default-allow.
+	ps := pgParse(`GRANT ALL PRIVILEGES ON DATABASE mydb TO PUBLIC`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL, "GRANT must set IsDCL=true")
+	assert.True(t, ps.DCLTargetsPublic, "GRANT ... TO PUBLIC must set DCLTargetsPublic=true")
+	assert.False(t, ps.IsDML)
+	assert.False(t, ps.IsDDL)
+	assert.False(t, ps.HasMutatingNode, "DCL is not a DML mutation; HasMutatingNode stays false")
+}
+
+func TestParse_GrantSelectOnTableToSpecificUser(t *testing.T) {
+	// Non-PUBLIC grantee: still DCL, but DCLTargetsPublic=false so the
+	// safe-default DCL floor abstains and downstream policy decides.
+	ps := pgParse(`GRANT SELECT ON TABLE public.users TO specific_user`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.False(t, ps.DCLTargetsPublic,
+		"specific user is not PUBLIC; DCLTargetsPublic must stay false")
+	assert.Contains(t, ps.TablesTouched, "public.users")
+}
+
+func TestParse_GrantCaseInsensitivePublic(t *testing.T) {
+	// pg_query parses bare PUBLIC via Roletype = ROLESPEC_PUBLIC; the
+	// case shouldn't matter. Defensive: lowercase + mixed-case still
+	// surface DCLTargetsPublic=true.
+	for _, sql := range []string{
+		`GRANT SELECT ON TABLE t TO public`,
+		`GRANT SELECT ON TABLE t TO Public`,
+		`GRANT SELECT ON TABLE t TO PUBLIC`,
+	} {
+		ps := pgParse(sql)
+		assert.True(t, ps.DCLTargetsPublic, "%q must set DCLTargetsPublic", sql)
+	}
+}
+
+func TestParse_RevokeFromPublic(t *testing.T) {
+	// REVOKE direction MUST NOT set DCLTargetsPublic. Revoking FROM
+	// PUBLIC is a cleanup operation and the safe-default profile lets
+	// it through — denying the cleanup would be a worse failure than
+	// allowing the original grant. Per task #302 spec.
+	ps := pgParse(`REVOKE ALL PRIVILEGES ON DATABASE mydb FROM PUBLIC`)
+	assert.Equal(t, StmtRevoke, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.False(t, ps.DCLTargetsPublic,
+		"REVOKE ... FROM PUBLIC is cleanup; DCLTargetsPublic MUST stay false")
+}
+
+func TestParse_RevokeFromSpecificUser(t *testing.T) {
+	ps := pgParse(`REVOKE INSERT ON TABLE public.orders FROM specific_user`)
+	assert.Equal(t, StmtRevoke, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.False(t, ps.DCLTargetsPublic)
+}
+
+func TestParse_AlterDefaultPrivilegesGrantToPublic(t *testing.T) {
+	// The other dangerous shape: ALTER DEFAULT PRIVILEGES ... GRANT ...
+	// TO PUBLIC makes EVERY FUTURE object in the schema world-accessible.
+	// StatementType is StmtAlterPrivileges, IsDCL=true, and the walker
+	// must recurse into the inner action to see PUBLIC in the grantees.
+	ps := pgParse(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO PUBLIC`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.True(t, ps.DCLTargetsPublic,
+		"ALTER DEFAULT PRIVILEGES ... GRANT ... TO PUBLIC must set DCLTargetsPublic")
+}
+
+func TestParse_AlterDefaultPrivilegesGrantToSpecificUser(t *testing.T) {
+	ps := pgParse(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO specific_user`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.False(t, ps.DCLTargetsPublic)
+}
+
+func TestParse_GrantRoleToUser(t *testing.T) {
+	// `GRANT role_a TO role_b` — role-membership grant (GrantRoleStmt
+	// node, distinct from object GrantStmt). Classified as StmtGrant
+	// + IsDCL=true.
+	ps := pgParse(`GRANT manager_role TO alice`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.False(t, ps.DCLTargetsPublic)
+}
+
+func TestParse_GrantMultipleGranteesIncludesPublic(t *testing.T) {
+	// Mixed grantee list including PUBLIC — must set DCLTargetsPublic
+	// (a grant to PUBLIC anywhere in the list is just as dangerous as
+	// a grant to PUBLIC alone).
+	ps := pgParse(`GRANT SELECT ON TABLE t TO alice, PUBLIC, bob`)
+	assert.True(t, ps.DCLTargetsPublic,
+		"PUBLIC mixed into a grantee list still triggers the floor")
+}
+
 // Multi-statement batches: the FIRST statement drives StatementType,
 // but TablesTouched + HasMutatingNode aggregate across all statements
 // in the batch so a "SELECT 1; UPDATE secrets ..." batch still
