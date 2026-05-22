@@ -63,6 +63,18 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 			wireProto += "+mtls"
 		}
 	}
+	// [[discovery-first-default]] (2026-05-22): default_mode label
+	// surfaces the operating shape (discovery|profile) on the headline
+	// banner. discovery = no profile selected (full-user); profile =
+	// operator explicitly picked a named profile via --profile NAME or
+	// DBOUNCE_PROFILE env var. Cross-product parity with ibounce +
+	// kbouncer + gbounce per [[cross-product-agent-parity]].
+	defaultModeLabel := "discovery"
+	if opts.ActiveProfileName != "" &&
+		opts.ActiveProfileName != "full-user" &&
+		opts.ActiveProfileName != "none" {
+		defaultModeLabel = "profile"
+	}
 	if opts.Quiet {
 		// LOW-D8-13 minimal banner: address + dialect + transport only.
 		// Drop mode + default-policy + profile + upstream + audit-db
@@ -77,8 +89,8 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 		return
 	}
 	fmt.Fprintf(w,
-		"dbounce wire listener  : %s:%d  (dialect=%s, mode=%s, default-policy=%s, transport=%s)\n",
-		cfg.Host, cfg.Port, cfg.Dialect, cfg.Mode, cfg.DefaultPolicy, wireProto)
+		"dbounce wire listener  : %s:%d  (dialect=%s, mode=%s, default-policy=%s, transport=%s, default_mode=%s)\n",
+		cfg.Host, cfg.Port, cfg.Dialect, cfg.Mode, cfg.DefaultPolicy, wireProto, defaultModeLabel)
 	mgmtScheme := "http"
 	if cfg.MgmtTLSCertFile != "" {
 		mgmtScheme = "https"
@@ -103,10 +115,27 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 		"profile               : %s (loaded from %s)\n",
 		opts.ActiveProfileName, opts.ResolvedProfilesPath)
 	if !opts.ProfileFromFlag && !opts.ProfileEnvSet {
+		// [[discovery-first-default]] (2026-05-22): name DISCOVERY MODE
+		// explicitly; closes D1/D2 NEGATIVE-VALUE + THEATER findings
+		// from the role-effectiveness eval (see KNOWN-CAVEATS §A21).
+		// Per [[security-team-positioning-safety-not-surveillance]]:
+		// framed as audit transparency NOT "we're not enforcing
+		// anything." Named profiles (safe-default + any custom) stay
+		// first-class via --profile NAME opt-in.
 		fmt.Fprintln(w,
-			"                        no --profile / "+envProfileVar+" set — running as 'full-user' "+
-				"(passthrough). To block writes by default, pass --profile safe-default OR "+
-				"export "+envProfileVar+"=safe-default.")
+			"                        no --profile / "+envProfileVar+" set.")
+		fmt.Fprintln(w,
+			"                        default mode: discovery — observing all statements, denying none.")
+		fmt.Fprintln(w,
+			"                          every statement is parsed, audit-logged, and")
+		fmt.Fprintln(w,
+			"                          (with --upstream) forwarded verbatim to the DB.")
+		fmt.Fprintln(w,
+			"                          full OCSF event stream + recommender operate as usual.")
+		fmt.Fprintln(w,
+			"                          To block writes (incl. the DCL-to-PUBLIC floor),")
+		fmt.Fprintln(w,
+			"                          pass --profile safe-default OR export "+envProfileVar+"=safe-default.")
 	}
 	fmt.Fprintln(w,
 		"mode                  : cooperative — every statement is parsed + audit-logged.")

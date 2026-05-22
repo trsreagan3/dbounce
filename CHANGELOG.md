@@ -5,6 +5,58 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### Changed
+
+### BREAKING — §A21 / [[discovery-first-default]] — default flips to DISCOVERY MODE — Shipped 2026-05-22
+
+Per the role-effectiveness eval at
+`iam-roles/tests/dogfood/role-effectiveness-grades.md`, dbounce's v1.0
+safe-default landed at 25% hit-rate against the 50% launch bar: D1
+(`SELECT *` from `credit_cards`) was THEATER, D2 (legit INSERT alongside
+adversarial DROP) was NEGATIVE-VALUE, and D3 (DCL floor + stale-profile
+upgrade gap) shipped PARTIAL. gbounce alone hit 66.7% with operator-set
+OPT-IN deny primitives — not blanket safe-defaults.
+
+The pivot flips dbounce's runtime default to match: observe + audit +
+pass-through (the `full-user` profile, which is already the default when
+no `--profile` is set). Named profiles (`safe-default` with its
+sql_read_only + DCL-to-PUBLIC floor, plus any custom) stay first-class
+via explicit opt-in (`dbounce run --profile <name>` or
+`export DBOUNCE_PROFILE=<name>`).
+
+- **internal/cli/banner.go:** headline banner now surfaces
+  `default_mode=discovery|profile` alongside dialect + mode +
+  default-policy + transport. Discovery fires when the active profile
+  is empty, `full-user`, or the legacy `none` alias. The "no profile
+  selected" block expands to explicitly name discovery mode (the
+  canonical cross-product term) + frame as audit transparency per
+  `[[security-team-positioning-safety-not-surveillance]]`.
+- **DCL-to-PUBLIC floor placement (judgment call per
+  `[[discovery-first-default]]`):** the `deny_dcl_targets_public`
+  floor stays TIED to the `safe-default` profile. Rationale: a
+  DCL floor firing without an active profile would surprise operators
+  who explicitly chose audit-only; the floor remains documented
+  alongside its profile in KNOWN-CAVEATS §A5 + §B7 and ships with
+  safe-default. Operators who want the DCL floor must pin
+  `--profile safe-default` (the floor + writes-block ship together by
+  design; no partial-floor mode in v1.0). v1.1 may surface the floor
+  as a standalone `--deny-dcl-public` flag if operator demand
+  materializes.
+- **No code path lost:** safe-default profile, OCSF audit, recommender,
+  agent attribution (#318/#320), pg_query AST walker all continue to
+  fire when the operator pins `--profile safe-default`. PG wire-
+  protocol pass-through verified.
+
+**BREAKING-CHANGE for operators upgrading from pre-pivot v1.0 builds**
+that auto-applied or framed `safe-default` as the v1.0 default. Fresh
+installs + upgrades now land in discovery mode by default. To keep
+pre-pivot behavior (including the DCL-to-PUBLIC floor) pin
+`dbounce run --profile safe-default` or `export DBOUNCE_PROFILE=safe-default`
+in your shell rc. See `iam-roles/docs/PROFILE-UPGRADE.md` + iam-roles
+KNOWN-CAVEATS §A21 for the cross-product upgrade path; the re-graded
+corpus lives at
+`iam-roles/tests/dogfood/role-effectiveness-grades-post-pivot.md`.
+
 ### #321 / §A19 — `dbounce profile doctor` upgrade-blindness fix — Shipped 2026-05-22
 
 Closes the D3 launch-blocker surfaced by the role-effectiveness eval

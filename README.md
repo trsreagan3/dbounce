@@ -78,22 +78,38 @@ go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
 
 ## Quickstart
 
+### First 60 seconds with dbounce (discovery mode default)
+
+Per `[[discovery-first-default]]` (2026-05-22) + iam-roles KNOWN-CAVEATS
+§A21 the canonical shape is **discovery mode** — observe + audit +
+pass-through. Closes the D1/D2 THEATER + NEGATIVE-VALUE findings from the
+role-effectiveness eval (the pre-pivot `safe-default` blocked legit
+INSERT alongside adversarial DROP; reads of sensitive tables walked
+through unconditionally).
+
 ```sh
-# Default run: cooperative mode, observation-only.
-# The proxy listens on 127.0.0.1:5433 (one above PostgreSQL's default
-# 5432 so an existing local PG install isn't disturbed). The management
-# HTTP port for /healthz is 127.0.0.1:8768 (distinct from kbounce's
-# 8766 and ibounce's 8767 so all three products coexist on the same
-# laptop).
+# Default run: discovery mode (no profile applied; statements forwarded + audit-logged).
+# The headline banner reports default_mode=discovery; full OCSF event stream operates as usual.
+# Proxy listens on 127.0.0.1:5433 (one above PG's 5432). /healthz on 127.0.0.1:8768.
 #
-# For a loopback upstream (local PG on 127.0.0.1 / localhost / a
-# .local hostname), add --allow-internal-upstream — dbounce refuses
-# internal IP ranges by default to prevent SSRF when the upstream URL
-# comes from untrusted config:
+# For a loopback upstream (local PG on 127.0.0.1 / localhost / a .local hostname),
+# add --allow-internal-upstream — dbounce refuses internal IP ranges by default to
+# prevent SSRF when the upstream URL comes from untrusted config:
 dbounce run \
   --upstream postgres://user:pass@127.0.0.1:5432/mydb \
   --allow-internal-upstream
+
+# Opt into the safe-default profile (sql_read_only + DCL-to-PUBLIC floor):
+dbounce run --profile safe-default --upstream ... --allow-internal-upstream
+# Or, persistent for your shell:
+export DBOUNCE_PROFILE=safe-default
 ```
+
+**DCL-to-PUBLIC floor placement:** the `deny_dcl_targets_public` floor
+ships TIED to `safe-default` (it doesn't auto-fire under discovery
+mode). Operators who want the floor pin `--profile safe-default`. See
+the CHANGELOG entry under §A21 for the rationale (judgment call:
+floor + writes-block ship together by design; no partial-floor in v1.0).
 
 ### After upgrade: `dbounce profile doctor` (one-time)
 
