@@ -35,6 +35,7 @@ import (
 
 	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/caveats"
+	"github.com/trsreagan3/dbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	dbrules "github.com/trsreagan3/dbounce/internal/rules"
@@ -576,6 +577,12 @@ func newRunCmd() *cobra.Command {
 		auditObjectStorageRotationMinutes int
 		auditObjectStorageMaxSizeMB       int
 		auditObjectStorageInstanceID      string
+		// #324c — dynamic-deny YAML path + disable + RDS-ARN match input.
+		// Default path is `~/.iam-jit/dynamic-denies.yaml` resolved via
+		// dynamicdeny.ResolveDefaultPath (honors $IAM_JIT_DYNAMIC_DENIES_PATH).
+		dynamicDeniesPath    string
+		disableDynamicDenies bool
+		upstreamRDSARN       string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -894,27 +901,69 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				return fmt.Errorf("select profile: %w", err)
 			}
 
+			// #324c — dynamic-deny watcher. Constructed BEFORE
+			// proxy.NewServer so the watcher's initial in-memory
+			// snapshot is the one the proxy sees on its first request.
+			// Default path is `~/.iam-jit/dynamic-denies.yaml`; the
+			// `--dynamic-denies-path PATH` flag overrides; the
+			// `--disable-dynamic-denies` flag turns the channel off
+			// entirely. SetInstanceUpstream is called with the resolved
+			// upstream's hostname (parsed from `--upstream`) + the
+			// operator-supplied --upstream-rds-arn so the watcher can
+			// compute the instance-denied flag on the initial snapshot
+			// + every subsequent reload.
+			var ddWatcher *dynamicdeny.Watcher
+			var ddBannerLine string
+			if !disableDynamicDenies {
+				ddPath := dynamicDeniesPath
+				if ddPath == "" {
+					ddPath = dynamicdeny.ResolveDefaultPath()
+				}
+				if ddPath != "" {
+					// emitFunc is wired AFTER NewServer below so we can
+					// reference the Server's counter-bump methods +
+					// audit-log sink. For now construct with nil; the
+					// post-NewServer step reassigns.
+					w, loadErr := dynamicdeny.NewWatcher(ddPath, nil)
+					if loadErr != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"dbounce: dynamic-denies: initial load of %q failed: %v\n",
+							ddPath, loadErr)
+					}
+					if w != nil {
+						upstreamHost := ""
+						if resolvedUpstream != nil {
+							upstreamHost = resolvedUpstream.HostnameOnly()
+						}
+						w.SetInstanceUpstream(upstreamHost, upstreamRDSARN)
+					}
+					ddWatcher = w
+				}
+			}
+
 			cfg := proxy.Config{
-				Host:              host,
-				Port:              port,
-				MgmtHost:          mgmtHost,
-				MgmtPort:          mgmtPort,
-				Mode:              mode,
-				DefaultPolicy:     defaultPol,
-				Dialect:           dialect,
-				UpstreamURL:       upstreamURL,
-				Upstream:          resolvedUpstream,
-				ListenerTLS:       listenerTLSCfg,
-				MgmtTLSCertFile:   mgmtTLSCert,
-				MgmtTLSKeyFile:    mgmtTLSKey,
-				ActiveProfile:     activeProfile,
-				ActiveProfileName: activeProfile.Name,
-				PromptOnDeny:      promptOnDeny,
-				SyncPromptOnDeny:  syncPromptOnDeny,
-				SyncPromptTimeout: syncPromptTimeout,
-				SyncPromptDefault: syncPromptDefault,
-				RedactLiterals:    redactLiterals,
-				AuditEventsToken:  auditEventsToken,
+				Host:               host,
+				Port:               port,
+				MgmtHost:           mgmtHost,
+				MgmtPort:           mgmtPort,
+				Mode:               mode,
+				DefaultPolicy:      defaultPol,
+				Dialect:            dialect,
+				UpstreamURL:        upstreamURL,
+				Upstream:           resolvedUpstream,
+				ListenerTLS:        listenerTLSCfg,
+				MgmtTLSCertFile:    mgmtTLSCert,
+				MgmtTLSKeyFile:     mgmtTLSKey,
+				ActiveProfile:      activeProfile,
+				ActiveProfileName:  activeProfile.Name,
+				PromptOnDeny:       promptOnDeny,
+				SyncPromptOnDeny:   syncPromptOnDeny,
+				SyncPromptTimeout:  syncPromptTimeout,
+				SyncPromptDefault:  syncPromptDefault,
+				RedactLiterals:     redactLiterals,
+				AuditEventsToken:   auditEventsToken,
+				DynamicDenyWatcher: ddWatcher,
+				UpstreamRDSARN:     upstreamRDSARN,
 			}.Normalize()
 
 			// Heartbeat — parse + validate BEFORE the exporter build so a
@@ -1073,6 +1122,95 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				}()
 			}
 
+			// #324c — wire the dynamic-deny watcher's emit callback now
+			// that the Server + audit exporter exist. Each reload bumps
+			// the matching counter on the Server + emits a synthetic
+			// ADMIN_ACTION OCSF event through the wired exporter so a
+			// SIEM dashboard sees activity. Instance-level transitions
+			// (now_denied / now_allowed) emit dbounce-specific actions
+			// distinct from the cross-product `dynamic_deny.reloaded` /
+			// `dynamic_deny.parse_error` shapes.
+			if ddWatcher != nil {
+				ddWatcher.SetStderr(cmd.ErrOrStderr())
+				listenerHost := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+				emit := func(reason dynamicdeny.ReloadReason, rs *dynamicdeny.RuleSet, parseErr error) {
+					switch reason {
+					case dynamicdeny.ReasonParseError:
+						s.BumpDynamicDenyParseError()
+					default:
+						s.BumpDynamicDenyReload()
+					}
+					var action audit.AdminActionKind
+					switch reason {
+					case dynamicdeny.ReasonParseError:
+						action = audit.AdminActionKindDynamicDenyParseError
+					case dynamicdeny.ReasonInstanceNowDenied:
+						action = audit.AdminActionKindDynamicDenyInstanceNowDenied
+					case dynamicdeny.ReasonInstanceNowAllowed:
+						action = audit.AdminActionKindDynamicDenyInstanceNowAllowed
+					default:
+						action = audit.AdminActionKindDynamicDenyReloaded
+					}
+					details := map[string]any{
+						"dynamic_deny_reload_reason": string(reason),
+					}
+					if rs != nil {
+						details["dynamic_denies_count"] = len(rs.Rules)
+						details["dynamic_denies_path"] = rs.SourcePath
+					}
+					if parseErr != nil {
+						details["dynamic_deny_parse_error"] = parseErr.Error()
+					}
+					// Surface the denying rule id alongside the
+					// transition action so a SIEM consumer joining
+					// `dynamic_deny.instance_now_denied` ->
+					// `dynamic_deny.connection_refused` on rule_id
+					// sees both keyed identically.
+					if reason == dynamicdeny.ReasonInstanceNowDenied {
+						if id, r := ddWatcher.DenyingRule(); id != "" {
+							details["dynamic_deny_rule_id"] = id
+							details["dynamic_deny_reason_detail"] = r
+						}
+					}
+					if auditExporter != nil && auditExporter.Enabled() {
+						evt := audit.NewAdminActionEvent(listenerHost,
+							audit.AdminActionInfo{
+								Action:       action,
+								Actor:        "dbounce-dynamic-deny-watcher",
+								ResourceType: "dynamic_denies_file",
+								ResourceID:   ddWatcher.Path(),
+								Result:       "success",
+								Details:      details,
+							})
+						_ = auditExporter.Emit(context.Background(), evt)
+					}
+				}
+				ddWatcher.SetEmitFunc(emit)
+				if startErr := ddWatcher.Start(cmd.Context()); startErr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"dbounce: dynamic-denies: watcher failed to start: %v\n",
+						startErr)
+				}
+				snap := ddWatcher.Snapshot()
+				ruleCount := 0
+				if snap != nil {
+					ruleCount = len(snap.Rules)
+				}
+				denied := ddWatcher.InstanceDenied()
+				denyingID, denyingReason := ddWatcher.DenyingRule()
+				deniedSuffix := "false"
+				if denied {
+					deniedSuffix = fmt.Sprintf("true (rule_id=%s; %s)", denyingID, denyingReason)
+				}
+				ddBannerLine = fmt.Sprintf(
+					"dynamic-denies: %d rules loaded from %s (%d applied to dbounce upstream; watching for changes)\nupstream-denied: %s",
+					ruleCount, ddWatcher.Path(), ruleCount, deniedSuffix)
+			} else if !disableDynamicDenies {
+				ddBannerLine = "dynamic-denies: disabled (no path resolved)"
+			} else {
+				ddBannerLine = "dynamic-denies: disabled (--disable-dynamic-denies)"
+			}
+
 			// Banner per the agent-parity requirement + the read-write
 			// framing the safe-default profile (D-Slice 7) will hook
 			// into. Goes to stderr so stdout stays clean.
@@ -1092,6 +1230,13 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				Quiet:                quietBanner,
 				AuditExporter:        auditExporter,
 			})
+			// #324c — dynamic-denies banner line. One line (with optional
+			// upstream-denied second line) per [[cross-product-agent-
+			// parity]]; suppressed by --quiet-banner like the rest of the
+			// banner.
+			if !quietBanner && ddBannerLine != "" {
+				fmt.Fprintln(os.Stderr, ddBannerLine)
+			}
 			// #254 — preset-derivation banner sits AFTER the standard
 			// startup banner so the operator sees which settings came
 			// from the preset (vs. their own flags / env). Suppressed
@@ -1563,6 +1708,41 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"audit-object-storage-instance-id", "",
 		"#317 — override the auto-generated instance identifier "+
 			"(hostname-pid) used in the object key.")
+	// #324c — dynamic-deny YAML path. Default ~/.iam-jit/dynamic-denies.yaml
+	// (resolved via os.UserHomeDir; honors IAM_JIT_DYNAMIC_DENIES_PATH
+	// env var). Per [[cross-product-agent-parity]] the flag name +
+	// default is identical on the other Bounce products. When the file
+	// is absent at startup the watcher waits for it to appear — startup
+	// is NOT an error condition (an operator who hasn't installed any
+	// dynamic denies still wants the proxy to start cleanly).
+	cmd.Flags().StringVar(&dynamicDeniesPath, "dynamic-denies-path", "",
+		"#324c — path to the dynamic-deny YAML file. Default "+
+			"~/.iam-jit/dynamic-denies.yaml (honors "+
+			"$IAM_JIT_DYNAMIC_DENIES_PATH). The file is watched via "+
+			"fsnotify (fsevents on macOS, inotify on Linux); rules apply "+
+			"to dbounce immediately on file change. Rules that don't "+
+			"target dbounce (per the rule's `applied_to` list OR the "+
+			"hostname / rds:* heuristic) are silently skipped — a "+
+			"single shared file fans out across the Bounce suite. POST "+
+			"/admin/dynamic-denies/reload on the mgmt port triggers an "+
+			"immediate reload for cross-bouncer fan-out orchestration "+
+			"(#324e). Parse errors retain the previous in-memory "+
+			"snapshot + emit an admin-action OCSF event. When ANY "+
+			"matching rule applies to this dbounce instance, NEW "+
+			"connections are refused at PG StartupMessage with SQLSTATE "+
+			"42501; existing connections continue normally.")
+	cmd.Flags().BoolVar(&disableDynamicDenies, "disable-dynamic-denies", false,
+		"#324c — turn the dynamic-deny watcher off entirely. The proxy "+
+			"falls back to the pre-#324c behavior (no instance-level "+
+			"deny gate). Useful for environments where the operator "+
+			"hasn't installed the cross-product CLI yet + the watcher's "+
+			"stat()ing of an absent file is undesirable.")
+	cmd.Flags().StringVar(&upstreamRDSARN, "upstream-rds-arn", "",
+		"#324c — optional RDS ARN identifying the upstream database "+
+			"(e.g. arn:aws:rds:us-east-1:123456789012:db:payments-prod). "+
+			"When set, dynamic-deny rules whose targets are `arn:aws:rds:*` "+
+			"patterns are matched against this ARN in addition to the "+
+			"hostname axis. Leave empty to match by hostname only.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more

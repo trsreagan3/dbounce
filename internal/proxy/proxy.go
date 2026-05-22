@@ -34,6 +34,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/trsreagan3/dbounce/internal/audit"
+	"github.com/trsreagan3/dbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/dbounce/internal/parser"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	dbrules "github.com/trsreagan3/dbounce/internal/rules"
@@ -305,6 +306,22 @@ type Config struct {
 	// trust anchor); empty + external mgmt host = the CLI refuses to
 	// start.
 	AuditEventsToken string
+
+	// DynamicDenyWatcher (#324c) is the dbounce-side consumer of the
+	// cross-product `~/.iam-jit/dynamic-denies.yaml` channel. When
+	// non-nil, the proxy consults the watcher's instance-denied flag
+	// before accepting EACH new connection — a denied instance refuses
+	// new connections at PG StartupMessage with SQLSTATE 42501 and a
+	// structured reason naming the rule_id. Existing connections
+	// continue normally (don't kill mid-transaction per
+	// [[ibounce-honest-positioning]]).
+	DynamicDenyWatcher *dynamicdeny.Watcher
+
+	// UpstreamRDSARN (#324c) is the optional operator-supplied RDS ARN
+	// the dynamic-deny matcher compares each rule's `arn:aws:rds:*`
+	// targets against. Empty disables RDS-ARN matching; the matcher
+	// still consults the hostname axis derived from `--upstream`.
+	UpstreamRDSARN string
 }
 
 // Normalize fills in zero-valued fields with sensible defaults.
@@ -478,6 +495,19 @@ type Server struct {
 	// payload). Mirrors gbounce + ibounce + kbouncer counter of the same
 	// name byte-for-byte per [[cross-product-agent-parity]].
 	totalAgentHeadersRejected atomic.Int64
+
+	// #324c — dynamic-deny watcher. May be nil (FREE-tier default; the
+	// CLI passed --disable-dynamic-denies OR no path could be resolved).
+	// Hot-path readers consult InstanceDenied() before accepting a new
+	// connection; reloads emit OCSF admin-action events via the
+	// watcher's EmitFunc + transition between accept / refuse posture.
+	dynamicDeny *dynamicdeny.Watcher
+
+	// #324c — counters surfaced via /healthz so an operator monitor sees
+	// dynamic-deny activity without grepping the audit log.
+	totalDynamicDenyConnectionsRefused atomic.Int64
+	totalDynamicDenyReloads            atomic.Int64
+	totalDynamicDenyParseErrors        atomic.Int64
 }
 
 // recordRejectedAgentTag bumps the per-Server rejection counter + logs
@@ -524,6 +554,7 @@ func NewServer(cfg Config, st *store.Store) *Server {
 		agentRegistry:     audit.NewAgentRegistry(),
 		activeProfile:     nc.ActiveProfile,
 		activeProfileName: nc.ActiveProfileName,
+		dynamicDeny:       nc.DynamicDenyWatcher,
 	}
 	// Bulk-prompt-answer UX per [[bulk-prompt-answer-ux]]: detector
 	// always-on by default. Operators who explicitly want to disable
@@ -965,6 +996,14 @@ func (s *Server) Serve() error {
 	// body never embeds the secret. Cross-product-identical HTML
 	// shape with ibounce / kbounce / gbounce.
 	mux.HandleFunc("/", auditEventsUIHandler(s.cfg.AuditEventsToken))
+	// #324c — POST /admin/dynamic-denies/reload triggers an immediate
+	// reload of the dynamic-deny YAML from disk. Useful for the
+	// cross-bouncer fan-out CLI (#324e), which writes the YAML +
+	// then calls this endpoint on each Bounce product's mgmt port
+	// to confirm "rules are live." Same bearer-token auth model as
+	// /audit/events.
+	mux.HandleFunc("/admin/dynamic-denies/reload",
+		s.dynamicDenyReloadHandler(s.cfg.AuditEventsToken))
 	s.mgmtSrv = &http.Server{
 		Addr:              mgmtAddr,
 		Handler:           mux,
@@ -1057,6 +1096,158 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// refuseIfDynamicDenied is the #324c hot-path gate. When a dynamic-deny
+// rule applies to THIS dbounce instance (the watcher's instance-denied
+// flag is true), the proxy:
+//
+//   - Bumps the totalDynamicDenyConnectionsRefused counter (surfaced
+//     via /healthz).
+//   - Reads the inbound StartupMessage preamble enough to identify a
+//     PG client + writes a PG ErrorResponse with SQLSTATE 42501
+//     (insufficient_privilege) + a structured message naming the
+//     rule_id + the operator reason.
+//   - Emits an OCSF v1.1.0 class 6003 audit event with
+//     `status_id=4` (Denied), `unmapped.iam_jit.ext.deny_source=
+//     "dynamic"`, `dynamic_deny_rule_id=<id>`, + the operator's
+//     verbatim reason as deny_reason context.
+//   - Closes the connection.
+//
+// MySQL clients get the same audit event + the same connection-close,
+// but no protocol-specific error packet — the MySQL handshake hasn't
+// run yet, so a PG ErrorResponse to a MySQL client would just be
+// garbled bytes. The audit trail (+ the operator's loud stderr line)
+// is the load-bearing signal in the MySQL path until #324c-MySQL
+// (post-launch).
+//
+// Returns true when the connection was refused (caller must NOT
+// continue the dispatch); false when no dynamic-deny rule applies +
+// the normal handler should proceed.
+func (s *Server) refuseIfDynamicDenied(conn net.Conn) bool {
+	if s == nil || s.dynamicDeny == nil {
+		return false
+	}
+	if !s.dynamicDeny.InstanceDenied() {
+		return false
+	}
+	ruleID, reason := s.dynamicDeny.DenyingRule()
+	s.totalDynamicDenyConnectionsRefused.Add(1)
+
+	// PG path: read preamble (handle SSLRequest), then send a
+	// minimally-shaped ErrorResponse with SQLSTATE 42501. The PG client
+	// receives an actionable error message rather than a silent TCP
+	// reset — surfaces the deny reason at the analyst's terminal.
+	if s.cfg.Dialect == DialectPostgres {
+		_ = writePGRefusalErrorResponse(conn, ruleID, reason)
+	}
+
+	// Emit the OCSF audit event regardless of dialect so the analyst
+	// has a SIEM-queryable record of the refusal.
+	if s.auditExporter != nil && s.auditExporter.Enabled() {
+		evt := audit.NewDynamicDenyConnectionRefusedEvent(s.listenerAddr(),
+			audit.DynamicDenyConnectionRefusedInfo{
+				RuleID:     ruleID,
+				Reason:     reason,
+				RemoteAddr: conn.RemoteAddr().String(),
+			})
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	if s.alertEngine != nil && s.alertEngine.Enabled() {
+		evt := audit.NewDynamicDenyConnectionRefusedEvent(s.listenerAddr(),
+			audit.DynamicDenyConnectionRefusedInfo{
+				RuleID:     ruleID,
+				Reason:     reason,
+				RemoteAddr: conn.RemoteAddr().String(),
+			})
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+
+	log.Warn().
+		Str("remote", conn.RemoteAddr().String()).
+		Str("rule_id", ruleID).
+		Str("reason", reason).
+		Msg("dbounce: refused new connection by dynamic-deny rule")
+	return true
+}
+
+// writePGRefusalErrorResponse consumes the inbound PG startup preamble
+// enough to identify a PG client (handles SSLRequest by replying 'N'),
+// then writes an ErrorResponse with SQLSTATE 42501 naming the rule.
+// Best-effort; an early read failure just closes the conn without an
+// error packet (the client will see TCP close — which is the same
+// outcome as if the SSL preamble itself failed).
+func writePGRefusalErrorResponse(conn net.Conn, ruleID, reason string) error {
+	// Read the 8-byte startup header.
+	hdr := make([]byte, 8)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return err
+	}
+	magic := binary.BigEndian.Uint32(hdr[4:8])
+	// SSLRequest: reply 'N' to decline TLS + read a fresh StartupMessage
+	// header so the client moves past its SSL negotiation phase.
+	if magic == 80877103 {
+		if _, err := conn.Write([]byte{'N'}); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return err
+		}
+	}
+	// Drop the body bytes (we don't care what user/database the client
+	// asked for; the refusal is connection-level).
+	length := binary.BigEndian.Uint32(hdr[0:4])
+	if length >= 8 && length < 1<<20 {
+		body := make([]byte, length-8)
+		_, _ = io.ReadFull(conn, body)
+	}
+	// Build ErrorResponse with SQLSTATE 42501 + operator-facing message.
+	msg := fmt.Sprintf("dbounce: refused by dynamic-deny rule %s (%s)", ruleID, reason)
+	var b []byte
+	b = append(b, 'S')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'V')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'C')
+	b = append(b, []byte("42501")...)
+	b = append(b, 0)
+	b = append(b, 'M')
+	b = append(b, []byte(msg)...)
+	b = append(b, 0)
+	b = append(b, 0)
+	hdrBuf := make([]byte, 5)
+	hdrBuf[0] = 'E'
+	binary.BigEndian.PutUint32(hdrBuf[1:5], uint32(len(b)+4))
+	if _, err := conn.Write(hdrBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(b); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DynamicDenyCounters exposes the per-Server #324c counters for
+// /healthz + tests. Read-only.
+func (s *Server) DynamicDenyCounters() (refused, reloads, parseErrors int64) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	return s.totalDynamicDenyConnectionsRefused.Load(),
+		s.totalDynamicDenyReloads.Load(),
+		s.totalDynamicDenyParseErrors.Load()
+}
+
+// BumpDynamicDenyReload + BumpDynamicDenyParseError are exposed for
+// the CLI's watcher emit callback so the /healthz counters reflect
+// reload activity without a circular package import.
+func (s *Server) BumpDynamicDenyReload()     { s.totalDynamicDenyReloads.Add(1) }
+func (s *Server) BumpDynamicDenyParseError() { s.totalDynamicDenyParseErrors.Add(1) }
+
+// DynamicDeny returns the wired watcher (may be nil). Surfaced for
+// the mgmt-port reload handler + tests.
+func (s *Server) DynamicDeny() *dynamicdeny.Watcher { return s.dynamicDeny }
+
 // serveConn is the per-client read loop.
 func (s *Server) serveConn(conn net.Conn) {
 	s.connWG.Add(1)
@@ -1070,6 +1261,16 @@ func (s *Server) serveConn(conn net.Conn) {
 		_ = conn.Close()
 	}()
 	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
+
+	// #324c — dynamic-deny instance gate. When the watcher has flipped
+	// this instance into the denied state, refuse new connections at
+	// the wire-protocol layer. Existing connections (already running
+	// loops past this point) continue per [[ibounce-honest-
+	// positioning]] — we don't kill mid-transaction; "new connections
+	// refused" is the honest behavioral contract.
+	if s.refuseIfDynamicDenied(conn) {
+		return
+	}
 
 	// D-Slice 5: dialect dispatch. MySQL gets its own wire-protocol
 	// handler in mysql.go; the PG path below is unchanged. The dispatch
@@ -1734,26 +1935,60 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	// alert. Per the memo: silently-failing audit IS a stealth
 	// bypass; making it loud closes the gap.
 	type HealthzAuditExportHealth = audit.ExportHealth
+	// #324c — dynamic-deny /healthz fields. Surfaced unconditionally
+	// (even when the watcher is nil) so a monitor scraping the
+	// endpoint sees a consistent shape across deployments.
+	denyRefused, denyReloads, denyParseErrs := s.DynamicDenyCounters()
+	dynamicDeniesEnabled := s.dynamicDeny != nil
+	dynamicDeniesPath := ""
+	dynamicDeniesCount := 0
+	upstreamDenied := false
+	upstreamDeniedRuleID := ""
+	if s.dynamicDeny != nil {
+		dynamicDeniesPath = s.dynamicDeny.Path()
+		if snap := s.dynamicDeny.Snapshot(); snap != nil {
+			dynamicDeniesCount = len(snap.Rules)
+		}
+		upstreamDenied = s.dynamicDeny.InstanceDenied()
+		upstreamDeniedRuleID, _ = s.dynamicDeny.DenyingRule()
+	}
+
 	payload := struct {
-		Status                    string                    `json:"status"`
-		Mode                      string                    `json:"mode"`
-		DefaultPolicy             string                    `json:"default_policy"`
-		Dialect                   string                    `json:"dialect"`
-		ActiveProfile             string                    `json:"active_profile"`
-		DecisionsCount            int64                     `json:"decisions_count"`
-		LookupErrorsCounter       int64                     `json:"lookup_errors_counter"`
-		TotalAgentHeadersRejected int64                     `json:"total_agent_headers_rejected"`
-		Pause                     *HealthzPause             `json:"pause"`
-		AuditExport               *HealthzAuditExport       `json:"audit_export,omitempty"`
-		AuditExportHealth         *HealthzAuditExportHealth `json:"audit_export_health,omitempty"`
+		Status                              string                    `json:"status"`
+		Mode                                string                    `json:"mode"`
+		DefaultPolicy                       string                    `json:"default_policy"`
+		Dialect                             string                    `json:"dialect"`
+		ActiveProfile                       string                    `json:"active_profile"`
+		DecisionsCount                      int64                     `json:"decisions_count"`
+		LookupErrorsCounter                 int64                     `json:"lookup_errors_counter"`
+		TotalAgentHeadersRejected           int64                     `json:"total_agent_headers_rejected"`
+		Pause                               *HealthzPause             `json:"pause"`
+		AuditExport                         *HealthzAuditExport       `json:"audit_export,omitempty"`
+		AuditExportHealth                   *HealthzAuditExportHealth `json:"audit_export_health,omitempty"`
+		DynamicDeniesEnabled                bool                      `json:"dynamic_denies_enabled"`
+		DynamicDeniesPath                   string                    `json:"dynamic_denies_path,omitempty"`
+		DynamicDeniesCount                  int                       `json:"dynamic_denies_count"`
+		UpstreamDenied                      bool                      `json:"upstream_denied"`
+		UpstreamDeniedRuleID                string                    `json:"upstream_denied_rule_id,omitempty"`
+		TotalDynamicDenyConnectionsRefused  int64                     `json:"total_dynamic_deny_connections_refused"`
+		TotalDynamicDenyReloads             int64                     `json:"total_dynamic_deny_reloads"`
+		TotalDynamicDenyParseErrors         int64                     `json:"total_dynamic_deny_parse_errors"`
 	}{
-		Status:                    "ok",
-		Mode:                      string(s.cfg.Mode),
-		DefaultPolicy:             string(s.cfg.DefaultPolicy),
-		Dialect:                   string(s.cfg.Dialect),
-		ActiveProfile:             s.ActiveProfileName(),
-		LookupErrorsCounter:       LookupErrorsCount(),
-		TotalAgentHeadersRejected: s.totalAgentHeadersRejected.Load(),
+		Status:                              "ok",
+		Mode:                                string(s.cfg.Mode),
+		DefaultPolicy:                       string(s.cfg.DefaultPolicy),
+		Dialect:                             string(s.cfg.Dialect),
+		ActiveProfile:                       s.ActiveProfileName(),
+		LookupErrorsCounter:                 LookupErrorsCount(),
+		TotalAgentHeadersRejected:           s.totalAgentHeadersRejected.Load(),
+		DynamicDeniesEnabled:                dynamicDeniesEnabled,
+		DynamicDeniesPath:                   dynamicDeniesPath,
+		DynamicDeniesCount:                  dynamicDeniesCount,
+		UpstreamDenied:                      upstreamDenied,
+		UpstreamDeniedRuleID:                upstreamDeniedRuleID,
+		TotalDynamicDenyConnectionsRefused:  denyRefused,
+		TotalDynamicDenyReloads:             denyReloads,
+		TotalDynamicDenyParseErrors:         denyParseErrs,
 	}
 	if s.store != nil {
 		if n, err := s.store.CountDecisions(); err == nil {

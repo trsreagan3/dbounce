@@ -236,13 +236,50 @@ Prints `dbounce <version> (commit X, built Y)`. Set at build time via
 
 ---
 
+## Dynamic denies (#324c)
+
+dbounce participates in the cross-product
+`~/.iam-jit/dynamic-denies.yaml` channel — operator-authored short-
+lived deny rules that fan out across the Bounce suite (ibounce /
+kbounce / dbounce / gbounce). When ANY rule in that file matches the
+dbounce instance's configured upstream (by hostname OR by
+`--upstream-rds-arn`), NEW connections are refused at PG StartupMessage
+with SQLSTATE 42501 + a structured message naming the rule id; existing
+connections continue normally per the honest behavioral contract.
+
+The full design — schema, CLI surface, MCP tools, conflict resolution,
+honest caveats — lives in the canonical doc at
+[`iam-roles/docs/DYNAMIC-DENY-RULES.md`](../iam-roles/docs/DYNAMIC-DENY-RULES.md).
+The cross-product CLI + MCP fan-out ship in #324e; this dbounce slice
+(#324c) implements the consumer side — loader, fsnotify watcher,
+connection-refuse gate, mgmt-port reload endpoint, OCSF audit event.
+
+Flags on `dbounce run`:
+- `--dynamic-denies-path PATH` (default `~/.iam-jit/dynamic-denies.yaml`;
+  honors `$IAM_JIT_DYNAMIC_DENIES_PATH`)
+- `--disable-dynamic-denies` (default false)
+- `--upstream-rds-arn ARN` (enables the RDS-ARN match axis)
+
+Mgmt-port endpoint:
+- `POST /admin/dynamic-denies/reload` — triggers an immediate reload +
+  returns `{"reloaded": true, "rules_count": N,
+  "rules_applied_to_dbounce": M, "instance_denied": bool,
+  "denying_rule_id": "dd_..."|null}`. Same bearer-token auth model
+  as `/audit/events`.
+
+---
+
 ## Liveness probe
 
 `GET /healthz` (default `127.0.0.1:8768`) returns 200 with a small
 JSON status payload (`status`, `mode`, `default_policy`, `dialect`,
-`active_profile`, `decisions_count`, `lookup_errors_counter`, `pause`).
-Never writes to the audit log; safe to poll from monit / k8s liveness
-probes / systemd watchdogs.
+`active_profile`, `decisions_count`, `lookup_errors_counter`, `pause`,
+plus the #324c `dynamic_denies_enabled` / `dynamic_denies_count` /
+`upstream_denied` / `upstream_denied_rule_id` /
+`total_dynamic_deny_connections_refused` /
+`total_dynamic_deny_reloads` / `total_dynamic_deny_parse_errors`
+fields). Never writes to the audit log; safe to poll from monit / k8s
+liveness probes / systemd watchdogs.
 
 The `lookup_errors_counter` field mirrors `kbounce`'s and `ibounce`'s
 healthz shape and surfaces SQLite-class lookup failures so monitors

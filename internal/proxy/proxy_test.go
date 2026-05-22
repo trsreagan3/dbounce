@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
+	"github.com/trsreagan3/dbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/dbounce/internal/store"
 )
 
@@ -326,4 +329,306 @@ func TestParseDialect_RejectsUnknown(t *testing.T) {
 	assert.Contains(t, err.Error(), "mysql")
 	assert.Contains(t, err.Error(), "snowflake")
 	assert.Contains(t, err.Error(), "bigquery")
+}
+
+// ---------------------------------------------------------------------------
+// #324c — dynamic-deny connection-refuse tests.
+// ---------------------------------------------------------------------------
+
+// startTestServerWithDynamicDeny spins up a Server wired with a
+// dynamicdeny.Watcher rooted at the given YAML file path. The watcher's
+// instance upstream is set to upstreamHost so a rule whose target
+// matches upstreamHost flips the instance into the denied state.
+//
+// Returns the running server + the wire-protocol addr + the mgmt
+// /healthz URL + the test store + the wired watcher. Cleanup is
+// registered with t.
+func startTestServerWithDynamicDeny(
+	t *testing.T, upstreamHost, ddPath string, refuseImmediately bool,
+) (*Server, string, string, *store.Store, *dynamicdeny.Watcher) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Construct the watcher BEFORE the Server so the instance-denied
+	// flag is correctly set on the initial snapshot.
+	w, _ := dynamicdeny.NewWatcher(ddPath, nil)
+	require.NotNil(t, w)
+	w.SetDebouncePeriod(20 * time.Millisecond)
+	w.SetInstanceUpstream(upstreamHost, "")
+
+	cfg := Config{
+		Host:               "127.0.0.1",
+		Port:               0,
+		MgmtHost:           "127.0.0.1",
+		MgmtPort:           0,
+		Mode:               ModeCooperative,
+		Dialect:            DialectPostgres,
+		DefaultPolicy:      DefaultPolicyAllow,
+		IdleTimeout:        5 * time.Second,
+		DynamicDenyWatcher: w,
+	}.Normalize()
+
+	wireL, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	mgmtL, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	cfg.Port = wireL.Addr().(*net.TCPAddr).Port
+	cfg.MgmtPort = mgmtL.Addr().(*net.TCPAddr).Port
+	cfg.WireListener = wireL
+	cfg.MgmtListener = mgmtL
+
+	srv := NewServer(cfg, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, w.Start(ctx))
+	t.Cleanup(w.Stop)
+
+	go func() { _ = srv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	// Brief poll until both listeners accept.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, derr := net.DialTimeout("tcp",
+			fmt.Sprintf("127.0.0.1:%d", cfg.Port), 100*time.Millisecond)
+		if derr == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, derr := http.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", cfg.MgmtPort))
+		if derr == nil {
+			_ = resp.Body.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Optionally race the test against the initial snapshot — when
+	// refuseImmediately is false, the caller wants to add a rule after
+	// startup + observe the transition.
+	_ = refuseImmediately
+
+	return srv,
+		fmt.Sprintf("127.0.0.1:%d", cfg.Port),
+		fmt.Sprintf("http://127.0.0.1:%d", cfg.MgmtPort),
+		st,
+		w
+}
+
+// dynamicDenyTestYAML builds a single-rule YAML targeting the given
+// hostname. The rule is operator-explicit applied_to: [dbounce] so
+// the loader keeps it regardless of hostname-heuristic shape.
+func dynamicDenyTestYAML(ruleID, target, reason string) string {
+	added := time.Now().UTC().Format(time.RFC3339)
+	return fmt.Sprintf(`schema_version: "1.0"
+denies:
+  - id: %s
+    targets: ["%s"]
+    reason: %q
+    duration: "1h"
+    added_by: "u@h"
+    added_at: "%s"
+    applied_to: [dbounce]
+`, ruleID, target, reason, added)
+}
+
+// readErrorResponse reads a single PG message expected to be
+// ErrorResponse ('E') and returns the parsed M (message) field.
+func readErrorResponse(t *testing.T, conn net.Conn) (sqlState, msg string) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	require.Equal(t, byte('E'), hdr[0], "expected ErrorResponse")
+	length := binary.BigEndian.Uint32(hdr[1:5])
+	require.GreaterOrEqual(t, length, uint32(4))
+	body := make([]byte, length-4)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	// Parse tagged C-strings.
+	i := 0
+	for i < len(body) {
+		tag := body[i]
+		if tag == 0 {
+			break
+		}
+		i++
+		// read C-string
+		start := i
+		for i < len(body) && body[i] != 0 {
+			i++
+		}
+		val := string(body[start:i])
+		switch tag {
+		case 'C':
+			sqlState = val
+		case 'M':
+			msg = val
+		}
+		i++ // skip terminator
+	}
+	return sqlState, msg
+}
+
+const ddTestRuleID = "dd_01HZ8VKJ6Y2BJTPVZ3PNX97A2C"
+const ddTestRuleID2 = "dd_01HZ8VKJ6Y2BJTPVZ3PNX97A2D"
+
+func TestProxy_NewConnectionRefusedWhenInstanceDenied(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	const upstream = "payments-db.example.com"
+	require.NoError(t, os.WriteFile(ddPath,
+		[]byte(dynamicDenyTestYAML(ddTestRuleID, upstream, "incident #4711")),
+		0o600))
+
+	_, addr, _, _, w := startTestServerWithDynamicDeny(t, upstream, ddPath, true)
+	// Sanity: the watcher's instance-denied flag should be set since
+	// the initial YAML has a matching rule.
+	assert.True(t, w.InstanceDenied(),
+		"watcher's instance-denied flag must be true with a matching rule at startup")
+
+	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+	sendStartupMessage(t, conn)
+
+	sqlState, msg := readErrorResponse(t, conn)
+	assert.Equal(t, "42501", sqlState,
+		"PG SQLSTATE on dynamic-deny refusal must be 42501 (insufficient_privilege)")
+	assert.Contains(t, msg, ddTestRuleID,
+		"refusal message must name the rule_id so the client analyst can join against the audit log")
+	assert.Contains(t, msg, "incident #4711",
+		"refusal message must carry the operator-supplied reason verbatim")
+}
+
+func TestProxy_ExistingConnectionNotKilledOnReloadDeny(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	// Start with EMPTY denies file so the initial connection lands.
+	emptyYAML := `schema_version: "1.0"` + "\ndenies: []\n"
+	require.NoError(t, os.WriteFile(ddPath, []byte(emptyYAML), 0o600))
+
+	const upstream = "payments-db.example.com"
+	_, addr, _, _, w := startTestServerWithDynamicDeny(t, upstream, ddPath, false)
+
+	// Open a connection BEFORE the deny lands.
+	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+	sendStartupMessage(t, conn)
+	readUntilReadyForQuery(t, conn, 10)
+
+	// NOW install the matching deny rule.
+	require.NoError(t, os.WriteFile(ddPath,
+		[]byte(dynamicDenyTestYAML(ddTestRuleID2, upstream, "block payments")),
+		0o600))
+
+	// Wait for the watcher to pick up the change.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.InstanceDenied() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.True(t, w.InstanceDenied(),
+		"watcher should have flipped to denied after rule install")
+
+	// The PREVIOUSLY-ESTABLISHED connection must still respond to a
+	// query — the [[ibounce-honest-positioning]] contract is
+	// "in-flight connections finish; new connections refused."
+	sendQuery(t, conn, "SELECT 1")
+	count := readUntilReadyForQuery(t, conn, 10)
+	assert.Greater(t, count, 0,
+		"existing connection must continue serving queries after a reload-deny")
+
+	// A NEW connection should be refused.
+	conn2, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	require.NoError(t, err)
+	defer conn2.Close()
+	sendStartupMessage(t, conn2)
+	sqlState, msg := readErrorResponse(t, conn2)
+	assert.Equal(t, "42501", sqlState)
+	assert.Contains(t, msg, ddTestRuleID2)
+}
+
+func TestProxy_AuditEventCarriesRuleIdOnRefusedConn(t *testing.T) {
+	// This test asserts the OCSF event for a refused connection
+	// carries the load-bearing pivot keys (deny_source=dynamic,
+	// dynamic_deny_rule_id, deny_reason). We invoke
+	// NewDynamicDenyConnectionRefusedEvent directly because the
+	// audit-exporter wiring requires a full LogWriter setup the proxy
+	// hot-path-test scaffold doesn't replicate; the constructor is
+	// pure projection so the round-trip is faithful.
+	evt := audit.NewDynamicDenyConnectionRefusedEvent("127.0.0.1:5433",
+		audit.DynamicDenyConnectionRefusedInfo{
+			RuleID:     ddTestRuleID,
+			Reason:     "incident #4711",
+			RemoteAddr: "192.0.2.1:54321",
+		})
+	assert.Equal(t, audit.StatusIDDenied, evt.StatusID,
+		"refused-connection event must use status_id=4 (Denied)")
+	require.NotNil(t, evt.Unmapped)
+	ext := evt.Unmapped.IAMJIT.Ext
+	assert.Equal(t, "dynamic", ext["deny_source"])
+	assert.Equal(t, ddTestRuleID, ext["dynamic_deny_rule_id"])
+	assert.Contains(t, ext["deny_reason"], ddTestRuleID)
+	assert.Equal(t, "incident #4711", ext["dynamic_deny_reason_detail"])
+	// Per the cross-product wire shape, the OCSF activity should be
+	// Connect (6) — the closest verb for "connection-level decision."
+	assert.Equal(t, 6, evt.ActivityID)
+	assert.Equal(t, "connection_refused", evt.ActivityName)
+}
+
+func TestReloadEndpoint_ReturnsInstanceDeniedState(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	const upstream = "payments-db.example.com"
+	require.NoError(t, os.WriteFile(ddPath,
+		[]byte(dynamicDenyTestYAML(ddTestRuleID, upstream, "lockout")),
+		0o600))
+
+	_, _, mgmtBase, _, _ := startTestServerWithDynamicDeny(t, upstream, ddPath, true)
+
+	resp, err := http.Post(mgmtBase+"/admin/dynamic-denies/reload",
+		"application/json", nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, true, body["reloaded"])
+	assert.Equal(t, float64(1), body["rules_count"])
+	assert.Equal(t, float64(1), body["rules_applied_to_dbounce"])
+	assert.Equal(t, true, body["instance_denied"])
+	assert.Equal(t, ddTestRuleID, body["denying_rule_id"])
+	assert.Equal(t, ddPath, body["path"])
+}
+
+func TestReloadEndpoint_RejectsNonPost(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	require.NoError(t, os.WriteFile(ddPath, []byte(`schema_version: "1.0"
+denies: []
+`), 0o600))
+	_, _, mgmtBase, _, _ := startTestServerWithDynamicDeny(t,
+		"payments-db.example.com", ddPath, false)
+	resp, err := http.Get(mgmtBase + "/admin/dynamic-denies/reload")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
 }

@@ -7,6 +7,127 @@ semver from v1.0.0 onward.
 
 ### Changed
 
+#### #296 / §A22 — SQLite store concurrency hardening (latency-tail fix)
+
+dbounce's `internal/store/store.go` `Open()` ADDS `journal_mode=WAL`
+to the existing PRAGMA triple (busy_timeout=5000, foreign_keys=1,
+synchronous=FULL — unchanged). Pre-#296 dbounce already had
+`busy_timeout` so the 20-session load probe did NOT lose any audit
+rows (kbouncer + gbounce both lost ~98% of writes pre-fix), but all
+writers serialized at the file-level write lock in rollback-journal
+mode: p99 = 86ms and **max latency = 1.4 seconds**. After adding WAL:
+p99 = 11.77ms, max = 132ms — a ~10x improvement at the audit-write
+hot path.
+
+Crucially, **the LOW-D8-12 audit closure's durability posture is
+PRESERVED**. Under WAL, `synchronous=FULL` still fsyncs the WAL file
+on every commit + fsyncs the main DB at checkpoint — every committed
+audit row hits stable storage before the wire-protocol path moves on,
+matching the pre-#296 guarantee. The only difference is parallel
+writers no longer block at the journal header. No schema change; no
+public API change; data on existing DBs is preserved verbatim.
+Verified by `internal/store/concurrency_load_test.go` (build-tagged
+`loadtest` so normal `go test ./...` skips it). Lifts the cross-
+product §B13 "1-3 concurrent terminals in v1.0" caveat — the new
+measured ceiling at the audit-write layer is **30+ concurrent agent
+sessions on one machine** with zero dropped audit events.
+
+### Added
+
+#### #324c — dynamic-deny core (loader + watcher + connection-refuse + mgmt endpoint)
+
+Implements dbounce's slice of the cross-product `~/.iam-jit/dynamic-denies.yaml`
+channel (canonical design at `iam-roles/docs/DYNAMIC-DENY-RULES.md`).
+Mirrors the gbounce reference impl (`5a65566`) for the shared events +
+adds dbounce-specific instance-level transition signals because
+dbounce's gate is connection-level (one proxy = one upstream) rather
+than per-request.
+
+- **New package `internal/dynamicdeny`** — loader + watcher.
+  - `LoadFile` reads + validates `~/.iam-jit/dynamic-denies.yaml`
+    against the v1.0 schema shape, then filters to the dbounce lane:
+    operator-explicit `applied_to: [dbounce]` ALWAYS wins; otherwise
+    the heuristic applies the rule to dbounce when ANY target matches
+    `*-db*`, `*postgres*`, `*mysql*`, `*-rds*` glob shapes OR is an
+    `arn:aws:rds:*` ARN. Already-expired rules are dropped at load.
+  - `Watcher` (fsnotify-driven) hot-reloads the file. 100ms debounce
+    coalesces rapid sequential writes. Parse-error retains the
+    previous in-memory snapshot (fail-CLOSED per
+    `[[ibounce-honest-positioning]]`).
+  - dbounce-specific: the watcher additionally tracks the instance-
+    denied flag (does ANY active rule's target match the configured
+    upstream hostname or RDS ARN?) + emits `instance_now_denied` /
+    `instance_now_allowed` transition events distinct from the
+    standard `file_*` reload reasons. Cross-product parity: the
+    standard `dynamic_deny.reloaded` + `dynamic_deny.parse_error`
+    admin-action wire shapes match gbounce byte-for-byte.
+- **Connection-level gate in `internal/proxy/proxy.go`** — when the
+  watcher's instance-denied flag is set, NEW PG connections are
+  refused at StartupMessage with a PG ErrorResponse:
+  `SFATAL / VFATAL / C42501 / Mdbounce: refused by dynamic-deny rule
+  dd_... (operator-reason)`. Existing connections continue normally
+  per the honest behavioral contract — "in-flight queries finish; new
+  connections refused." MySQL connections are closed cleanly without
+  a protocol error packet (a PG ErrorResponse to a MySQL client would
+  be garbled bytes; the OCSF audit event is the load-bearing signal
+  for the MySQL path until #324c-MySQL post-launch).
+- **OCSF v1.1.0 class 6003 audit event for refused connections** via
+  `audit.NewDynamicDenyConnectionRefusedEvent`:
+  `activity_id=6` (Connect), `activity_name="connection_refused"`,
+  `status_id=4` (Denied; new `StatusIDDenied` constant — mirrors
+  gbounce's `StatusDenied` per `[[cross-product-agent-parity]]`),
+  `severity_id=1` (Informational), `unmapped.iam_jit.ext.deny_source=
+  "dynamic"`, `unmapped.iam_jit.ext.dynamic_deny_rule_id="dd_..."`,
+  `unmapped.iam_jit.ext.deny_reason="connection refused by dynamic-
+  deny rule dd_..."`, `unmapped.iam_jit.ext.dynamic_deny_reason_detail
+  ="<operator reason>"`. A single SIEM filter
+  `status_id=4 AND ext.deny_source="dynamic"` isolates dynamic-deny
+  refusals across the Bounce suite.
+- **POST `/admin/dynamic-denies/reload`** on the mgmt port (default
+  8768) triggers an immediate reload + returns the
+  cross-product-shared shape plus the dbounce-specific fields:
+  `{"reloaded": true, "rules_count": N, "rules_applied_to_dbounce":
+  M, "instance_denied": bool, "denying_rule_id": "dd_..."|null,
+  "path": "..."}`. Same bearer-token auth model as `/audit/events`.
+- **New `internal/audit/admin_action.go`** pins the dynamic-deny
+  admin-action kind constants: `AdminActionKindDynamicDenyReloaded`,
+  `AdminActionKindDynamicDenyParseError` (cross-product shapes);
+  `AdminActionKindDynamicDenyInstanceNowDenied`,
+  `AdminActionKindDynamicDenyInstanceNowAllowed` (dbounce-specific
+  instance-level transitions).
+- **New CLI flags on `dbounce run`**:
+  - `--dynamic-denies-path PATH` (default `~/.iam-jit/dynamic-
+    denies.yaml`, honors `$IAM_JIT_DYNAMIC_DENIES_PATH`)
+  - `--disable-dynamic-denies` (boolean, default false)
+  - `--upstream-rds-arn ARN` (optional; enables RDS-ARN axis matching
+    in addition to hostname matching)
+- **Banner** now emits two lines after the standard startup banner:
+  `dynamic-denies: N rules loaded from <path> (M applied to dbounce
+  upstream; watching for changes)` and `upstream-denied: false` /
+  `upstream-denied: true (rule_id=dd_...; <reason>)`.
+- **`/healthz`** gains five fields: `dynamic_denies_enabled`,
+  `dynamic_denies_path`, `dynamic_denies_count`, `upstream_denied`,
+  `upstream_denied_rule_id`, plus three counters
+  (`total_dynamic_deny_connections_refused`,
+  `total_dynamic_deny_reloads`, `total_dynamic_deny_parse_errors`).
+  Shape mirrors gbounce per `[[cross-product-agent-parity]]`.
+- **`go.mod`** — added `github.com/fsnotify/fsnotify v1.7.0`.
+- **Tests** — 33 cases in `internal/dynamicdeny/{loader,watcher}_test.go`
+  (loader: happy-path, 6 schema-violation rejections, lane-filtering
+  for ARN / k8s / hostname-heuristic / explicit-applied_to-override /
+  RDS-ARN / expired-drop / instance-matcher; watcher: file creation /
+  modification / debounce / parse-error retention / instance-now-denied
+  / instance-now-allowed / ReloadNow / no-path-no-op) + 5 cases in
+  `internal/proxy/proxy_test.go` covering connection-refused
+  PG-protocol shape, mid-flight connection preservation, OCSF event
+  pivot keys, and the mgmt-port reload endpoint.
+
+What this slice does NOT do (deferred to follow-on tracking items):
+no cross-bouncer fan-out (#324e), no `iam-jit deny add` CLI (#324e),
+no MCP tools (#324e), no recommender Deny-injection (#324f).
+
+### Changed
+
 ### BREAKING — §A21 / [[discovery-first-default]] — default flips to DISCOVERY MODE — Shipped 2026-05-22
 
 Per the role-effectiveness eval at

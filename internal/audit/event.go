@@ -280,7 +280,16 @@ const (
 	StatusIDUnknown = 0
 	StatusIDSuccess = 1
 	StatusIDFailure = 2
-	StatusIDOther   = 99
+	// StatusIDDenied is the dbounce-specific extension for explicit
+	// policy-deny outcomes. OCSF v1.1.0's status_id enum has
+	// Unknown=0/Success=1/Failure=2/Other=99; "Denied" is a verdict-
+	// shaped outcome that's distinct from a generic failure. Used by
+	// #324c (dynamic-deny connection refusal) + mirrors gbounce's
+	// StatusDenied = 4 per [[cross-product-agent-parity]] so a single
+	// SIEM filter `status_id=4` isolates policy denials across the
+	// Bounce suite.
+	StatusIDDenied = 4
+	StatusIDOther  = 99
 )
 
 // BuildVersion is the dbounce binary version stamped into
@@ -1765,6 +1774,94 @@ func NewAdminActionEvent(host string, info AdminActionInfo) Event {
 			IAMJIT: IAMJITExt{
 				EventType: string(EventTypeAdminAction),
 				Enforced:  false,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
+// DynamicDenyConnectionRefusedInfo carries the per-event payload for
+// the #324c dbounce-specific synthetic event emitted when a new
+// connection is refused by an active dynamic-deny rule. RuleID is the
+// `dd_<ULID>` identifier; Reason is the operator-supplied free-text
+// reason (surfaces verbatim in the PG ErrorResponse body so the
+// downstream SQL client sees the same string). RemoteAddr is the
+// inbound TCP peer for the SrcEndpoint projection — the listener
+// address goes into Host on the caller side.
+type DynamicDenyConnectionRefusedInfo struct {
+	RuleID     string
+	Reason     string
+	RemoteAddr string
+}
+
+// NewDynamicDenyConnectionRefusedEvent constructs the OCSF v1.1.0
+// class 6003 envelope for a connection refused by an active dynamic-
+// deny rule. Schema: activity_id=6 (Connect — closest verb for a
+// connection-level decision), severity Informational (the refusal is
+// the operator's intended outcome; alerts are for the SIEM to derive
+// over time), status_id=4 (Denied — the dbounce-specific extension
+// for policy denials; mirrors gbounce's StatusDenied per
+// [[cross-product-agent-parity]]).
+//
+// The unmapped.iam_jit.ext block carries the load-bearing pivot keys:
+//
+//   - deny_source = "dynamic" — distinguishes this from any future
+//     static-deny path so a SIEM filter `ext.deny_source="dynamic"`
+//     isolates rule-driven denials.
+//   - dynamic_deny_rule_id = "dd_..." — the JOIN key against the
+//     admin-action audit row that installed the rule.
+//   - deny_reason = "connection refused by dynamic-deny rule <id>"
+//     — the analyst-facing single-line summary.
+//   - dynamic_deny_reason_detail = "<operator-supplied reason>" —
+//     the verbatim operator reason for triage context.
+//
+// Per [[creates-never-mutates]]: emitting this synthetic NEVER mutates
+// state; it's a pure audit projection.
+func NewDynamicDenyConnectionRefusedEvent(host string, info DynamicDenyConnectionRefusedInfo) Event {
+	ext := map[string]any{
+		"deny_source":                "dynamic",
+		"dynamic_deny_rule_id":       info.RuleID,
+		"deny_reason":                fmt.Sprintf("connection refused by dynamic-deny rule %s", info.RuleID),
+		"dynamic_deny_reason_detail": info.Reason,
+	}
+	detail := fmt.Sprintf("dbounce: refused new connection (rule_id=%s reason=%q)",
+		info.RuleID, info.Reason)
+	// activity_id=6 (Connect) is the OCSF verb that most closely matches
+	// "a TCP client tried to open a session." Some products use Other
+	// (99) here; Connect is the more specific match for class 6003.
+	const activityConnect = 6
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   activityConnect,
+		ActivityName: "connection_refused",
+		TypeUID:      ocsfTypeUIDBase + activityConnect,
+		TypeName:     typeNameFor(activityConnect),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDDenied,
+		Status:       "Denied",
+		StatusDetail: detail,
+		API: API{
+			Operation: "connection_refused",
+		},
+		SrcEndpoint: parseEndpoint(info.RemoteAddr),
+		DstEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeSecurityAlert),
+				Enforced:  true,
 				Ext:       ext,
 			},
 		},
