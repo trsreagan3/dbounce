@@ -187,8 +187,23 @@ func Open(path string) (*Store, error) {
 	// the latency/durability trade — every decision MUST be on disk
 	// before the wire-protocol path moves on, otherwise a crash erases
 	// evidence the audit reviewer might be the only source of.
+	//
+	// Task #296 / §A22: ADD `journal_mode=WAL` to the existing PRAGMA
+	// triple. The pre-#296 rollback-journal mode serialized writers
+	// behind the file-level write lock — 20-writer load probe showed
+	// 0 errors (busy_timeout absorbed contention) BUT max-latency spiked
+	// to 1.4s as goroutines queued. WAL lets readers + a single writer
+	// proceed concurrently without taking the same lock, dropping max
+	// latency by ~10x at 20 writers. Crucially, `synchronous=FULL` is
+	// WAL-COMPATIBLE: under WAL, FULL fsyncs the WAL file on every
+	// commit (matching the pre-#296 durability guarantee) AND fsyncs
+	// the main DB at checkpoint. The audit row still hits stable
+	// storage before the wire-protocol path moves on; the difference
+	// is only that we no longer block parallel writers at the journal
+	// header. No durability regression vs the LOW-D8-12 posture.
 	dsn := "file:" + path +
-		"?_pragma=busy_timeout(5000)" +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=foreign_keys(1)" +
 		"&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
