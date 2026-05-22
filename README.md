@@ -191,6 +191,12 @@ CSV and ocsf-bundle exports ALWAYS redact SQL string literals
 (MED-D8-09 redactor applied defensively on read) so a bulk SIEM
 shipment cannot leak PII embedded in raw statements.
 
+For the full "where do my audit logs go in production" decision tree
+(JSONL / webhook + presets / Security Lake / Lambda → S3 / GCP / Azure
+/ CI runners / Enterprise fan-out) see the cross-product runbook in
+the iam-roles repo:
+[docs/PRODUCTION-LOG-STORAGE.md](https://github.com/trsreagan3/iam-roles/blob/main/docs/PRODUCTION-LOG-STORAGE.md).
+
 ### `dbounce --version`
 
 Prints `dbounce <version> (commit X, built Y)`. Set at build time via
