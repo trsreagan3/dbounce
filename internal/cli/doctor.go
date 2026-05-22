@@ -38,6 +38,8 @@ lives at ` + caveats.CanonicalDocURL() + `.`,
 		return fmt.Errorf("dbounce doctor: subcommand required (try `dbounce doctor caveats`)")
 	}
 	cmd.AddCommand(newDoctorCaveatsCmd())
+	// #311 / §A10 — audit-log integrity / freshness / disk check.
+	cmd.AddCommand(newDoctorLogsCmd())
 	return cmd
 }
 

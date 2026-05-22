@@ -110,6 +110,21 @@ type LogWriter struct {
 	// at startup but is now writing fine reads as ok again, exactly
 	// like the webhook recovery semantics.
 	lastWriteAtUnixNano atomic.Int64
+
+	// #311 / §A10 rotation knobs + telemetry. maxSizeMB / maxAgeDays
+	// gate the rotation trigger; rotations / rotationFailures /
+	// partialBytesRecovered are surfaced by Stats() so operators
+	// can confirm rotation cadence without grepping admin-actions.
+	maxSizeMB              int64
+	maxAgeDays             int
+	rotations              atomic.Int64
+	rotationFailures       atomic.Int64
+	lastRotationUnixNano   atomic.Int64
+	lastRotationPath       atomic.Value // string
+	partialBytesRecovered  atomic.Int64
+	onRotation             func(archive string)
+	onRotationFailure      func(reason string)
+	onRecovery             func(bytes int64)
 }
 
 // LogOptions wires the LogWriter from CLI flags.
@@ -122,6 +137,16 @@ type LogOptions struct {
 	// QueueSize bounds the in-flight chan. Defaults to 1000 when
 	// zero. Tests pass small values to exercise the drop path.
 	QueueSize int
+	// #311 / §A10 rotation thresholds. Zero disables the respective
+	// trigger; the writer never destroys data on its own.
+	MaxSizeMB  int64
+	MaxAgeDays int
+	// Optional lifecycle callbacks for the admin-action audit
+	// channel. Fire off the worker goroutine; callers MUST NOT
+	// block on the audit pipeline (would deadlock the worker).
+	OnRotation        func(archive string)
+	OnRotationFailure func(reason string)
+	OnRecovery        func(bytes int64)
 }
 
 // chanCapacityDefault is the in-flight bound when QueueSize is unset.
@@ -150,6 +175,8 @@ func NewLogWriter(opts LogOptions) (*LogWriter, error) {
 			return nil, fmt.Errorf("audit: create log parent dir %q: %w", dir, err)
 		}
 	}
+	// #311 / §A10 — crash recovery before opening for append.
+	recovered, _ := RecoverPartialTail(opts.Path)
 	f, err := os.OpenFile(opts.Path,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY,
 		0o600)
@@ -157,14 +184,64 @@ func NewLogWriter(opts LogOptions) (*LogWriter, error) {
 		return nil, fmt.Errorf("audit: open log %q: %w", opts.Path, err)
 	}
 	w := &LogWriter{
-		path:   opts.Path,
-		fsync:  opts.Fsync,
-		f:      f,
-		ch:     make(chan Event, opts.QueueSize),
-		doneCh: make(chan struct{}),
+		path:              opts.Path,
+		fsync:             opts.Fsync,
+		f:                 f,
+		ch:                make(chan Event, opts.QueueSize),
+		doneCh:            make(chan struct{}),
+		maxSizeMB:         opts.MaxSizeMB,
+		maxAgeDays:        opts.MaxAgeDays,
+		onRotation:        opts.OnRotation,
+		onRotationFailure: opts.OnRotationFailure,
+		onRecovery:        opts.OnRecovery,
+	}
+	w.lastRotationPath.Store("")
+	if recovered > 0 {
+		w.partialBytesRecovered.Add(recovered)
+		if opts.OnRecovery != nil {
+			go opts.OnRecovery(recovered)
+		}
 	}
 	go w.runWorker()
 	return w, nil
+}
+
+// maybeRotate runs the size + age check; on a trigger it swaps the
+// file handle. Called from runWorker on the writer goroutine so the
+// mutation of w.f is single-threaded. A rotation failure does not
+// abort the worker — the active log keeps growing until the
+// operator intervenes (signal: rotation_failed admin-action).
+func (w *LogWriter) maybeRotate() {
+	if !ShouldRotateBySize(w.path, w.maxSizeMB) &&
+		!ShouldRotateByAge(w.path, w.maxAgeDays, time.Now()) {
+		return
+	}
+	if osF, ok := w.f.(*os.File); ok {
+		_ = osF.Sync()
+		_ = osF.Close()
+	}
+	archive, rotErr := Rotate(w.path, time.Now())
+	if rotErr != nil {
+		w.rotationFailures.Add(1)
+		w.recordErr(fmt.Errorf("rotate: %w", rotErr))
+		if w.onRotationFailure != nil {
+			go w.onRotationFailure(rotErr.Error())
+		}
+	}
+	newF, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		w.recordErr(fmt.Errorf("reopen after rotate: %w", err))
+		return
+	}
+	w.f = newF
+	if archive != "" {
+		w.rotations.Add(1)
+		w.lastRotationUnixNano.Store(time.Now().UnixNano())
+		w.lastRotationPath.Store(archive)
+		if w.onRotation != nil {
+			go w.onRotation(archive)
+		}
+	}
 }
 
 // Write enqueues evt for the worker to serialize + write. Non-blocking:
@@ -253,6 +330,15 @@ func (w *LogWriter) runWorker() {
 			sinceStat = 0
 			if newEnc := w.checkFilePresence(enc); newEnc != nil {
 				enc = newEnc
+			}
+		}
+		// #311 / §A10 — rotation guard. Cheap when no trigger fires
+		// (a single Stat); on rotation we swap w.f and rebuild enc.
+		if w.maxSizeMB > 0 || w.maxAgeDays > 0 {
+			prevPath := w.lastRotationPath.Load()
+			w.maybeRotate()
+			if w.lastRotationPath.Load() != prevPath {
+				enc = json.NewEncoder(w.f)
 			}
 		}
 	}
@@ -392,6 +478,14 @@ type LogStats struct {
 	WritesOK    bool
 	LastErrorAt int64
 	LastWriteAt int64
+	// #311 / §A10 rotation telemetry.
+	MaxSizeMB             int64
+	MaxAgeDays            int
+	Rotations             int64
+	RotationFailures      int64
+	LastRotationAt        int64
+	LastRotationPath      string
+	PartialBytesRecovered int64
 }
 
 // Stats returns the current counters. Safe to call concurrently with
@@ -403,18 +497,26 @@ func (w *LogWriter) Stats() LogStats {
 	w.lastErrMu.Lock()
 	last := w.lastErr
 	w.lastErrMu.Unlock()
+	lastRotPath, _ := w.lastRotationPath.Load().(string)
 	return LogStats{
-		Path:        w.path,
-		Written:     w.written.Load(),
-		Dropped:     w.dropped.Load(),
-		LastError:   last,
-		Fsync:       w.fsync,
-		QueueDepth:  len(w.ch),
-		QueueLimit:  cap(w.ch),
-		Configured:  true,
-		WritesOK:    w.WritesOK(),
-		LastErrorAt: w.lastErrAtUnixNano.Load(),
-		LastWriteAt: w.lastWriteAtUnixNano.Load(),
+		Path:                  w.path,
+		Written:               w.written.Load(),
+		Dropped:               w.dropped.Load(),
+		LastError:             last,
+		Fsync:                 w.fsync,
+		QueueDepth:            len(w.ch),
+		QueueLimit:            cap(w.ch),
+		Configured:            true,
+		WritesOK:              w.WritesOK(),
+		LastErrorAt:           w.lastErrAtUnixNano.Load(),
+		LastWriteAt:           w.lastWriteAtUnixNano.Load(),
+		MaxSizeMB:             w.maxSizeMB,
+		MaxAgeDays:            w.maxAgeDays,
+		Rotations:             w.rotations.Load(),
+		RotationFailures:      w.rotationFailures.Load(),
+		LastRotationAt:        w.lastRotationUnixNano.Load(),
+		LastRotationPath:      lastRotPath,
+		PartialBytesRecovered: w.partialBytesRecovered.Load(),
 	}
 }
 

@@ -5,6 +5,55 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #311 / §A10 — robust audit-log retention (2026-05-22)
+
+Cross-product launch-blocker resolved. `dbounce` now rotates `audit.jsonl`
+automatically at 100 MB or 7 days (whichever first), gzipping to
+`audit-{YYYY-MM-DD-HHMMSS}.jsonl.gz` in the same dir. New surface:
+
+- `dbounce logs purge --older-than 7d --yes` — retention sweep of rotated
+  archives (never touches the active `audit.jsonl`)
+- `dbounce logs archive --out FILE` — tar.gz bundle for SIEM hand-off
+- `dbounce logs verify` — gzip + JSONL integrity check
+- `dbounce doctor logs` — integrity + freshness + retention + disk checks
+  (exits non-zero on any failure)
+- Crash recovery: partial JSONL tail truncated on startup
+- Rotation lifecycle admin-actions: `audit.log.rotated`,
+  `audit.log.rotation_failed`, `audit.log.recovered_partial`
+- LogOptions: `MaxSizeMB`, `MaxAgeDays`, `OnRotation`,
+  `OnRotationFailure`, `OnRecovery`
+- LogStats extended with rotation telemetry: `Rotations`,
+  `RotationFailures`, `LastRotationAt`, `LastRotationPath`,
+  `PartialBytesRecovered`
+- Cross-product runbook: `iam-roles/docs/LOG-RETENTION.md`
+- 12 new tests in `internal/audit/rotation_test.go`
+
+### #304 — KNOWN-CAVEATS discoverability surfaces (2026-05-22)
+
+Per founder direction 2026-05-22: caveats must be easily discoverable
+to users + agents, not buried in `docs/KNOWN-CAVEATS.md`. This slice
+ships four surfaces:
+
+- `internal/caveats/` — new package centralizes the dbounce-relevant
+  §B entries (B6 + B7 product-specific; B13 + B14 + B15 cross-product)
+  + the GitHub markdown anchors. `caveats.BannerLines(Trigger)`
+  returns the startup-banner lines to emit;
+  `caveats.DoctorEntries()` returns the full applicable list;
+  `caveats.LinkSuffix(id)` produces an inline `(see KNOWN-CAVEATS §X:
+  <URL>)` suffix for error responses.
+- **README "Known limitations" section** — top 3 dbounce-relevant §B
+  entries (B6 / B7 / B14) linked to the canonical doc.
+- **Startup banner** — `dbounce run` emits the §B6 + §B7 lines after
+  the standard banner. §B7 is suppressed when `--redact-numerics` is
+  set (post-v1.0; field reserved in bannerOpts).
+- **`dbounce doctor caveats`** — new subcommand under a new `doctor`
+  command group. Same shape across the Bounce suite per
+  `[[cross-product-agent-parity]]`.
+- **MCP tool descriptions** — `dbounce_active_mode` description now
+  embeds §B6 + §B7 references + links. `dbounce_decide` description
+  embeds the §B7 numeric-literal note (any tool that dry-runs SQL
+  should carry the redaction caveat per the task #304 spec).
+
 ### GRANT/REVOKE/DCL classifier (#302, 2026-05-22; HIGH)
 
 - **Bug:** `GRANT ALL PRIVILEGES ON DATABASE x TO PUBLIC` and the

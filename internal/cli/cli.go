@@ -189,6 +189,10 @@ func newRootCmd() *cobra.Command {
 	// muscle-memory shortcut works across all three products.
 	root.AddCommand(newDiagnosticsCmd())
 	root.AddCommand(newDiagnosticsDiagAliasCmd())
+	// #304 — `dbounce doctor caveats` surfaces the §B entries from
+	// KNOWN-CAVEATS.md that apply to dbounce. Sibling Bounce products
+	// ship the same shape per [[cross-product-agent-parity]].
+	root.AddCommand(newDoctorCmd())
 	// #273 investigate-with-Claude workflow. Composes #268
 	// audit-tail OCSF export + #277 diagnostics bundle into a single
 	// subcommand that lands a Claude-ready evidence pack on disk.
@@ -208,6 +212,11 @@ func newRootCmd() *cobra.Command {
 	// orchestrators (and the cross-product `iam-jit session replay
 	// <FILE>` CLI) consume any product's recordings uniformly.
 	root.AddCommand(newSessionCmd())
+	// #311 / §A10 — `dbounce logs {purge,archive,verify}` audit-log
+	// retention surface. Ships in lockstep with the sibling products
+	// (ibounce / kbounce / gbounce); the cross-product runbook at
+	// iam-roles/docs/LOG-RETENTION.md applies to all.
+	root.AddCommand(newLogsCmd())
 	return root
 }
 
