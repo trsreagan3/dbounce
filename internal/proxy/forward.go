@@ -447,8 +447,72 @@ func (f *Forwarder) handshakeAndAuth() error {
 	return f.pumpAuthPhase()
 }
 
+// PG AuthenticationRequest sub-codes (from the 'R' message payload).
+// Documented in the PostgreSQL frontend/backend protocol reference.
+// Only a SUBSET of these requires the client to send a follow-up message;
+// the rest are server→client only. Mis-classifying authCode == 12
+// (AuthenticationSASLFinal) as "client-response-required" is task #299:
+// the proxy blocks on a client read that never arrives + the upstream's
+// subsequent AuthenticationOk / ParameterStatus / ReadyForQuery messages
+// never reach the client → connection hangs forever during initial auth.
+const (
+	authOK                   uint32 = 0  // AuthenticationOk             — no client response
+	authKerberosV5           uint32 = 2  // AuthenticationKerberosV5     — no client response (obsolete)
+	authCleartextPassword    uint32 = 3  // AuthenticationCleartextPassword — client → PasswordMessage
+	authMD5Password          uint32 = 5  // AuthenticationMD5Password    — client → PasswordMessage
+	authSCMCredential        uint32 = 6  // AuthenticationSCMCredential  — no client response (Unix-socket only)
+	authGSS                  uint32 = 7  // AuthenticationGSS            — client → GSSResponse
+	authGSSContinue          uint32 = 8  // AuthenticationGSSContinue    — client → GSSResponse
+	authSSPI                 uint32 = 9  // AuthenticationSSPI           — client → GSSResponse
+	authSASL                 uint32 = 10 // AuthenticationSASL           — client → SASLInitialResponse
+	authSASLContinue         uint32 = 11 // AuthenticationSASLContinue   — client → SASLResponse
+	authSASLFinal            uint32 = 12 // AuthenticationSASLFinal      — NO client response; AuthenticationOk follows
+)
+
+// authRequestExpectsClientResponse reports whether an AuthenticationRequest
+// with the given sub-code triggers a client→server follow-up message that
+// the proxy must shuttle upstream. Server-only auth-flow messages
+// (AuthenticationOk, AuthenticationSASLFinal, etc.) MUST fall through so
+// the proxy keeps reading from the upstream — blocking on a client read
+// here causes the SCRAM-SHA-256 handshake hang documented in task #299.
+//
+// Conservative default: unknown auth codes return false so the proxy
+// keeps draining the upstream (PG will eventually send AuthenticationOk
+// or ErrorResponse). The alternative — block on a client read for an
+// unknown code — is exactly the failure mode of #299.
+func authRequestExpectsClientResponse(code uint32) bool {
+	switch code {
+	case authCleartextPassword,
+		authMD5Password,
+		authGSS,
+		authGSSContinue,
+		authSSPI,
+		authSASL,
+		authSASLContinue:
+		return true
+	default:
+		// authOK / authKerberosV5 / authSCMCredential / authSASLFinal +
+		// any unrecognized code: keep reading from upstream.
+		return false
+	}
+}
+
 // pumpAuthPhase shuttles auth messages between inbound + upstream
 // until ReadyForQuery (auth done) or ErrorResponse (auth failed).
+//
+// Wire-protocol contract (task #299 regression note):
+//
+//	The 'R' (AuthenticationRequest) sub-codes split into TWO categories:
+//	  - client-response-required:  3, 5, 7, 8, 9, 10, 11
+//	  - server-only (no response): 0, 2, 6, 12  + any unknown code
+//
+//	SCRAM-SHA-256 walks codes 10 (SASL) → 11 (SASLContinue) → 12 (SASLFinal)
+//	→ 0 (AuthenticationOk). Mis-treating 12 as "expects a client response"
+//	blocks the proxy on a client read that never arrives, and the upstream's
+//	subsequent AuthenticationOk / ParameterStatus / BackendKeyData /
+//	ReadyForQuery never propagate. The fix below routes the decision through
+//	authRequestExpectsClientResponse so unknown / server-only codes fall
+//	through to the next upstream read instead of deadlocking on the client.
 func (f *Forwarder) pumpAuthPhase() error {
 	for {
 		_ = f.out.SetDeadline(time.Now().Add(f.srv.cfg.ReadTimeout))
@@ -470,7 +534,12 @@ func (f *Forwarder) pumpAuthPhase() error {
 				return fmt.Errorf("malformed AuthenticationRequest payload (%d bytes)", len(payload))
 			}
 			authCode := binary.BigEndian.Uint32(payload[0:4])
-			if authCode == 0 {
+			if !authRequestExpectsClientResponse(authCode) {
+				// AuthenticationOk (0), AuthenticationSASLFinal (12), or
+				// any other server-only auth-flow message — keep reading
+				// from upstream. The next upstream message is either
+				// another 'R' (e.g. SASLFinal → Ok), a ParameterStatus,
+				// BackendKeyData, or ReadyForQuery.
 				continue
 			}
 			_ = f.in.SetDeadline(time.Now().Add(f.srv.cfg.ReadTimeout))

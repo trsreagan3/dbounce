@@ -410,6 +410,290 @@ func TestForward_CooperativeDenyStillForwards(t *testing.T) {
 		"cooperative DENY must NOT be marked enforced")
 }
 
+// TestForward_SCRAMSHA256HandshakeCompletes is the task #299 regression
+// pin. Before the fix in pumpAuthPhase, the proxy treated EVERY
+// AuthenticationRequest sub-code other than 0 (Ok) as "client-response
+// required" and blocked on a client read. AuthenticationSASLFinal
+// (sub-code 12) is server-only — no client response follows — so the
+// proxy deadlocked, holding the client at a connect spinner forever +
+// preventing the upstream's subsequent AuthenticationOk / ParameterStatus
+// / BackendKeyData / ReadyForQuery from propagating back.
+//
+// The fix: route the post-'R'-write branch through
+// authRequestExpectsClientResponse, so server-only sub-codes (0, 2, 6,
+// 12, unknown) fall through to the next upstream read. The fake upstream
+// here walks a SCRAM-shaped handshake — R/10 (SASL), R/11 (SASLContinue),
+// R/12 (SASLFinal), R/0 (Ok), K, Z — and the test asserts the client
+// session reaches RFQ within a deadline measured in milliseconds (NOT
+// the multi-second read-timeout dbounce sets, because the pre-fix
+// behavior would have produced a read-timeout failure, not success).
+//
+// Why a unit test in addition to the integration test:
+//
+//   - forwarding_integration_test.go (build tag `integration`) covers
+//     the real PG path but only runs when `make pg-up` is up. The unit
+//     test catches the regression in `go test ./...` without dependencies.
+//   - The fake walks the exact 4-message AUTH sequence the real PG
+//     emits during SCRAM, so the regression surfaces even when the
+//     real PG happens to be configured for `trust` auth.
+func TestForward_SCRAMSHA256HandshakeCompletes(t *testing.T) {
+	// Build a custom listener that walks the full SCRAM-shaped server
+	// sequence. We don't use the shared fakePGUpstream because its
+	// handleConn jumps straight from StartupMessage to AuthenticationOk +
+	// skips the SASL round-trip; the bug is in how the proxy handles the
+	// R/12 → R/0 transition, which only manifests when the server emits
+	// the SASLFinal message.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	upstreamPort := l.Addr().(*net.TCPAddr).Port
+
+	// Capture the SASL responses the proxy forwards from the client so
+	// the test can assert byte-level pass-through (audit-cadence (b) in
+	// forward.go — proxy must NOT inspect/mutate SCRAM tokens).
+	clientSASLResponses := make(chan []byte, 4)
+
+	go func() {
+		conn, acceptErr := l.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		// 1. Read StartupMessage. The fake doesn't speak SSL.
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return
+		}
+		length := binary.BigEndian.Uint32(hdr[0:4])
+		if length > 8 {
+			body := make([]byte, length-8)
+			if _, err := io.ReadFull(conn, body); err != nil {
+				return
+			}
+		}
+
+		// 2. Server → AuthenticationSASL (sub-code 10) advertising the
+		// SCRAM-SHA-256 mechanism. The mechanism list is a null-terminated
+		// list of null-terminated strings + a trailing zero.
+		saslPayload := []byte{0, 0, 0, 10}
+		saslPayload = append(saslPayload, []byte("SCRAM-SHA-256\x00\x00")...)
+		_ = writeMessage(conn, 'R', saslPayload)
+
+		// 3. Client → SASLInitialResponse ('p'). Proxy must shuttle.
+		_, p1, err := readPGMessage(conn)
+		if err != nil {
+			return
+		}
+		clientSASLResponses <- p1
+
+		// 4. Server → AuthenticationSASLContinue (sub-code 11) with a
+		// fake server-first message (we don't validate SCRAM math here —
+		// the proxy is byte-level pass-through; correctness of the SCRAM
+		// computation is the client's + the real PG's responsibility).
+		contPayload := []byte{0, 0, 0, 11}
+		contPayload = append(contPayload, []byte("r=fake,s=fake,i=4096")...)
+		_ = writeMessage(conn, 'R', contPayload)
+
+		// 5. Client → SASLResponse ('p') with client-final-message.
+		_, p2, err := readPGMessage(conn)
+		if err != nil {
+			return
+		}
+		clientSASLResponses <- p2
+
+		// 6. Server → AuthenticationSASLFinal (sub-code 12). THIS is the
+		// message that triggered the #299 hang: pre-fix, the proxy would
+		// block on a client read here that never arrives.
+		finalPayload := []byte{0, 0, 0, 12}
+		finalPayload = append(finalPayload, []byte("v=fake-server-signature")...)
+		_ = writeMessage(conn, 'R', finalPayload)
+
+		// 7. Server → AuthenticationOk (sub-code 0). Must reach the
+		// client; pre-fix, this never propagated because step 6 stalled.
+		_ = writeMessage(conn, 'R', []byte{0, 0, 0, 0})
+
+		// 8. Server → BackendKeyData + ReadyForQuery so the client session
+		// completes its auth handshake.
+		_ = writeMessage(conn, 'K', []byte{0, 0, 0, 1, 0, 0, 0, 0})
+		_ = writeMessage(conn, 'Z', []byte{'I'})
+
+		// Hold the connection open so the proxy doesn't EOF mid-test.
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _, _ = readPGMessage(conn)
+	}()
+
+	// Bring up dbounce in front of the fake.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	up, err := upstream.Resolve(upstream.Options{
+		UpstreamURL:   "postgres://tester@127.0.0.1:" + itoa(upstreamPort) + "/postgres",
+		TLSMode:       upstream.TLSModeDisable,
+		AllowInternal: true,
+	})
+	require.NoError(t, err)
+
+	wireL, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	mgmtL, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	wirePort := wireL.Addr().(*net.TCPAddr).Port
+	mgmtPort := mgmtL.Addr().(*net.TCPAddr).Port
+
+	cfg := Config{
+		Host: "127.0.0.1", Port: wirePort,
+		MgmtHost: "127.0.0.1", MgmtPort: mgmtPort,
+		WireListener: wireL,
+		MgmtListener: mgmtL,
+		Mode:         ModeCooperative, Dialect: DialectPostgres,
+		Upstream: up,
+		// Give plenty of read-timeout so we never accidentally pass the
+		// test on a slow CI — pre-fix, this would have hung until the
+		// 5s timeout below fires anyway.
+		IdleTimeout: 5 * time.Second,
+		ReadTimeout: 5 * time.Second,
+	}.Normalize()
+	srv := NewServer(cfg, st)
+	go func() { _ = srv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	// Wait for the proxy listener.
+	addr := "127.0.0.1:" + itoa(wirePort)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, derr := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if derr == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Open a client connection, send a StartupMessage, walk the SCRAM
+	// flow, and assert we reach RFQ within an aggressive deadline. The
+	// pre-fix behavior would deadlock until the proxy's 5s read-timeout
+	// fires; the post-fix behavior completes in microseconds.
+	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+	// Hard deadline well below the proxy's 5s read timeout so a regression
+	// surfaces as a test failure (not a hang).
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	// StartupMessage (proto v3, user=tester, database=postgres).
+	params := []byte("user\x00tester\x00database\x00postgres\x00\x00")
+	body := make([]byte, 4+len(params))
+	binary.BigEndian.PutUint32(body[0:4], 196608)
+	copy(body[4:], params)
+	startupHdr := make([]byte, 4)
+	binary.BigEndian.PutUint32(startupHdr, uint32(4+len(body)))
+	_, _ = conn.Write(startupHdr)
+	_, _ = conn.Write(body)
+
+	// Helper: read the next message, validate its type, optionally send
+	// a follow-up.
+	readR := func(t *testing.T) uint32 {
+		t.Helper()
+		mt, p, err := readPGMessage(conn)
+		require.NoError(t, err, "client must receive auth message")
+		require.Equal(t, byte('R'), mt, "expected 'R' AuthenticationRequest, got %q", mt)
+		require.GreaterOrEqual(t, len(p), 4, "AuthenticationRequest payload < 4 bytes")
+		return binary.BigEndian.Uint32(p[0:4])
+	}
+
+	sendSASL := func(t *testing.T, payload []byte) {
+		t.Helper()
+		err := writeMessage(conn, 'p', payload)
+		require.NoError(t, err)
+	}
+
+	// AuthenticationSASL (10) → client sends SASLInitialResponse.
+	assert.Equal(t, uint32(10), readR(t), "first 'R' must be AuthenticationSASL (sub-code 10)")
+	sendSASL(t, []byte("SCRAM-SHA-256\x00\x00\x00\x00\x20n,,n=,r=client-nonce"))
+
+	// AuthenticationSASLContinue (11) → client sends SASLResponse.
+	assert.Equal(t, uint32(11), readR(t), "second 'R' must be AuthenticationSASLContinue (sub-code 11)")
+	sendSASL(t, []byte("c=biws,r=fake,p=fake-client-proof"))
+
+	// AuthenticationSASLFinal (12) — server-only. Pre-fix, the proxy
+	// blocked here waiting for a client response that never comes.
+	// Post-fix, the proxy forwards this through + immediately reads the
+	// next upstream message.
+	assert.Equal(t, uint32(12), readR(t), "third 'R' must be AuthenticationSASLFinal (sub-code 12) — the pre-fix hang point")
+
+	// AuthenticationOk (0) — only reachable when the SASLFinal hand-off
+	// is correct. This is the load-bearing assertion for #299.
+	assert.Equal(t, uint32(0), readR(t), "fourth 'R' must be AuthenticationOk (sub-code 0) — pre-fix this never arrived")
+
+	// BackendKeyData ('K').
+	mt, _, err := readPGMessage(conn)
+	require.NoError(t, err)
+	assert.Equal(t, byte('K'), mt, "must receive BackendKeyData after AuthenticationOk")
+
+	// ReadyForQuery ('Z') — auth handshake complete.
+	mt, _, err = readPGMessage(conn)
+	require.NoError(t, err)
+	assert.Equal(t, byte('Z'), mt, "must receive ReadyForQuery — handshake complete")
+
+	// Audit-cadence (b) pass-through invariant: each SASL response the
+	// client sent reached the fake upstream byte-identical.
+	select {
+	case got := <-clientSASLResponses:
+		assert.Contains(t, string(got), "n=", "client SASLInitialResponse bytes must reach upstream verbatim")
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake upstream never received SASLInitialResponse — proxy dropped a client auth message")
+	}
+	select {
+	case got := <-clientSASLResponses:
+		assert.Contains(t, string(got), "p=", "client SASLResponse bytes must reach upstream verbatim")
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake upstream never received SASLResponse — proxy dropped a client auth message")
+	}
+}
+
+// TestAuthRequestExpectsClientResponse pins the wire-protocol contract
+// at the function level — task #299's fix lives or dies by this mapping.
+// Each sub-code is enumerated explicitly with a comment naming the PG
+// protocol message it represents so a future contributor can't quietly
+// flip one without the test breaking + the diff surfacing the change.
+func TestAuthRequestExpectsClientResponse(t *testing.T) {
+	cases := []struct {
+		code uint32
+		want bool
+		name string
+	}{
+		{0, false, "AuthenticationOk"},
+		{2, false, "AuthenticationKerberosV5"},
+		{3, true, "AuthenticationCleartextPassword"},
+		{5, true, "AuthenticationMD5Password"},
+		{6, false, "AuthenticationSCMCredential"},
+		{7, true, "AuthenticationGSS"},
+		{8, true, "AuthenticationGSSContinue"},
+		{9, true, "AuthenticationSSPI"},
+		{10, true, "AuthenticationSASL"},
+		{11, true, "AuthenticationSASLContinue"},
+		{12, false, "AuthenticationSASLFinal — task #299 regression point"},
+		{99, false, "unknown sub-code — conservative default is no-client-response"},
+		{255, false, "unknown sub-code (high)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := authRequestExpectsClientResponse(c.code)
+			assert.Equal(t, c.want, got,
+				"authRequestExpectsClientResponse(%d) = %v, want %v (%s)",
+				c.code, got, c.want, c.name)
+		})
+	}
+}
+
 // TestForward_UpstreamDialFailure: the operator-configured upstream
 // is unreachable → client gets a PG ErrorResponse with SQLSTATE 08006.
 func TestForward_UpstreamDialFailure(t *testing.T) {

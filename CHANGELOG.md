@@ -5,6 +5,47 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### SCRAM-SHA-256 handshake hang fix (#299, 2026-05-22; CRITICAL)
+
+- **Bug:** Connecting any modern Postgres client (psql 14+, libpq 14+,
+  psycopg2, lib/pq, pgx, etc.) through dbounce against a SCRAM-SHA-256-
+  authenticated upstream hung forever during initial auth. The proxy
+  forwarded the SCRAM bytes upstream but the AuthenticationOk /
+  ParameterStatus / BackendKeyData / ReadyForQuery responses never
+  propagated back to the client. Modern PostgreSQL 14+ defaults to
+  SCRAM-SHA-256, so this broke every default install.
+- **Root cause:** `pumpAuthPhase` in `internal/proxy/forward.go` treated
+  EVERY `AuthenticationRequest` sub-code other than 0 (Ok) as "client-
+  response required" and blocked on a client read. The SCRAM-SHA-256
+  flow walks `R/10` (SASL) → `R/11` (SASLContinue) → `R/12` (SASLFinal)
+  → `R/0` (Ok); sub-code 12 (`AuthenticationSASLFinal`) is server-only
+  and is NOT followed by a client message. The proxy deadlocked on the
+  spurious client read.
+- **Fix:** Introduced `authRequestExpectsClientResponse(uint32) bool` —
+  an enumerated mapping from PG protocol auth sub-codes to "does the
+  client respond?" The post-`R`-write branch now routes through this
+  helper, so server-only sub-codes (0, 2, 6, 12) and unknown codes fall
+  through to the next upstream read instead of blocking on the client.
+  Wire-protocol pass-through invariants are preserved — dbounce still
+  forwards SCRAM bytes verbatim and never names/inspects the SCRAM
+  token or password.
+- **Regression coverage:**
+  - `TestForward_SCRAMSHA256HandshakeCompletes` (`internal/proxy/forwarding_test.go`)
+    walks the full 4-message SCRAM server sequence via a custom in-process
+    fake upstream and asserts the client session reaches `ReadyForQuery`
+    in under 3s (pre-fix this hangs until `ReadTimeout` fires).
+  - `TestAuthRequestExpectsClientResponse` pins the wire-protocol
+    contract — each PG auth sub-code is enumerated by name with its
+    expected verdict.
+  - `TestIntegration_SCRAMAuthThroughProxy` (build tag `integration`)
+    verifies the fix against a real PostgreSQL with SCRAM-only
+    `pg_hba.conf`.
+- **End-to-end verification:** psycopg2.connect() through dbounce against
+  Postgres 16 with `password_encryption=scram-sha-256` succeeds in ~95ms
+  (was: hung until client `connect_timeout`).
+- Per `[[creates-never-mutates]]`: fix is scoped to the upstream-auth
+  forwarder; no surrounding code touched.
+
 ### Per-org notification routing engine (#280, 2026-05-19; ENTERPRISE tier)
 
 - **`dbounce run --alert-routes ROUTES.yaml`** activates the multi-
