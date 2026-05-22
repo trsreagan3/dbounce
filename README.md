@@ -67,12 +67,18 @@ wire-protocol path.
 
 ---
 
+## Install
+
+```sh
+# Canonical install — builds the binary fresh from source into $GOPATH/bin
+# (or $HOME/go/bin if GOPATH is unset). Make sure that directory is on
+# your PATH.
+go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
+```
+
 ## Quickstart
 
 ```sh
-# Build (single static binary).
-go build ./cmd/dbounce
-
 # Default run: cooperative mode, observation-only.
 # The proxy listens on 127.0.0.1:5433 (one above PostgreSQL's default
 # 5432 so an existing local PG install isn't disturbed). The management
@@ -84,10 +90,27 @@ go build ./cmd/dbounce
 # .local hostname), add --allow-internal-upstream — dbounce refuses
 # internal IP ranges by default to prevent SSRF when the upstream URL
 # comes from untrusted config:
-./dbounce run \
+dbounce run \
   --upstream postgres://user:pass@127.0.0.1:5432/mydb \
   --allow-internal-upstream
 ```
+
+### Local development build
+
+If you're iterating on the source tree:
+
+```sh
+# Drops the binary into ./bin/dbounce (gitignored).
+make build
+
+# Or invoke go directly:
+go build -o bin/dbounce ./cmd/dbounce
+./bin/dbounce run --upstream postgres://... --allow-internal-upstream
+```
+
+`bin/` is gitignored — never commit a pre-built binary. Users pick up
+fresh source via `go install ...@latest` and get an up-to-date build
+every time. Closes #306 / #307 + KNOWN-CAVEATS §A8.
 
 Default audit DB: `~/.dbounce/state.db`.
 

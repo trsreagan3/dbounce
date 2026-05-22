@@ -5,6 +5,33 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #306 + #307 — canonicalize `go install` as the install path; no checked-in `bin/` (2026-05-22)
+
+Closes KNOWN-CAVEATS §A8. The repository never tracked `bin/dbounce`
+(it was gitignored via the existing `bin/` pattern in `.gitignore`),
+but the README still led with `go build ./cmd/dbounce` followed by
+`./dbounce run`, which papered over the canonical install story and
+left the door open for someone to commit a stale binary in the future.
+
+- **README "Install" section** — adds a dedicated "Install" section
+  ahead of "Quickstart" with `go install
+  github.com/trsreagan3/dbounce/cmd/dbounce@latest` as the canonical
+  first-time-install path. Every user who follows the README gets a
+  fresh build straight from source; no pre-built binary can lag the
+  codebase. Local-dev iteration via `make build` /
+  `go build -o bin/dbounce ./cmd/dbounce` is documented in a separate
+  subsection with an explicit reminder that `bin/` is gitignored.
+- **Makefile `install` target** — wraps `go install ./cmd/dbounce` so
+  local-dev iteration can match the canonical install path without
+  re-typing the module URL.
+- **Makefile `build` target** — now drops the binary into `./bin/`
+  (gitignored) instead of the working directory, so source-tree
+  iteration produces a predictable artifact location that won't
+  collide with git tracking.
+- Per `[[creates-never-mutates]]` this slice is hygiene-only — no
+  surrounding code touched. Per `[[push-policy-public-repo]]` diff
+  scanned for sensitive data before push.
+
 ### SCRAM-SHA-256 handshake hang fix (#299, 2026-05-22; CRITICAL)
 
 - **Bug:** Connecting any modern Postgres client (psql 14+, libpq 14+,

@@ -1,5 +1,8 @@
 # dbounce — make targets
 #
+# `make build`             compile dbounce into ./bin/ (gitignored)
+# `make install`           go install dbounce into $GOPATH/bin
+# `make vet`               go vet ./...
 # `make test`              unit tests only (always runnable, no docker)
 # `make test-integration`  build-tag gated integration tests; safe to run
 #                          even without engines up — integration tests
@@ -26,12 +29,23 @@ DBOUNCE_TEST_MYSQL_PORT ?= 3306
 DBOUNCE_TEST_MYSQL_PASSWORD ?= test
 DBOUNCE_TEST_MYSQL_DB ?= dbounce_test
 
-.PHONY: build vet test test-integration test-integration-clean \
+.PHONY: build install vet test test-integration test-integration-clean \
 	pg-up pg-down pg-logs \
 	mysql-up mysql-down mysql-logs
 
+# Local-dev build — drops the binary into ./bin/ which is gitignored.
+# NEVER commit the contents of bin/. The canonical install path for end
+# users is `go install github.com/trsreagan3/dbounce/cmd/dbounce@latest`
+# per README; this target exists for source-tree iteration only.
 build:
-	go build ./...
+	@mkdir -p bin
+	go build -o bin/dbounce ./cmd/dbounce
+
+# Equivalent of the canonical end-user install — drops the binary into
+# $GOPATH/bin (or $HOME/go/bin). Use this when you want the locally-
+# built binary on your PATH without committing ./bin/.
+install:
+	go install ./cmd/dbounce
 
 vet:
 	go vet ./...
