@@ -22,7 +22,7 @@ import (
 // TestBuildAuditExporter_NoFlags_ReturnsNilNil verifies the FREE-tier
 // default — no audit-export wired.
 func TestBuildAuditExporter_NoFlags_ReturnsNilNil(t *testing.T) {
-	e, err := buildAuditExporter("", false, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0)
+	e, err := buildAuditExporter("", false, -1, -1, -1, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.NoError(t, err)
 	assert.Nil(t, e, "no audit-export flags = no exporter (FREE-tier default)")
 }
@@ -32,7 +32,7 @@ func TestBuildAuditExporter_NoFlags_ReturnsNilNil(t *testing.T) {
 func TestBuildAuditExporter_LogOnly_FreeTier(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.jsonl")
-	e, err := buildAuditExporter(path, false, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0)
+	e, err := buildAuditExporter(path, false, -1, -1, -1, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.NoError(t, err, "log-only transport must work without a license (FREE tier)")
 	require.NotNil(t, e)
 	require.True(t, e.Enabled())
@@ -53,12 +53,11 @@ func TestBuildAuditExporter_WebhookWithoutLicense_Rejected(t *testing.T) {
 	}
 	t.Cleanup(func() { licensedForAuditWebhook = prev })
 
-	_, err := buildAuditExporter("", false,
-		"https://collector.example.com/audit", "some-token", 1, false,
+	_, err := buildAuditExporter("", false, -1, -1, -1, "https://collector.example.com/audit", "some-token", 1, false,
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0)
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Enterprise license",
 		"webhook flag without license must produce a license-tier error")
@@ -75,12 +74,11 @@ func TestBuildAuditExporter_WebhookWithLicenseOverride(t *testing.T) {
 	t.Cleanup(func() { licensedForAuditWebhook = prev })
 
 	// Use a public IP literal that passes the SSRF gate.
-	e, err := buildAuditExporter("", false,
-		"https://93.184.216.34/audit", "test-token", 1, false,
+	e, err := buildAuditExporter("", false, -1, -1, -1, "https://93.184.216.34/audit", "test-token", 1, false,
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0)
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.NoError(t, err)
 	require.NotNil(t, e)
 	require.True(t, e.Enabled())
@@ -92,12 +90,11 @@ func TestBuildAuditExporter_WebhookWithLicenseOverride(t *testing.T) {
 // Same placeholder shape as the webhook gate; both wait on #235.
 func TestBuildAuditExporter_AlertRoutesLicensePlaceholderRejects(t *testing.T) {
 	dir := t.TempDir()
-	_, err := buildAuditExporter("", false,
-		"", "", 0, false,
+	_, err := buildAuditExporter("", false, -1, -1, -1, "", "", 0, false,
 		"", "", "",
 		dir+"/routes.yaml",
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0)
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, audit.ErrRoutesLicenseRequired,
 		"--alert-routes must return ErrRoutesLicenseRequired until license-file plumbing lands")
@@ -117,11 +114,11 @@ func TestRunCmdRegistersAlertRoutesFlag(t *testing.T) {
 // TestBuildAuditExporter_TokenWithoutURL_Rejected: token without a URL
 // is almost certainly a typo / forgotten flag; fail-fast.
 func TestBuildAuditExporter_TokenWithoutURL_Rejected(t *testing.T) {
-	_, err := buildAuditExporter("", false, "", "stray-token", 0, false,
+	_, err := buildAuditExporter("", false, -1, -1, -1, "", "stray-token", 0, false,
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0)
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--audit-webhook-token")
 }
@@ -140,11 +137,13 @@ func TestStartupBanner_TokenNeverPresent(t *testing.T) {
 	dir := t.TempDir()
 	e, err := buildAuditExporter(
 		filepath.Join(dir, "audit.jsonl"), false,
+		-1, -1, -1,
 		"https://93.184.216.34/audit", tok, 1, false,
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0)
+		"127.0.0.1:5433", "", "", "", "", "", 0,
+		"", "", "", "", "", 0, 0, "")
 	require.NoError(t, err)
 	require.NotNil(t, e)
 	t.Cleanup(func() { _ = e.Shutdown(context.Background()) })
