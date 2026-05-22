@@ -5,6 +5,46 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #321 / §A19 — `dbounce profile doctor` upgrade-blindness fix — Shipped 2026-05-22
+
+Closes the D3 launch-blocker surfaced by the role-effectiveness eval
+2026-05-22: an operator who installed dbounce pre-#302 was silently
+running WITHOUT the `deny_dcl_targets_public` floor because
+`~/.dbounce/profiles.yaml` is intentionally never overwritten
+(operator may have customized). Without a fix the safety guarantee
+("GRANT-to-PUBLIC blocked under safe-default") was silently false on
+older installs.
+
+- **internal/profile/doctor.go (new):** `Check()` diff-checks the
+  installed profile YAML against a curated catalog of shipped default
+  fields. `Apply()` additively merges missing fields into the on-disk
+  YAML + backs up the prior file (`<path>.bak-YYYYMMDD-HHMMSS`)
+  before writing. `Acknowledge()` writes a per-operator stamp to
+  suppress the startup banner until a new `ShippedDefaultsVersion`
+  re-arms it. Field categories (`safety-floor` / `detection` /
+  `audit` / `convenience`) bound the startup-banner shape: only
+  `safety-floor` misses trigger the run-time caveat. Per
+  [[creates-never-mutates]]: additive only — operator-customized
+  field values are never overwritten.
+- **internal/cli/profile.go (extended):** `dbounce profile doctor`
+  subcommand with `--apply` / `--acknowledge` / `--diff` / `--check`
+  / `--json` flags. Same flag shape as `kbounce` / `ibounce` /
+  `gbounce` per [[cross-product-agent-parity]]. Exit codes: `0`
+  current; `2` gaps found (script-friendly).
+- **internal/cli/cli.go (extended):** `dbounce run` startup-banner
+  hook calls `profile.StartupBannerLine` after the existing caveats
+  block. The one-line warning ("caveat: your safe-default profile
+  is missing fields shipped in this version — run `dbounce profile
+  doctor` for details (KNOWN-CAVEATS §A19)") fires only when a
+  safety-floor field is missing AND the operator hasn't
+  acknowledged the current shipped-defaults version. Per
+  [[security-team-positioning-safety-not-surveillance]]: framed
+  as "your profile is behind" not "you are non-compliant."
+- **internal/profile/doctor_test.go (new):** 7 tests cover fresh
+  profile / missing-safety-floor / missing-convenience / apply-
+  additive / apply-backs-up / acknowledge-silences /
+  catalog-covers-embedded-defaults.
+
 ### #320 / §A18 — `/audit/events` wire-shape parity fix — Shipped 2026-05-22
 
 Closes a UAT-discovered CRIT: the HTTP `/audit/events` endpoint that

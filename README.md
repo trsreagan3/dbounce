@@ -95,6 +95,20 @@ dbounce run \
   --allow-internal-upstream
 ```
 
+### After upgrade: `dbounce profile doctor` (one-time)
+
+dbounce never overwrites `~/.dbounce/profiles.yaml` (your edits
+survive upgrades), so a new safety floor added to embedded defaults
+won't land until you opt in. After upgrading the binary, run:
+
+```sh
+dbounce profile doctor          # report missing fields (no write)
+dbounce profile doctor --apply  # additively merge + back up prior file
+```
+
+See [docs/PROFILE-UPGRADE.md](../iam-roles/docs/PROFILE-UPGRADE.md)
+for the full runbook (task #321 / KNOWN-CAVEATS §A19).
+
 ### Local development build
 
 If you're iterating on the source tree:

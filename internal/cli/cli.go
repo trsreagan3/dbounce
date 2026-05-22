@@ -1127,6 +1127,16 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				}) {
 					fmt.Fprintln(os.Stderr, line)
 				}
+				// §A19 profile-upgrade-blindness banner (#321). Only
+				// fires when the operator's installed profile is
+				// missing a safety-floor field AND they haven't
+				// acknowledged the current shipped-defaults version.
+				// Convenience / detection / audit misses don't trigger
+				// the startup line — operators see those on explicit
+				// `dbounce profile doctor` invocation.
+				if line := profile.StartupBannerLine("dbounce", resolvedProfilesPath); line != "" {
+					fmt.Fprintln(os.Stderr, line)
+				}
 			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
