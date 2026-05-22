@@ -66,6 +66,14 @@ type Exporter struct {
 	// the data.
 	SecurityLake *SecurityLakeWriter
 
+	// #317 — optional cloud-neutral S3-compat NDJSON object-storage
+	// writer. Nil disables this channel. When wired, every event is
+	// also buffered + finalized into the operator-owned bucket per
+	// the Hive-partitioned NDJSON.gz layout. Per [[self-host-zero-
+	// billing-dependency]] the destination is operator-owned;
+	// iam-jit-the-company never receives the data.
+	ObjectStorage *ObjectStorageWriter
+
 	// host is the proxy listener address ("127.0.0.1:5433") stamped
 	// onto every event's Event.Host field. Provided at construction
 	// time so we don't re-read s.cfg per decision.
@@ -103,7 +111,8 @@ func (e *Exporter) Enabled() bool {
 		return false
 	}
 	return e.Log != nil || e.Webhook != nil || e.Routes != nil ||
-		e.Recorder != nil || e.SecurityLake != nil
+		e.Recorder != nil || e.SecurityLake != nil ||
+		e.ObjectStorage != nil
 }
 
 // EmitDecision projects a store.DecisionRow into the cross-product
@@ -161,6 +170,13 @@ func (e *Exporter) emit(ctx context.Context, evt Event) error {
 	if e.SecurityLake != nil {
 		e.SecurityLake.Write(ctx, evt)
 	}
+	// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+	// Synchronous in-memory append; the background rotator handles
+	// finalize uploads. Fail-soft so an unreachable bucket never
+	// blocks the hot path.
+	if e.ObjectStorage != nil {
+		e.ObjectStorage.Write(ctx, evt)
+	}
 	if len(errs) == 0 {
 		return nil
 	}
@@ -216,6 +232,12 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 	if e.SecurityLake != nil {
 		e.SecurityLake.Close()
 	}
+	// #317 — object-storage teardown finalizes the active NDJSON
+	// buffer synchronously (per the spec) so a clean shutdown
+	// doesn't drop in-memory rows.
+	if e.ObjectStorage != nil {
+		e.ObjectStorage.Close()
+	}
 	if len(errs) == 0 {
 		return nil
 	}
@@ -226,14 +248,15 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 // per-transport stats + a top-level "configured" flag so the tool can
 // answer "is anything wired up?" without inspecting nil fields.
 type ExporterStatus struct {
-	Configured   bool                   `json:"configured"`
-	Log          *LogStats              `json:"log,omitempty"`
-	Webhook      *WebhookStats          `json:"webhook,omitempty"`
-	Heartbeat    *HeartbeatStats        `json:"heartbeat,omitempty"`
-	Recorder     *SessionRecorderStatus `json:"recorder,omitempty"`
-	SecurityLake *SecurityLakeStatus    `json:"security_lake,omitempty"`
-	Host         string                 `json:"host,omitempty"`
-	Upstream     string                 `json:"upstream,omitempty"`
+	Configured    bool                   `json:"configured"`
+	Log           *LogStats              `json:"log,omitempty"`
+	Webhook       *WebhookStats          `json:"webhook,omitempty"`
+	Heartbeat     *HeartbeatStats        `json:"heartbeat,omitempty"`
+	Recorder      *SessionRecorderStatus `json:"recorder,omitempty"`
+	SecurityLake  *SecurityLakeStatus    `json:"security_lake,omitempty"`
+	ObjectStorage *ObjectStorageStatus   `json:"object_storage,omitempty"`
+	Host          string                 `json:"host,omitempty"`
+	Upstream      string                 `json:"upstream,omitempty"`
 }
 
 // Status returns the current per-transport stats. Safe for concurrent
@@ -266,6 +289,10 @@ func (e *Exporter) Status() ExporterStatus {
 	if e.SecurityLake != nil {
 		s := e.SecurityLake.Status()
 		out.SecurityLake = &s
+	}
+	if e.ObjectStorage != nil {
+		s := e.ObjectStorage.Status()
+		out.ObjectStorage = &s
 	}
 	return out
 }
