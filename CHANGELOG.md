@@ -5,6 +5,52 @@ semver from v1.0.0 onward.
 
 ## Unreleased
 
+### #320 / §A18 — `/audit/events` wire-shape parity fix — Shipped 2026-05-22
+
+Closes a UAT-discovered CRIT: the HTTP `/audit/events` endpoint that
+powers `iam-jit audit query` was emitting an empty agent block on
+every row even when the in-memory exporter pipeline had high-fidelity
+agent identity. SOC analysts pulling cross-product events by
+`agent.session_id` got zero dbounce hits.
+
+- **store/store.go:** SchemaVersion bumped to 7. Adds three additive
+  columns to `decisions` via idempotent `ALTER TABLE`:
+  `agent_name TEXT`, `agent_session_id TEXT`, `detected_from TEXT
+  NOT NULL DEFAULT 'unknown'`. Pre-#320 rows surface NULL (or
+  "unknown" for `detected_from`) so the read path drops the agent
+  block — historical events keep their legacy shape per
+  `[[creates-never-mutates]]`.
+- **proxy/proxy.go:** `evaluateAndAuditWithAgent` looks up the agent
+  registry on every decision + persists the fingerprint alongside
+  the row so the SQLite-backed projection sees what the JSONL log +
+  webhook stream already carry.
+- **proxy/audit_events.go:** `decisionRowsToAuditEvents` now routes
+  through `audit.FromDecisionRowWithAgent` with the persisted
+  fields. New `agentFromDecisionRow` helper translates row → Agent.
+- **audit/agent_context.go:** `Agent` struct gains a non-serialised
+  `HeaderRejection` map field that propagates `application_name`
+  tag-rejection breadcrumbs to every event from the rejected
+  session.
+- **audit/event.go:** When `Agent.HeaderRejection` is non-empty the
+  projection splices it into
+  `unmapped.iam_jit.ext.agent_header_rejection`.
+- **audit/agent_header_rejection.go (new):** Cross-product bounded
+  enum (`invalid_name_charset` / `invalid_name_length` /
+  `invalid_session_id_format` / `invalid_session_id_length` /
+  dbounce-only `application_name_unparseable`) + classifier
+  helpers. Raw rejected value NEVER emitted; only its length, for
+  safe forensics per
+  `[[security-team-positioning-safety-not-surveillance]]`.
+- **proxy/proxy.go:** `registerPGAgentFromBody` stamps the rejection
+  breadcrumb on the registered Agent when
+  `application_name=iam-jit-agent:...` fails validation, threading
+  through every subsequent audit event from that connection.
+- Two new regression tests in `proxy/audit_events_test.go`:
+  `TestAuditEvents_320_ThreadsAgentBlockFromStore` +
+  `TestAuditEvents_320_FilterByAgentSessionIDMatches`.
+- Closes `[[cross-product-agent-parity]]` parity with kbouncer +
+  gbounce + ibounce.
+
 ### #317 / §A15 — cloud-neutral S3-compatible NDJSON object-storage sink — Shipped 2026-05-22
 
 Closes the headline cloud-neutrality gap surfaced by founder

@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1240,12 +1241,38 @@ func (s *Server) registerPGAgentFromBody(body []byte) string {
 	}
 	params := audit.ParsePGStartupParams(body)
 	name, sessionID, rawAppName, tagInvalid := audit.ParsePGStartupAppNameWithSession(params)
-	if tagInvalid {
-		s.recordRejectedAgentTag(rawAppName)
-	}
 	agent := audit.Agent{
 		Name:         name,
 		DetectedFrom: audit.DetectedFromPGAppName,
+	}
+	if tagInvalid {
+		s.recordRejectedAgentTag(rawAppName)
+		// #320 / §A18: stamp the structured rejection breadcrumb on
+		// the session's Agent so every subsequent audit event from
+		// this connection carries it under
+		// `unmapped.iam_jit.ext.agent_header_rejection`. Pre-§A18
+		// the only signal was the /healthz counter + the truncated
+		// stderr line; SOC analysts querying the audit log directly
+		// couldn't tell which connection had the misconfigured
+		// agent SDK. The breadcrumb names the field
+		// (`application_name`), a bounded enum reason
+		// (invalid_name_charset / invalid_name_length /
+		// invalid_session_id_format / invalid_session_id_length /
+		// application_name_unparseable), AND the rejected tail's
+		// length — never the raw value. Per
+		// [[security-team-positioning-safety-not-surveillance]].
+		fullTail := rawAppName
+		if strings.HasPrefix(rawAppName, audit.AgentAppNameTagPrefix) {
+			fullTail = strings.TrimPrefix(rawAppName, audit.AgentAppNameTagPrefix)
+		}
+		// Re-parse the malformed pieces so the classifier can pick the
+		// most-specific reason. ParseAgentTagFromAppName already returns
+		// the raw pieces when validation failed but ok=false; we call
+		// it again because ParsePGStartupAppNameWithSession's tag-invalid
+		// branch discards them.
+		rawName, rawSession, _ := audit.ParseAgentTagFromAppName(rawAppName)
+		agent.HeaderRejection = audit.ClassifyApplicationNameTagRejection(
+			rawName, rawSession, fullTail)
 	}
 	if rawAppName == "" {
 		// No application_name sent. Mint anyway so the session id
@@ -1320,6 +1347,27 @@ func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 		statementRedacted = storedStatement != sql
 	}
 
+	// #320 / §A18: resolve the agent fingerprint UP-FRONT so the
+	// SQLite row carries the same agent.name / agent.session_id /
+	// agent.detected_from values the JSONL log + webhook pipeline
+	// already emit. Pre-#320 these were dropped on the store side
+	// (the in-process registry was the only source of truth) and
+	// the HTTP /audit/events endpoint surfaced an empty agent block
+	// — cross-bouncer correlation by `agent.session_id` returned
+	// zero dbounce events. Lookup is best-effort: a registry miss
+	// (concurrent connection close + final in-flight decision) still
+	// stamps the session_id so the cross-bouncer pivot resolves.
+	var agentName, agentSessionID, agentDetectedFrom string
+	if sessionID != "" && s.agentRegistry != nil {
+		if a, ok := s.agentRegistry.Lookup(sessionID); ok {
+			agentName = a.Name
+			agentSessionID = a.SessionID
+			agentDetectedFrom = string(a.DetectedFrom)
+		} else {
+			agentSessionID = sessionID
+			agentDetectedFrom = string(audit.DetectedFromUnknown)
+		}
+	}
 	row := store.DecisionRow{
 		At:               time.Now().UTC(),
 		Dialect:          ps.Dialect,
@@ -1349,6 +1397,13 @@ func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 		TaskID:            d.TaskID,
 		PauseID:           pauseID,
 		StatementRedacted: statementRedacted,
+		// #320 / §A18: agent attribution persisted alongside the
+		// row so /audit/events + audit tail readers see the same
+		// `unmapped.iam_jit.agent.{name, session_id, detected_from}`
+		// block the JSONL log + webhook pipeline already emit.
+		AgentName:      agentName,
+		AgentSessionID: agentSessionID,
+		DetectedFrom:   agentDetectedFrom,
 	}
 	decisionID, err := s.store.RecordDecision(row)
 	if err != nil {

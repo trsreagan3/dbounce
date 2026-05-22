@@ -188,22 +188,35 @@ const (
 //
 // DetectedFrom names the detection source so a reviewer can triage
 // confidence per row.
+//
+// HeaderRejection is the #320 / §A18 structured breadcrumb that lands
+// at `unmapped.iam_jit.ext.agent_header_rejection` when the agent's
+// `application_name=iam-jit-agent:...` tag was malformed. Stamped at
+// connection-registration time + threaded onto every subsequent
+// audit event from that session so a SOC analyst querying the audit
+// log can see which connection had a misconfigured agent SDK +
+// which reason (charset / length / unparseable tag body). NEVER
+// includes the raw value — only the rejected value's length, for
+// safe forensics per
+// [[security-team-positioning-safety-not-surveillance]].
 type Agent struct {
-	Name         string       `json:"name,omitempty"`
-	Version      string       `json:"version,omitempty"`
-	SessionID    string       `json:"session_id,omitempty"`
-	DetectedFrom DetectedFrom `json:"detected_from,omitempty"`
+	Name            string         `json:"name,omitempty"`
+	Version         string         `json:"version,omitempty"`
+	SessionID       string         `json:"session_id,omitempty"`
+	DetectedFrom    DetectedFrom   `json:"detected_from,omitempty"`
+	HeaderRejection map[string]any `json:"-"`
 }
 
 // IsEmpty reports whether nothing was populated (no name / no session
-// id / no detection source). The projection branches on this to keep
-// the JSONL line minimal — an event without any agent information
-// omits the entire unmapped.iam_jit.agent block rather than emitting a
-// stub `"agent":{"detected_from":"unknown"}` clutter on every row that
-// happens to lack agent context (e.g. observation-only smoke tests
-// before any client has connected).
+// id / no detection source / no rejection). The projection branches
+// on this to keep the JSONL line minimal — an event without any
+// agent information omits the entire unmapped.iam_jit.agent block
+// rather than emitting a stub `"agent":{"detected_from":"unknown"}`
+// clutter on every row that happens to lack agent context (e.g.
+// observation-only smoke tests before any client has connected).
 func (a Agent) IsEmpty() bool {
-	return a.Name == "" && a.Version == "" && a.SessionID == "" && a.DetectedFrom == ""
+	return a.Name == "" && a.Version == "" && a.SessionID == "" &&
+		a.DetectedFrom == "" && len(a.HeaderRejection) == 0
 }
 
 // Normalize fills in DetectedFromUnknown when DetectedFrom is empty +

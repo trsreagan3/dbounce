@@ -216,14 +216,51 @@ func filterAuditEventsByTime(events []audit.Event, since, until *time.Time) []au
 }
 
 // decisionRowsToAuditEvents wraps SQLite DecisionRows as OCSF Events
-// via the canonical FromDecisionRow builder so the resulting events
-// match what the JSONL log / webhook pipeline emits.
+// via the canonical FromDecisionRowWithAgent builder so the resulting
+// events match what the JSONL log / webhook pipeline emits.
+//
+// #320 / §A18: threads the persisted agent fields (`agent_name`,
+// `agent_session_id`, `detected_from`) into the projection's Agent
+// struct so the HTTP /audit/events endpoint carries the same
+// `unmapped.iam_jit.agent.{name, session_id, detected_from}` block
+// the in-memory exporter pipeline emits. Pre-#320 the projection
+// routed through `FromDecisionRow` with an empty Agent, which made
+// the cross-bouncer `iam-jit audit query --filter
+// agent.session_id=X` return ZERO dbounce events even when SQLite
+// had matching rows. Per [[cross-product-agent-parity]] the wire
+// shape is identical to kbouncer's + gbounce's + ibounce's.
 func decisionRowsToAuditEvents(rows []store.DecisionRow) []audit.Event {
 	out := make([]audit.Event, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, audit.FromDecisionRow(r, 0, "", ""))
+		out = append(out, audit.FromDecisionRowWithAgent(r, 0, "", "", agentFromDecisionRow(r)))
 	}
 	return out
+}
+
+// agentFromDecisionRow rebuilds an audit.Agent from the persisted
+// `agent_name` + `agent_session_id` + `detected_from` columns.
+// Returns the zero Agent when all three are empty so the OCSF
+// projection's `agentPtrOrNil` helper drops the entire agent block
+// — historical pre-#320 rows keep their legacy "no agent" shape.
+//
+// Empty `DetectedFrom` is treated as "unknown" so handler code
+// never has to nil-check. Name is left verbatim — the Agent's
+// `Normalize` step stamps "unknown" when name is empty + a session
+// id or detection source is non-empty.
+func agentFromDecisionRow(r store.DecisionRow) audit.Agent {
+	if r.AgentName == "" && r.AgentSessionID == "" &&
+		(r.DetectedFrom == "" || r.DetectedFrom == string(audit.DetectedFromUnknown)) {
+		return audit.Agent{}
+	}
+	df := audit.DetectedFrom(r.DetectedFrom)
+	if df == "" {
+		df = audit.DetectedFromUnknown
+	}
+	return audit.Agent{
+		Name:         r.AgentName,
+		SessionID:    r.AgentSessionID,
+		DetectedFrom: df,
+	}
 }
 
 // auditEventsBundle is the on-wire shape for ?format=ocsf-bundle.

@@ -616,6 +616,20 @@ func FromDecisionRowWithAgent(row store.DecisionRow, decisionID int64, host, ups
 			},
 		},
 	}
+	// #320 / §A18: when the agent's `application_name=iam-jit-agent:...`
+	// tag was malformed at connection-registration time, the
+	// HeaderRejection breadcrumb is threaded onto the session's Agent
+	// + propagated to every audit event from that connection. Lands at
+	// `unmapped.iam_jit.ext.agent_header_rejection` per
+	// [[cross-product-agent-parity]]. Stamped HERE (not in the SQLite
+	// row) because the breadcrumb is per-connection state — pre-#320
+	// rows from prior process lifetimes can't reconstruct it.
+	if len(agent.HeaderRejection) > 0 {
+		if evt.Unmapped.IAMJIT.Ext == nil {
+			evt.Unmapped.IAMJIT.Ext = map[string]any{}
+		}
+		evt.Unmapped.IAMJIT.Ext["agent_header_rejection"] = agent.HeaderRejection
+	}
 	return evt
 }
 

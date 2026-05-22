@@ -353,3 +353,127 @@ func TestAuditEvents_NonGETMethodRejected(t *testing.T) {
 		t.Errorf("status = %d (want 405)", resp.StatusCode)
 	}
 }
+
+// TestAuditEvents_320_ThreadsAgentBlockFromStore is the §A18 regression
+// guard: when a DecisionRow carries persisted agent fields, the
+// /audit/events projection MUST surface them under
+// `unmapped.iam_jit.agent.{name, session_id, detected_from}` so the
+// cross-bouncer `iam-jit audit query --filter agent.session_id=X`
+// returns dbounce events. Pre-#320 the projection routed through
+// FromDecisionRow with an empty Agent, which made
+// `unmapped.iam_jit.agent` an empty object on every row and the
+// filter returned zero events.
+func TestAuditEvents_320_ThreadsAgentBlockFromStore(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	const wantSession = "01968d6a-9c12-7a4b-b6f8-3b8e4c0d1aef"
+	const wantName = "claude-code"
+	const wantDetectedFrom = "pg_application_name"
+	if _, err := st.RecordDecision(store.DecisionRow{
+		At:              time.Now().UTC(),
+		Dialect:         "postgres",
+		Statement:       "SELECT 1",
+		StatementType:   "SELECT",
+		DecisionVerdict: "ALLOW",
+		ModeAtDecision:  "cooperative",
+		AgentName:       wantName,
+		AgentSessionID:  wantSession,
+		DetectedFrom:    wantDetectedFrom,
+	}); err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	srv := httptest.NewServer(auditEventsHandler(st, ""))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "?limit=10")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("got %d events; want 1 (body=%s)", len(lines), string(body))
+	}
+	var ev map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &ev); err != nil {
+		t.Fatalf("event JSON parse: %v", err)
+	}
+	unmapped, _ := ev["unmapped"].(map[string]any)
+	iamJIT, _ := unmapped["iam_jit"].(map[string]any)
+	agent, _ := iamJIT["agent"].(map[string]any)
+	if agent == nil {
+		t.Fatalf("agent block missing; event=%v", ev)
+	}
+	if got, _ := agent["name"].(string); got != wantName {
+		t.Errorf("agent.name = %q; want %q", got, wantName)
+	}
+	if got, _ := agent["session_id"].(string); got != wantSession {
+		t.Errorf("agent.session_id = %q; want %q", got, wantSession)
+	}
+	if got, _ := agent["detected_from"].(string); got != wantDetectedFrom {
+		t.Errorf("agent.detected_from = %q; want %q", got, wantDetectedFrom)
+	}
+}
+
+// TestAuditEvents_320_FilterByAgentSessionIDMatches verifies the
+// cross-bouncer query-by-session filter (`agent.session_id=X` in long
+// form) matches dbounce rows when the persisted session_id matches.
+// The headline §A18 SOC-analyst workflow.
+func TestAuditEvents_320_FilterByAgentSessionIDMatches(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	const wantSession = "01968d6a-9c12-7a4b-b6f8-3b8e4c0d1aef"
+	if _, err := st.RecordDecision(store.DecisionRow{
+		At:              time.Now().UTC(),
+		Dialect:         "postgres",
+		Statement:       "SELECT 1",
+		StatementType:   "SELECT",
+		DecisionVerdict: "ALLOW",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "claude-code",
+		AgentSessionID:  wantSession,
+		DetectedFrom:    "pg_application_name",
+	}); err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	// Add a second row with a DIFFERENT session id so the filter has
+	// something to discriminate against.
+	if _, err := st.RecordDecision(store.DecisionRow{
+		At:              time.Now().UTC(),
+		Dialect:         "postgres",
+		Statement:       "SELECT 2",
+		StatementType:   "SELECT",
+		DecisionVerdict: "ALLOW",
+		ModeAtDecision:  "cooperative",
+		AgentName:       "psql",
+		AgentSessionID:  "01968d6a-aaaa-7a4b-b6f8-3b8e4c0d1aef",
+		DetectedFrom:    "pg_application_name",
+	}); err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	srv := httptest.NewServer(auditEventsHandler(st, ""))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	q := u.Query()
+	q.Set("limit", "10")
+	q.Add("filter", fmt.Sprintf("unmapped.iam_jit.agent.session_id=%s", wantSession))
+	u.RawQuery = q.Encode()
+	resp, err := http.Get(u.String())
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("filter matched %d events; want 1 (body=%s)", len(lines), string(body))
+	}
+}

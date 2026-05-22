@@ -93,7 +93,20 @@ import (
 //	    through the SAME Exporter + RuleEngine the in-process emit
 //	    sites use so a SIEM consumer sees ONE consistent stream
 //	    regardless of which process originated the event.
-const SchemaVersion = 6
+//	7 — #320 / §A18 cross-bouncer /audit/events parity: decisions
+//	    table gains `agent_name`, `agent_session_id`, `detected_from`
+//	    TEXT columns so the HTTP GET /audit/events endpoint's
+//	    SQLite-backed projection threads the same
+//	    `unmapped.iam_jit.agent.{name, session_id, detected_from}`
+//	    block the JSONL log + webhook pipeline emits. Pre-#320 rows
+//	    leave the columns NULL (read path surfaces the no-agent
+//	    block via the empty Agent fall-through in
+//	    FromDecisionRowWithAgent — same shape ibounce + kbounce +
+//	    gbounce use). Mirrors kbounce's v8 + the gbounce + ibounce
+//	    columns per [[cross-product-agent-parity]]. Per
+//	    [[creates-never-mutates]]: no backfill, no row mutation, no
+//	    fake identity for retroactive rows.
+const SchemaVersion = 7
 
 // DefaultDBPath returns the path the store opens when no explicit path
 // is supplied. Honors DBOUNCE_DB for tests and CI sandboxes that want
@@ -263,7 +276,10 @@ func (s *Store) migrate() error {
 			forwarded INTEGER NOT NULL DEFAULT 0,
 			upstream_status TEXT NOT NULL DEFAULT '',
 			upstream_response_summary TEXT NOT NULL DEFAULT '',
-			statement_redacted INTEGER NOT NULL DEFAULT 0
+			statement_redacted INTEGER NOT NULL DEFAULT 0,
+			agent_name TEXT,
+			agent_session_id TEXT,
+			detected_from TEXT NOT NULL DEFAULT 'unknown'
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_decisions_at ON decisions(at)`,
 		`CREATE INDEX IF NOT EXISTS idx_decisions_verdict ON decisions(decision_verdict)`,
@@ -454,6 +470,33 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// v7 additive migration (#320 / §A18 — close the /audit/events
+	// wire-shape parity gap): persist the agent name + per-connection
+	// session id + detection source alongside every decision row.
+	// Today the in-process AgentRegistry maps session_id → agent
+	// fingerprint for the JSONL log + webhook pipeline; SQLite was
+	// the one channel that dropped them, which made the HTTP
+	// `/audit/events` endpoint (read-path of the cross-bouncer
+	// `iam-jit audit query` CLI) always emit an empty agent block.
+	// Three columns nullable: pre-#320 rows stay NULL and the read
+	// path (RecentDecisions → decisionRowsToAuditEvents →
+	// FromDecisionRowWithAgent) surfaces an empty Agent so the
+	// JSON marshaller drops the entire block — historical events
+	// keep their legacy shape. NO backfill — synthesizing a fake
+	// identity for retroactive rows would violate
+	// [[scorer-is-ground-truth]] (pretending to know is not honest).
+	// Mirrors kbounce v8 + gbounce + ibounce per
+	// [[cross-product-agent-parity]].
+	if err := s.addColumnIfMissing("decisions", "agent_name", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("decisions", "agent_session_id", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("decisions", "detected_from", "TEXT NOT NULL DEFAULT 'unknown'"); err != nil {
+		return err
+	}
+
 	// Stamp / bump schema_version.
 	var ver int
 	row := s.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`)
@@ -574,6 +617,27 @@ type DecisionRow struct {
 	// trust the SQL for replay when this is true — see RedactLiterals
 	// in the parser package.
 	StatementRedacted bool
+	// AgentName added in v7 (#320 / §A18 close the /audit/events
+	// wire-shape parity gap). The fingerprinted agent name at decision
+	// time ("claude-code", "psql", "pgcli", "unknown", ...). Empty
+	// when no detection source fired AND for rows recorded before
+	// #320 — both surface as the no-agent (block-omitted) projection
+	// when wrapped by FromDecisionRowWithAgent. Mirrors the column
+	// written by ibounce + kbounce + gbounce per
+	// [[cross-product-agent-parity]].
+	AgentName string
+	// AgentSessionID added in v7 (#320 / §A18). The per-connection
+	// session id bound at the PG StartupMessage / MySQL Handshake;
+	// empty when no agent declared itself (raw psql / pgcli run
+	// from a script).
+	AgentSessionID string
+	// DetectedFrom added in v7 (#320 / §A18). Names the signal that
+	// produced the AgentName + AgentSessionID values: one of
+	// "pg_application_name", "mysql_client_attrs", "mcp_clientinfo",
+	// "decide_flag", "unknown". Pre-#320 rows surface "unknown" via
+	// the schema-level DEFAULT. Empty string is treated as "unknown"
+	// on the read path so handler code never has to nil-check.
+	DetectedFrom string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -604,6 +668,14 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 	if len(upstreamSummary) > 256 {
 		upstreamSummary = upstreamSummary[:253] + "..."
 	}
+	// #320 / §A18: detected_from defaults to "unknown" so a row that
+	// was written before the agent-fingerprint code populated the
+	// field still satisfies the NOT NULL constraint + reads back as
+	// the canonical fall-through value.
+	detectedFrom := d.DetectedFrom
+	if detectedFrom == "" {
+		detectedFrom = "unknown"
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO decisions(
 			at, dialect, statement, statement_type,
@@ -616,8 +688,9 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			matched_rule_id, task_id, pause_id,
 			is_stream, stream_kind,
 			forwarded, upstream_status, upstream_response_summary,
-			statement_redacted
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			statement_redacted,
+			agent_name, agent_session_id, detected_from
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Dialect, d.Statement, d.StatementType,
 		tablesJSON, functionsJSON,
 		boolToInt(d.IsDML), boolToInt(d.IsDDL), boolToInt(d.HasMutatingNode), d.MutatingNodeType,
@@ -629,6 +702,7 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 		boolToInt(d.IsStream), d.StreamKind,
 		boolToInt(d.Forwarded), d.UpstreamStatus, upstreamSummary,
 		boolToInt(d.StatementRedacted),
+		nullableString(d.AgentName), nullableString(d.AgentSessionID), detectedFrom,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("dbounce: record decision: %w", err)
@@ -690,7 +764,9 @@ func (s *Store) RecentDecisionsAfterID(after int64, limit int) ([]DecisionRowWit
 		matched_rule_id, task_id, pause_id,
 		is_stream, stream_kind,
 		forwarded, upstream_status, upstream_response_summary,
-		statement_redacted
+		statement_redacted,
+		COALESCE(agent_name, ''), COALESCE(agent_session_id, ''),
+		COALESCE(detected_from, 'unknown')
 		FROM decisions
 		WHERE id > ?
 		ORDER BY id ASC
@@ -734,6 +810,7 @@ func (s *Store) RecentDecisionsAfterID(after int64, limit int) ([]DecisionRowWit
 			&isStream, &d.StreamKind,
 			&forwarded, &d.UpstreamStatus, &d.UpstreamResponseSummary,
 			&stmtRedacted,
+			&d.AgentName, &d.AgentSessionID, &d.DetectedFrom,
 		); err != nil {
 			return nil, fmt.Errorf("dbounce: decisions after id scan: %w", err)
 		}
@@ -811,7 +888,9 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		matched_rule_id, task_id, pause_id,
 		is_stream, stream_kind,
 		forwarded, upstream_status, upstream_response_summary,
-		statement_redacted
+		statement_redacted,
+		COALESCE(agent_name, ''), COALESCE(agent_session_id, ''),
+		COALESCE(detected_from, 'unknown')
 		FROM decisions
 		ORDER BY id DESC
 		LIMIT ?`, limit)
@@ -853,6 +932,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 			&isStream, &d.StreamKind,
 			&forwarded, &d.UpstreamStatus, &d.UpstreamResponseSummary,
 			&stmtRedacted,
+			&d.AgentName, &d.AgentSessionID, &d.DetectedFrom,
 		); err != nil {
 			return nil, fmt.Errorf("dbounce: recent decisions scan: %w", err)
 		}
