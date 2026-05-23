@@ -361,6 +361,14 @@ a shipped binary, not a library other Go programs link against.
 
 ---
 
+## License
+
+Apache-2.0 — see [LICENSE](./LICENSE).
+
+Copyright 2026 trsreagan3.
+
+---
+
 ## Position in the Bounce suite
 
 `dbounce` is the third product in the Bounce suite — the SQL-shaped

@@ -34,6 +34,24 @@ sessions on one machine** with zero dropped audit events.
 
 ### Added
 
+#### #342 / §A23 — Formal Apache-2.0 LICENSE + NOTICE + README license attribution (2026-05-23)
+
+dbounce's `LICENSE` file had the canonical Apache-2.0 text but the
+boilerplate copyright line read `Copyright 2026 dbounce contributors`
+(placeholder from the initial repo scaffold); this slice replaces it
+with `Copyright 2026 trsreagan3` (founder direction) and adds a
+`NOTICE` file with per-product attribution (`dbounce — SQL wire-
+protocol bouncer (part of the iam-jit Bouncer suite)`). The README
+also gains a new `## License` section reading `Apache-2.0 — see
+[LICENSE](./LICENSE). Copyright 2026 trsreagan3.` Same change shipped
+in iam-roles + gbounce + kbouncer so the Bounce suite presents one
+coherent license posture per `[[cross-product-agent-parity]]`.
+Unblocks: Anthropic Cyber Verification Program application + iam-jit-
+vs-OneCLI competitive-matrix accuracy + pkg.go.dev license badge (Go
+tooling reads LICENSE directly — no go.mod change needed). Per-source-
+file SPDX-License-Identifier headers DEFERRED to v1.1 per
+`[[deliberate-feature-completion]]`.
+
 #### #324c — dynamic-deny core (loader + watcher + connection-refuse + mgmt endpoint)
 
 Implements dbounce's slice of the cross-product `~/.iam-jit/dynamic-denies.yaml`
