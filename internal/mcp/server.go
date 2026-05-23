@@ -39,6 +39,7 @@ import (
 
 	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/parser"
+	"github.com/trsreagan3/dbounce/internal/posture"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	"github.com/trsreagan3/dbounce/internal/rules"
@@ -401,8 +402,26 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolPromptsBulkAnswer(args)
 	case "list_audit_webhook_presets":
 		return s.toolListAuditWebhookPresets(args)
+	case "dbounce_posture":
+		return s.toolPosture(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+// toolPosture surfaces dbounce's local posture (running / mode /
+// profile / PGHOST wiring / MISCONFIG). Read-only; takes no
+// arguments. Mirrors `dbounce posture --json` CLI shape. #383 / §A42.
+func (s *Server) toolPosture(_ map[string]any) (map[string]any, error) {
+	block := posture.Capture()
+	bs, err := json.Marshal(block)
+	if err != nil {
+		return nil, fmt.Errorf("posture: marshal: %w", err)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(bs, &out); err != nil {
+		return nil, fmt.Errorf("posture: unmarshal: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Server) requireStore() error {

@@ -292,5 +292,20 @@ func ToolDescriptors() []map[string]any {
 				"properties": map[string]any{},
 			},
 		},
+		{
+			"name": "dbounce_posture",
+			"description": "Return dbounce's local posture: running / port / " +
+				"mgmt port / mode / active-profile / PGHOST wiring / MISCONFIG " +
+				"flag. Read-only single-bouncer view; for the cross-product " +
+				"view use `iam_jit_posture` from the iam-jit MCP server. Per " +
+				"[[cross-product-agent-parity]] every Bounce ships this same " +
+				"shape. Per [[ibounce-honest-positioning]] reports " +
+				"MISCONFIGURED rather than silently claiming intercept when " +
+				"env wiring + process state disagree.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
 	}
 }

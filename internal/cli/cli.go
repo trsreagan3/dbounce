@@ -226,6 +226,10 @@ func newRootCmd() *cobra.Command {
 	// generic User-Agent, kill-switch env var; see internal/cli/
 	// version_check.go for the full design.
 	root.AddCommand(newVersionCheckCmd())
+	// #383 / §A42 — `dbounce posture` per-bouncer posture surface.
+	// Cross-product parity per [[cross-product-agent-parity]]; for
+	// the cross-product roll-up use `iam-jit posture` from iam-roles.
+	root.AddCommand(newPostureCmd())
 	return root
 }
 
