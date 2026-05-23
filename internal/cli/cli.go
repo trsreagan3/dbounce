@@ -220,6 +220,12 @@ func newRootCmd() *cobra.Command {
 	// (ibounce / kbounce / gbounce); the cross-product runbook at
 	// iam-roles/docs/LOG-RETENTION.md applies to all.
 	root.AddCommand(newLogsCmd())
+	// #365 / §A34 — `dbounce version-check`. Opt-in GitHub-Releases
+	// poll; mirrors kbouncer + ibounce siblings per
+	// [[cross-product-agent-parity]]. Privacy posture: zero telemetry,
+	// generic User-Agent, kill-switch env var; see internal/cli/
+	// version_check.go for the full design.
+	root.AddCommand(newVersionCheckCmd())
 	return root
 }
 
