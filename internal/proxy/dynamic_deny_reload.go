@@ -45,6 +45,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 
@@ -67,7 +68,8 @@ func (s *Server) dynamicDenyReloadHandler(requireBearer string) http.HandlerFunc
 				return
 			}
 			tok, ok := parseBearerHeader(ah)
-			if !ok || tok != requireBearer {
+			// §A99 — constant-time compare; see audit_events.go.
+			if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(requireBearer)) != 1 {
 				writeDDReloadError(w, http.StatusForbidden, "bearer token rejected")
 				return
 			}
