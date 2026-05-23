@@ -9,8 +9,11 @@
 //
 // Per the [[security-team-audit-export]] memo:
 //
-//   - Enterprise-tier feature; license-gated at CLI parse time (see
-//     internal/cli/cli.go --audit-webhook-url validation).
+//   - Ships in the v1.0 free + open-source release per
+//     project_oss_only_launch_decision.md (license-file plumbing in
+//     internal/cli/cli.go --audit-webhook-url validation is retained
+//     for any future paid tier but does NOT gate this transport at
+//     v1.0).
 //   - SSRF gate REUSES the existing internal/upstream MED-D8-06
 //     closure (upstream.GuardInternalHost with GuardKindWebhook). Same
 //     CIDR + .internal/.local-suffix table; same DNS-rebind resistance;
@@ -23,10 +26,10 @@
 //     downstream consumer sees the gap rather than silently losing
 //     visibility.
 //
-// Per [[ibounce-honest-positioning]]: even Enterprise webhook delivery
-// is OPERATOR VISIBILITY, not adversary defense. A compromised proxy
-// process can withhold or fabricate events; the audit log is the
-// post-hoc-review tool, not a real-time trust anchor.
+// Per [[ibounce-honest-positioning]]: webhook delivery is OPERATOR
+// VISIBILITY, not adversary defense. A compromised proxy process can
+// withhold or fabricate events; the audit log is the post-hoc-review
+// tool, not a real-time trust anchor.
 //
 // Per [[no-hosted-saas]]: iam-jit-the-company NEVER hosts the webhook
 // endpoint. The operator's --audit-webhook-url is THEIR endpoint

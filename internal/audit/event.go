@@ -11,8 +11,12 @@
 //
 // Slice 1 ships TWO transports built on this Event schema:
 //
-//	JSONL log file  — internal/audit/log.go        — FREE tier
-//	HTTPS webhook   — internal/audit/webhook.go    — Enterprise (license-gated)
+//	JSONL log file  — internal/audit/log.go        — v1.0 free + OSS
+//	HTTPS webhook   — internal/audit/webhook.go    — v1.0 free + OSS
+//
+// Per project_oss_only_launch_decision.md (2026-05-23): both transports
+// ship in the v1.0 free + open-source release. License-file plumbing
+// (#235) is retained in the CLI but does NOT gate features at v1.0.
 //
 // Slice 2 (alerting rules) layers SECURITY_ALERT events on the SAME
 // transports + the SAME OCSF schema; per the memo, Slice 2 events use

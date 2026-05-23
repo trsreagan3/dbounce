@@ -3,7 +3,20 @@
 All notable changes to `dbounce` get recorded here. Versioning follows
 semver from v1.0.0 onward.
 
-## Unreleased
+## Unreleased — v1.0 launch prep (2026-05)
+
+### Changed
+
+- **Tier rescope: v1.0 ships fully free + open source** (2026-05-23) —
+  Per `[[oss-only-launch-decision]]`: all features previously labeled
+  ENTERPRISE tier in --help text + audit-package docstrings (the
+  `--audit-webhook-url`, `--alert-routes` flags + the
+  `internal/audit/webhook.go` + `internal/audit/event.go` package
+  headers) now framed as v1.0 free + open-source ships per
+  cross-product alignment with iam-roles README. License-file plumbing
+  (#235) retained in code path but does NOT gate features at v1.0;
+  refactor to remove the gate is queued for a follow-up. Mirrors the
+  iam-roles + kbouncer changes in the same sweep.
 
 ### Docs
 

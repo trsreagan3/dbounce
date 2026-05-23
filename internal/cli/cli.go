@@ -1578,10 +1578,10 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"#461 — disk-usage percent at which the bouncer surfaces an emergency "+
 			"status. Default 98.")
 	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
-		"HTTPS webhook URL to POST audit-export events to. ENTERPRISE tier "+
-			"(license-gated; #235 will land the license-file plumbing — "+
-			"until then the flag fails at parse with the FREE-tier "+
-			"JSONL fallback documented). Bounded queue + exponential "+
+		"HTTPS webhook URL to POST audit-export events to. v1.0 free + "+
+			"open-source release per project_oss_only_launch_decision.md "+
+			"(license-file plumbing #235 retained for any future paid tier "+
+			"but does NOT gate this flag at v1.0). Bounded queue + exponential "+
 			"backoff retry + drop-on-overflow with synthetic AUDIT_DROPPED "+
 			"events. SSRF gate REUSES the --upstream SSRF closure (MED-D8-"+
 			"06) — internal-range hosts rejected unless "+
@@ -1638,8 +1638,11 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"tables override this per-deployment. Sentinel custom-log tables "+
 			"have a max name length of 100 chars + must match [A-Za-z0-9_]+.")
 	cmd.Flags().StringVar(&auditAlertRoutesPath, "alert-routes", "",
-		"#280 (ENTERPRISE tier — license-gated) — YAML file describing "+
-			"per-org notification routing. When set, the multi-destination "+
+		"#280 — YAML file describing "+
+			"per-org notification routing. Ships in the v1.0 free + open-source "+
+				"release (license-file plumbing #235 retained for any future "+
+				"paid tier per project_oss_only_launch_decision.md but does "+
+				"NOT gate this flag at v1.0). When set, the multi-destination "+
 			"routing engine activates: each event is matched against the "+
 			"configured routes' match blocks + dispatched to the route's "+
 			"destinations (webhook / pagerduty / slack). When unset, the "+
