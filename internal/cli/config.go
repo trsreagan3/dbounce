@@ -244,6 +244,12 @@ type ConfigProfile struct {
 	Exceptions           []string                   `json:"exceptions,omitempty"`
 	AllowRules           []ConfigProfileAllowRule   `json:"allow_rules,omitempty"`
 	Dialects             []string                   `json:"dialects,omitempty"`
+	// §A40 — profile-level connection-scope allowlists. Empty = no
+	// restriction (preserves backward-compat for profiles authored
+	// pre-§A40). Round-tripped on config import/export so an operator
+	// can edit the JSON bundle + re-apply.
+	OnlyHosts     []string `json:"only_hosts,omitempty"`
+	OnlyDatabases []string `json:"only_databases,omitempty"`
 }
 
 // ConfigProfileAllowRule mirrors profile.ProfileAllowRule's fields the
@@ -903,6 +909,9 @@ func profileToConfig(p *profile.Profile) ConfigProfile {
 		ExemptActions:        appendStringsCopy(nil, p.ExemptActions),
 		Exceptions:           appendStringsCopy(nil, p.Exceptions),
 		Dialects:             inferDialectsFromProfileNames([]string{p.Name}),
+		// §A40.
+		OnlyHosts:     appendStringsCopy(nil, p.OnlyHosts),
+		OnlyDatabases: appendStringsCopy(nil, p.OnlyDatabases),
 	}
 	if len(p.KeywordTargets) > 0 {
 		targets := make([]string, 0, len(p.KeywordTargets))
@@ -1370,6 +1379,9 @@ func configToProfile(cp ConfigProfile) *profile.Profile {
 		ExemptResources:      appendStringsCopy(nil, cp.ExemptResources),
 		ExemptActions:        appendStringsCopy(nil, cp.ExemptActions),
 		Exceptions:           appendStringsCopy(nil, cp.Exceptions),
+		// §A40.
+		OnlyHosts:     appendStringsCopy(nil, cp.OnlyHosts),
+		OnlyDatabases: appendStringsCopy(nil, cp.OnlyDatabases),
 	}
 	if len(cp.KeywordTargets) > 0 {
 		targets := make([]profile.KeywordTarget, 0, len(cp.KeywordTargets))

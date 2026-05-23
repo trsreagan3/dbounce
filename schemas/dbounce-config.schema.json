@@ -131,6 +131,16 @@
               "exempt_resources": {"type": "array", "items": {"type": "string"}},
               "exempt_actions": {"type": "array", "items": {"type": "string"}},
               "exceptions": {"type": "array", "items": {"type": "string"}},
+              "only_hosts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "§A40 hostname-glob allowlist evaluated at connection establishment. Empty = no restriction. Non-empty = the upstream hostname must match at least one glob or the connection is REFUSED with deny_reason=profile_only_hosts."
+              },
+              "only_databases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "§A40 database-name-glob allowlist evaluated at connection establishment. Empty = no restriction. Non-empty = the inbound database name must match at least one glob or the connection is REFUSED with deny_reason=profile_only_databases."
+              },
               "allow_rules": {
                 "type": "array",
                 "items": {

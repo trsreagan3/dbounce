@@ -333,6 +333,48 @@ type Profile struct {
 	// same name.
 	Source string `yaml:"source,omitempty"`
 
+	// OnlyHosts is a hostname-glob allowlist evaluated at CONNECTION
+	// ESTABLISHMENT. Empty = no restriction (preserves backward compat
+	// for profiles authored before §A40). Non-empty = the inbound
+	// upstream host (the hostname portion of the proxy's `--upstream`
+	// URL, NOT the client's listener address) must match at least one
+	// glob or the connection is REFUSED at PG StartupMessage / MySQL
+	// HandshakeResponse time with `deny_reason="profile_only_hosts"`.
+	//
+	// Glob shape: AWS-IAM-style `*` (any chars) + `?` (single char).
+	// Case-insensitive — hostnames are case-insensitive per RFC 1035.
+	//
+	// Per [[multi-account-region-cluster-use-case]] §A40 LAUNCH-BLOCKER:
+	// closes the multi-host workflow where the same `staging-only`
+	// profile must DENY when accidentally used against a prod-shaped
+	// upstream. The proxy instance config IS the scope today; OnlyHosts
+	// adds a profile-level scope FLOOR that travels with the profile
+	// regardless of which `--upstream` flag the operator passed.
+	//
+	// Per [[v1-scope-bar]]: no `OnlyAccounts` (dbounce has no AWS
+	// account concept), no `OnlyRegions` (no region awareness for SQL).
+	// Just host + database — the two scopes that exist for a SQL
+	// connection.
+	OnlyHosts []string `yaml:"only_hosts,omitempty"`
+
+	// OnlyDatabases is a database-name-glob allowlist evaluated at
+	// CONNECTION ESTABLISHMENT. Empty = no restriction. Non-empty = the
+	// inbound database name (parsed from PG StartupMessage `database`
+	// param OR — when absent — from the upstream URL path) must match
+	// at least one glob or the connection is REFUSED with
+	// `deny_reason="profile_only_databases"`.
+	//
+	// MySQL caveat: in v1.0 we extract the database name from the
+	// upstream URL path only (the MySQL HandshakeResponse's optional
+	// schema field requires deeper handshake parsing per
+	// [[v1-scope-bar]] — deferred). PG covers both startup-param +
+	// upstream-URL fallback.
+	//
+	// Glob shape: AWS-IAM-style `*` + `?`. Case-insensitive — most SQL
+	// engines fold database identifiers in some way; the safe-by-
+	// default match treats them as case-insensitive.
+	OnlyDatabases []string `yaml:"only_databases,omitempty"`
+
 	// compiledKeywords holds pre-compiled regexes for word_boundary
 	// mode. Built lazily on first Evaluate via compileOnce; safe for
 	// concurrent callers thereafter.
@@ -621,6 +663,17 @@ const SourceProfile = "profile"
 // allow_baseline classifier or allow_rules layer fires.
 const SourceProfileAllow = "profile.allow"
 
+// DenyReasonOnlyHosts is the deny_reason tag emitted on the OCSF audit
+// event when a connection is refused because the upstream host does
+// not match the profile's OnlyHosts allowlist. Stable string — SIEM
+// filters key on it. Per §A40.
+const DenyReasonOnlyHosts = "profile_only_hosts"
+
+// DenyReasonOnlyDatabases is the deny_reason tag emitted when a
+// connection is refused because the database name does not match the
+// profile's OnlyDatabases allowlist. Per §A40.
+const DenyReasonOnlyDatabases = "profile_only_databases"
+
 // FullUserProfileName is the reserved profile name that disables
 // profile rules entirely. Always present in Profiles.All.
 const FullUserProfileName = "full-user"
@@ -890,6 +943,191 @@ func (p *Profile) Evaluate(ps *ParsedStatement) Verdict {
 
 	// No profile rule fired; defer to the next layer.
 	return Verdict{}
+}
+
+// ConnectionVerdict is what EvaluateConnection returns. When Denied
+// is true, the proxy MUST refuse the inbound connection at the wire-
+// protocol handshake (PG: ErrorResponse with SQLSTATE 42501 + close;
+// MySQL: ErrPacket access-denied + close). DenyReason is one of the
+// DenyReason* constants — the SIEM keys filter rules on this value.
+type ConnectionVerdict struct {
+	// Denied is true when the profile blocks the connection.
+	Denied bool
+	// Reason is a one-line audit-log-ready description ("upstream host
+	// 'prod-db.production.internal' does not match profile %q
+	// only_hosts entries [*.staging.internal]").
+	Reason string
+	// DenyReason is the stable string SIEM consumers filter on
+	// (DenyReasonOnlyHosts / DenyReasonOnlyDatabases).
+	DenyReason string
+	// ProfileName is the name of the profile that fired.
+	ProfileName string
+}
+
+// EvaluateConnectionHost runs ONLY the OnlyHosts portion of the
+// connection-scope evaluation. Used by the upstream-forwarding path's
+// pre-dial gate, where we know the upstream host but haven't yet
+// parsed the StartupMessage `database` param. Returns Denied=true
+// when OnlyHosts is non-empty AND host doesn't match; Denied=false
+// when OnlyHosts is empty (defer) or matches.
+//
+// Per §A40: the host pre-gate is the load-bearing safety —
+// refusing BEFORE the upstream dial avoids burning a TCP connection
+// + reveals the misconfigured-host case at the operator's terminal
+// without the upstream side seeing a single byte.
+func (p *Profile) EvaluateConnectionHost(host string) ConnectionVerdict {
+	if p == nil || p.Name == FullUserProfileName {
+		return ConnectionVerdict{}
+	}
+	if len(p.OnlyHosts) == 0 {
+		return ConnectionVerdict{}
+	}
+	if !matchAnyHostGlob(host, p.OnlyHosts) {
+		return ConnectionVerdict{
+			Denied: true,
+			Reason: fmt.Sprintf(
+				"profile %q: upstream host %q does not match only_hosts %v",
+				p.Name, host, p.OnlyHosts),
+			DenyReason:  DenyReasonOnlyHosts,
+			ProfileName: p.Name,
+		}
+	}
+	return ConnectionVerdict{}
+}
+
+// EvaluateConnectionDatabase runs ONLY the OnlyDatabases portion of
+// the connection-scope evaluation. Used by the upstream-forwarding
+// path's post-startup-body gate, where the database name is now
+// known. Returns Denied=true when OnlyDatabases is non-empty AND
+// database doesn't match; Denied=false when empty (defer) or matches.
+func (p *Profile) EvaluateConnectionDatabase(database string) ConnectionVerdict {
+	if p == nil || p.Name == FullUserProfileName {
+		return ConnectionVerdict{}
+	}
+	if len(p.OnlyDatabases) == 0 {
+		return ConnectionVerdict{}
+	}
+	if !matchAnyDatabaseGlob(database, p.OnlyDatabases) {
+		return ConnectionVerdict{
+			Denied: true,
+			Reason: fmt.Sprintf(
+				"profile %q: database %q does not match only_databases %v",
+				p.Name, database, p.OnlyDatabases),
+			DenyReason:  DenyReasonOnlyDatabases,
+			ProfileName: p.Name,
+		}
+	}
+	return ConnectionVerdict{}
+}
+
+// EvaluateConnection runs the profile's connection-level scope rules
+// (OnlyHosts + OnlyDatabases) against the resolved upstream host +
+// database name. Returns Denied=true when the connection violates a
+// scope; Denied=false when the profile abstains (empty allowlists) OR
+// the connection matches at least one glob in every non-empty list.
+//
+// Inputs:
+//
+//   - host: the upstream hostname (NOT the listener host). PORT MUST
+//     BE STRIPPED before calling — the OnlyHosts globs match against
+//     the bare hostname per RFC 1035 case-insensitivity.
+//   - database: the resolved database name. For PG this is the
+//     StartupMessage `database` param (falling back to the upstream
+//     URL path when the client omitted it). For MySQL this is the
+//     upstream URL path only in v1.0.
+//
+// A nil receiver OR a full-user profile OR a profile with both
+// allowlists empty returns Denied=false (abstain) immediately — the
+// fast path covers the common no-scope case without allocating.
+//
+// Per §A40: enforcement at connection-establishment is load-bearing.
+// A profile-allowed connection-handshake that then per-statement-denies
+// a host violation defeats the operator intent ("the agent should never
+// have touched this prod host"). This function is the gate.
+//
+// Per [[creates-never-mutates]]: pure function, no I/O. Caller owns
+// the audit-event emit + connection close.
+func (p *Profile) EvaluateConnection(host, database string) ConnectionVerdict {
+	if p == nil || p.Name == FullUserProfileName {
+		return ConnectionVerdict{}
+	}
+	if len(p.OnlyHosts) == 0 && len(p.OnlyDatabases) == 0 {
+		return ConnectionVerdict{}
+	}
+	if len(p.OnlyHosts) > 0 {
+		if !matchAnyHostGlob(host, p.OnlyHosts) {
+			return ConnectionVerdict{
+				Denied: true,
+				Reason: fmt.Sprintf(
+					"profile %q: upstream host %q does not match only_hosts %v",
+					p.Name, host, p.OnlyHosts),
+				DenyReason:  DenyReasonOnlyHosts,
+				ProfileName: p.Name,
+			}
+		}
+	}
+	if len(p.OnlyDatabases) > 0 {
+		if !matchAnyDatabaseGlob(database, p.OnlyDatabases) {
+			return ConnectionVerdict{
+				Denied: true,
+				Reason: fmt.Sprintf(
+					"profile %q: database %q does not match only_databases %v",
+					p.Name, database, p.OnlyDatabases),
+				DenyReason:  DenyReasonOnlyDatabases,
+				ProfileName: p.Name,
+			}
+		}
+	}
+	return ConnectionVerdict{}
+}
+
+// matchAnyHostGlob returns true when the host matches at least one
+// glob in the list. Empty host with a non-empty list never matches
+// (an unparseable startup that yields no host should be REFUSED, not
+// silently allowed — the safer fail-closed shape for §A40).
+func matchAnyHostGlob(host string, globs []string) bool {
+	if host == "" {
+		return false
+	}
+	lh := strings.ToLower(strings.TrimSpace(host))
+	for _, g := range globs {
+		lg := strings.ToLower(strings.TrimSpace(g))
+		if lg == "" {
+			continue
+		}
+		re, err := compileGlob(lg)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(lh) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchAnyDatabaseGlob mirrors matchAnyHostGlob for database names.
+// Kept distinct so a future v1.1 can tune case-folding rules per
+// dialect without touching the host path.
+func matchAnyDatabaseGlob(database string, globs []string) bool {
+	if database == "" {
+		return false
+	}
+	ld := strings.ToLower(strings.TrimSpace(database))
+	for _, g := range globs {
+		lg := strings.ToLower(strings.TrimSpace(g))
+		if lg == "" {
+			continue
+		}
+		re, err := compileGlob(lg)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(ld) {
+			return true
+		}
+	}
+	return false
 }
 
 // decideAllowBaseline runs the allow_baseline classifier + the

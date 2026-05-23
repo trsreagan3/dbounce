@@ -508,6 +508,13 @@ type Server struct {
 	totalDynamicDenyConnectionsRefused atomic.Int64
 	totalDynamicDenyReloads            atomic.Int64
 	totalDynamicDenyParseErrors        atomic.Int64
+
+	// §A40 — counter surfaced via /healthz so an operator monitor sees
+	// profile-scope refusals (an agent repeatedly trying a misconfigured
+	// upstream against a scoped profile) without grepping the audit log.
+	// Bumped from Forwarder.refuseIfProfileScopeViolation +
+	// observation-only profile-scope refuse paths.
+	totalProfileScopeRefused atomic.Int64
 }
 
 // recordRejectedAgentTag bumps the per-Server rejection counter + logs
@@ -906,6 +913,105 @@ func (s *Server) emitSessionEnded(sessionID string) {
 	}
 }
 
+// refuseObservationProfileScopeViolation is the observation-only
+// counterpart to Forwarder.refuseIfProfileScopeViolation. The proxy
+// has no upstream configured but the operator may still want OnlyHosts
+// / OnlyDatabases enforcement (e.g. running `dbounce run --profile
+// staging-only` without an upstream as a dry-run gate). Returns true
+// when the connection was refused — caller must close + return.
+//
+// Database resolution: PG StartupMessage `database` param only (no
+// upstream URL to fall back on). Host resolution: empty (no upstream)
+// — when OnlyHosts is set on observation-only mode we still ENFORCE
+// (an empty host never matches a non-empty allowlist, per the
+// fail-closed shape in matchAnyHostGlob), surfacing "you scoped the
+// profile to hosts but didn't configure an upstream" as a refusal +
+// audit signal. Loud failure beats silent permit.
+func (s *Server) refuseObservationProfileScopeViolation(conn net.Conn, startupBody []byte) bool {
+	activeProfile, _ := s.loadActiveProfile()
+	if activeProfile == nil || activeProfile.Name == profile.FullUserProfileName {
+		return false
+	}
+	if len(activeProfile.OnlyHosts) == 0 && len(activeProfile.OnlyDatabases) == 0 {
+		return false
+	}
+	host := ""
+	if s.cfg.Upstream != nil {
+		host = s.cfg.Upstream.HostnameOnly()
+	}
+	database := ""
+	params := audit.ParsePGStartupParams(startupBody)
+	if d := strings.TrimSpace(params["database"]); d != "" {
+		database = d
+	} else if s.cfg.Upstream != nil {
+		database = s.cfg.Upstream.Database()
+	}
+	// Host check first (matches forwarder ordering for parity).
+	verdict := activeProfile.EvaluateConnectionHost(host)
+	if !verdict.Denied {
+		verdict = activeProfile.EvaluateConnectionDatabase(database)
+	}
+	if !verdict.Denied {
+		return false
+	}
+	s.totalProfileScopeRefused.Add(1)
+	msg := fmt.Sprintf("dbounce: %s", verdict.Reason)
+	if werr := writePGScopeRefusalErrorResponse(conn, verdict.DenyReason, msg); werr != nil {
+		log.Debug().Err(werr).
+			Str("remote", conn.RemoteAddr().String()).
+			Str("deny_reason", verdict.DenyReason).
+			Msg("dbounce: write profile-scope refusal (observation-only) failed")
+	}
+	s.emitProfileScopeRefused(audit.ProfileScopeRefusedInfo{
+		ProfileName: verdict.ProfileName,
+		DenyReason:  verdict.DenyReason,
+		Reason:      verdict.Reason,
+		Host:        host,
+		Database:    database,
+		RemoteAddr:  conn.RemoteAddr().String(),
+	})
+	log.Warn().
+		Str("remote", conn.RemoteAddr().String()).
+		Str("profile", verdict.ProfileName).
+		Str("deny_reason", verdict.DenyReason).
+		Str("upstream_host", host).
+		Str("database", database).
+		Msg("dbounce: refused new connection by profile scope (observation-only)")
+	return true
+}
+
+// emitProfileScopeRefused fires the §A40 profile-scope-refused
+// synthetic on the wired Exporter + RuleEngine. Called from the PG
+// forwarder + observation-only PG path when the active profile's
+// OnlyHosts / OnlyDatabases scope refused the inbound connection.
+//
+// Nil-safe + best-effort identical to emitProfileInstalled. The
+// RuleEngine.ObserveDecision feed lets a future alert rule key on
+// deny_source="profile_scope" without re-routing the synthetic.
+func (s *Server) emitProfileScopeRefused(info audit.ProfileScopeRefusedInfo) {
+	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
+	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
+	if !exporterOn && !alertsOn {
+		return
+	}
+	evt := audit.NewProfileScopeRefusedEvent(s.listenerAddr(), info)
+	if exporterOn {
+		_ = s.auditExporter.Emit(context.Background(), evt)
+	}
+	if alertsOn {
+		s.alertEngine.ObserveDecision(context.Background(), evt)
+	}
+}
+
+// ProfileScopeRefusedCount returns the §A40 counter for /healthz +
+// tests. Read-only.
+func (s *Server) ProfileScopeRefusedCount() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.totalProfileScopeRefused.Load()
+}
+
 // listenerAddr returns the "host:port" of the proxy wire listener
 // for the OCSF src_endpoint projection. Reads directly from Config so
 // the per-decision path doesn't allocate a stats struct.
@@ -1227,6 +1333,65 @@ func writePGRefusalErrorResponse(conn net.Conn, ruleID, reason string) error {
 	return nil
 }
 
+// writePGScopeRefusalPreambleErrorResponse is the §A40 variant of
+// writePGRefusalErrorResponse. Mirrors the #324c shape (consumes
+// the SSLRequest preamble + drops startup body bytes) but produces
+// an operator-facing message that honestly names the profile-scope
+// path rather than mis-labeling as "dynamic-deny rule." Used by
+// the upstream-forwarding host pre-gate where the StartupMessage
+// has NOT yet been read.
+func writePGScopeRefusalPreambleErrorResponse(conn net.Conn, profileName, denyReason, reason string) error {
+	hdr := make([]byte, 8)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return err
+	}
+	magic := binary.BigEndian.Uint32(hdr[4:8])
+	if magic == 80877103 {
+		if _, err := conn.Write([]byte{'N'}); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return err
+		}
+	}
+	length := binary.BigEndian.Uint32(hdr[0:4])
+	if length >= 8 && length < 1<<20 {
+		body := make([]byte, length-8)
+		_, _ = io.ReadFull(conn, body)
+	}
+	msg := fmt.Sprintf("dbounce: profile %q refused connection: %s",
+		profileName, reason)
+	var b []byte
+	b = append(b, 'S')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'V')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'C')
+	b = append(b, []byte("42501")...)
+	b = append(b, 0)
+	b = append(b, 'M')
+	b = append(b, []byte(msg)...)
+	b = append(b, 0)
+	// Detail field carries the stable deny_reason constant for SIEM
+	// + scripted client mapping (psql surfaces D as a "DETAIL:" line).
+	b = append(b, 'D')
+	b = append(b, []byte(denyReason)...)
+	b = append(b, 0)
+	b = append(b, 0)
+	hdrBuf := make([]byte, 5)
+	hdrBuf[0] = 'E'
+	binary.BigEndian.PutUint32(hdrBuf[1:5], uint32(len(b)+4))
+	if _, err := conn.Write(hdrBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(b); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DynamicDenyCounters exposes the per-Server #324c counters for
 // /healthz + tests. Read-only.
 func (s *Server) DynamicDenyCounters() (refused, reloads, parseErrors int64) {
@@ -1325,6 +1490,23 @@ func (s *Server) serveConn(conn net.Conn) {
 		return
 	}
 	conn = working
+
+	// §A40 profile-scope gate (observation-only path). pgHandshakeWithPreamble
+	// has already replied with the synthetic AuthenticationOk +
+	// ReadyForQuery sequence so the client thinks it's authenticated; a
+	// scope refusal here writes an ErrorResponse + closes. Done after
+	// handshake (not before) because pgHandshakeWithPreamble owns the
+	// preamble-read state machine; emitting an early refuse would require
+	// duplicating that. Per [[ibounce-honest-positioning]]: the
+	// observation-only path is the dev-laptop default; refusing AFTER the
+	// synthetic-ack is still the operator's intended signal — the
+	// connection didn't reach any upstream because there is no upstream.
+	// Production deployments use the upstream-forwarding path
+	// (refuseIfProfileScopeViolation), which refuses BEFORE any upstream
+	// dial completes.
+	if s.refuseObservationProfileScopeViolation(conn, startupBody) {
+		return
+	}
 
 	// [[agent-identity-in-audit]] Feature 1+2: parse application_name
 	// from the StartupMessage body + mint a per-connection session id.
@@ -1973,6 +2155,8 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyConnectionsRefused  int64                     `json:"total_dynamic_deny_connections_refused"`
 		TotalDynamicDenyReloads             int64                     `json:"total_dynamic_deny_reloads"`
 		TotalDynamicDenyParseErrors         int64                     `json:"total_dynamic_deny_parse_errors"`
+		// §A40 — profile scope refusal counter.
+		TotalProfileScopeRefused int64 `json:"total_profile_scope_refused"`
 	}{
 		Status:                              "ok",
 		Mode:                                string(s.cfg.Mode),
@@ -1989,6 +2173,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyConnectionsRefused:  denyRefused,
 		TotalDynamicDenyReloads:             denyReloads,
 		TotalDynamicDenyParseErrors:         denyParseErrs,
+		TotalProfileScopeRefused:            s.ProfileScopeRefusedCount(),
 	}
 	if s.store != nil {
 		if n, err := s.store.CountDecisions(); err == nil {

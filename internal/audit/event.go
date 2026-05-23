@@ -1780,6 +1780,114 @@ func NewAdminActionEvent(host string, info AdminActionInfo) Event {
 	}
 }
 
+// ProfileScopeRefusedInfo carries the per-event payload for the §A40
+// dbounce-specific synthetic event emitted when a new connection is
+// refused because the active profile's OnlyHosts / OnlyDatabases scope
+// does not match the inbound upstream host or database name.
+//
+// ProfileName is the active profile's name (e.g. "staging-only").
+// DenyReason is one of the profile.DenyReason* stable constants
+// ("profile_only_hosts" / "profile_only_databases") — the SIEM keys
+// alert rules on this value. Reason is the human-readable explanation
+// surfaced in the PG ErrorResponse body + the audit row. Host +
+// Database are the resolved-at-handshake values for triage context.
+// RemoteAddr is the inbound TCP peer for the SrcEndpoint projection.
+//
+// Per [[multi-account-region-cluster-use-case]] §A40 LAUNCH-BLOCKER:
+// closes the "same `staging-only` profile accidentally used against
+// prod" workflow with a connection-establish gate + a SIEM signal.
+type ProfileScopeRefusedInfo struct {
+	ProfileName string
+	DenyReason  string
+	Reason      string
+	Host        string
+	Database    string
+	RemoteAddr  string
+}
+
+// NewProfileScopeRefusedEvent constructs the OCSF v1.1.0 class 6003
+// envelope for a connection refused by a profile-scope mismatch. Same
+// envelope shape as NewDynamicDenyConnectionRefusedEvent so SIEM
+// dashboards built against #324c trivially extend to §A40 (one
+// additional filter clause on `ext.deny_source="profile_scope"`).
+//
+// activity_id=6 (Connect) — connection-level decision.
+// severity Informational — the refusal is the operator's intended
+// outcome; alerts are for SIEM to derive over time (a frequent
+// profile_only_hosts refusal might mean an agent is misconfigured).
+// status_id=4 (Denied) — the dbounce-specific extension for policy
+// denials; mirrors the dynamic-deny class.
+//
+// The unmapped.iam_jit.ext block carries the load-bearing pivot keys:
+//
+//   - deny_source = "profile_scope" — distinguishes from "dynamic"
+//     (#324c) so a SIEM filter isolates profile-scope refusals.
+//   - deny_reason = "profile_only_hosts" / "profile_only_databases"
+//     — the stable constant the SIEM alert rule keys on.
+//   - profile_name = "<active profile>" — JOIN key against the audit
+//     row that recorded the profile install / activation.
+//   - profile_scope_reason = "<human reason>" — verbatim operator-
+//     facing message; mirrors dynamic_deny_reason_detail's role.
+//   - profile_scope_host / profile_scope_database = the resolved
+//     handshake values for triage context.
+//
+// Per [[creates-never-mutates]]: emitting this synthetic NEVER mutates
+// state; it's a pure audit projection.
+func NewProfileScopeRefusedEvent(host string, info ProfileScopeRefusedInfo) Event {
+	ext := map[string]any{
+		"deny_source":          "profile_scope",
+		"deny_reason":          info.DenyReason,
+		"profile_name":         info.ProfileName,
+		"profile_scope_reason": info.Reason,
+	}
+	if info.Host != "" {
+		ext["profile_scope_host"] = info.Host
+	}
+	if info.Database != "" {
+		ext["profile_scope_database"] = info.Database
+	}
+	detail := fmt.Sprintf(
+		"dbounce: refused new connection (profile=%q reason=%s host=%q database=%q)",
+		info.ProfileName, info.DenyReason, info.Host, info.Database)
+	const activityConnect = 6
+	return Event{
+		Metadata: Metadata{
+			Version: SchemaVersion,
+			Product: Product_{
+				Name:       Product,
+				VendorName: VendorName,
+				Version:    BuildVersion,
+			},
+		},
+		Time:         time.Now().UTC().UnixMilli(),
+		ClassUID:     ocsfClassUID,
+		ClassName:    ocsfClassName,
+		CategoryUID:  ocsfCategoryUID,
+		CategoryName: ocsfCategoryNm,
+		ActivityID:   activityConnect,
+		ActivityName: "connection_refused",
+		TypeUID:      ocsfTypeUIDBase + activityConnect,
+		TypeName:     typeNameFor(activityConnect),
+		SeverityID:   ocsfSeverityInformationalID,
+		Severity:     ocsfSeverityInformational,
+		StatusID:     StatusIDDenied,
+		Status:       "Denied",
+		StatusDetail: detail,
+		API: API{
+			Operation: "connection_refused",
+		},
+		SrcEndpoint: parseEndpoint(info.RemoteAddr),
+		DstEndpoint: parseEndpoint(host),
+		Unmapped: &Unmapped{
+			IAMJIT: IAMJITExt{
+				EventType: string(EventTypeSecurityAlert),
+				Enforced:  true,
+				Ext:       ext,
+			},
+		},
+	}
+}
+
 // DynamicDenyConnectionRefusedInfo carries the per-event payload for
 // the #324c dbounce-specific synthetic event emitted when a new
 // connection is refused by an active dynamic-deny rule. RuleID is the

@@ -50,7 +50,9 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/parser"
+	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
@@ -296,6 +298,20 @@ func (s *Server) serveConnWithUpstream(in net.Conn) {
 }
 
 func (f *Forwarder) run() error {
+	// §A40 HOST-scope pre-gate. The upstream URL host is known at
+	// startup; checking it BEFORE the dial avoids burning a TCP
+	// connection to a forbidden upstream just to refuse the inbound
+	// client. We still need to consume the inbound PG preamble +
+	// startup body so we can write a proper PG ErrorResponse — but the
+	// upstream is NEVER contacted. Per [[creates-never-mutates]]: no
+	// state mutation; the upstream side never sees a byte.
+	//
+	// DATABASE-scope happens AFTER the body parse (in
+	// handshakeAndAuth) because we need the StartupMessage `database`
+	// param.
+	if denied := f.refuseIfProfileHostScopeViolation(); denied {
+		return nil
+	}
 	if err := f.negotiateSSL(); err != nil {
 		return fmt.Errorf("ssl negotiation: %w", err)
 	}
@@ -419,6 +435,12 @@ func (f *Forwarder) dialUpstream() error {
 // Audit-cadence (b): grep this file for "password" + "scram" — no
 // named buffer holds an inbound password. The bytes traverse
 // io.ReadFull / Write only.
+//
+// §A40 connection-scope enforcement: BEFORE forwarding the
+// StartupMessage upstream, consult the active profile's OnlyHosts /
+// OnlyDatabases scope. A scope violation refuses the connection at
+// PG ErrorResponse + closes — the upstream is NEVER contacted,
+// matching the dynamic-deny invariant in refuseIfDynamicDenied.
 func (f *Forwarder) handshakeAndAuth() error {
 	length := binary.BigEndian.Uint32(f.startupBytes[0:4])
 	if length < 8 || length > 1<<20 {
@@ -435,6 +457,18 @@ func (f *Forwarder) handshakeAndAuth() error {
 	// bytes themselves still forward to the upstream verbatim below.
 	f.startupBody = body
 
+	// §A40 profile-scope gate. Runs AFTER the body is read (so we have
+	// the StartupMessage `database` param) but BEFORE forwarding the
+	// preamble + body upstream — a scope violation MUST NOT establish
+	// any upstream session at all. The dynamic-deny precedent
+	// (refuseIfDynamicDenied) deliberately runs even earlier (before
+	// reading the preamble) because dynamic-denies key on the upstream
+	// alone; profile-scope needs the parsed database name, so we gate
+	// here.
+	if denied, dverr := f.refuseIfProfileScopeViolation(body); denied {
+		return dverr
+	}
+
 	if _, err := f.out.Write(f.startupBytes); err != nil {
 		return fmt.Errorf("forward startup preamble: %w", err)
 	}
@@ -445,6 +479,176 @@ func (f *Forwarder) handshakeAndAuth() error {
 	}
 
 	return f.pumpAuthPhase()
+}
+
+// refuseIfProfileHostScopeViolation runs the §A40 HOST-scope pre-gate.
+// Called from run() BEFORE negotiateSSL so the upstream is NEVER
+// dialed when the host fails the OnlyHosts allowlist. The inbound
+// preamble + startup body are consumed by writePGRefusalErrorResponse
+// (mirrors the #324c dynamic-deny refusal shape) so a PG client gets
+// an actionable ErrorResponse rather than a silent TCP reset.
+//
+// Returns true when refused — caller MUST return from run() without
+// proceeding to negotiateSSL.
+//
+// Database-scope is NOT checked here (the body isn't parsed yet);
+// refuseIfProfileDatabaseScopeViolation handles that downstream
+// AFTER handshakeAndAuth has read the body.
+func (f *Forwarder) refuseIfProfileHostScopeViolation() bool {
+	activeProfile, _ := f.srv.loadActiveProfile()
+	if activeProfile == nil || activeProfile.Name == profile.FullUserProfileName {
+		return false
+	}
+	if len(activeProfile.OnlyHosts) == 0 {
+		// HOST-scope not configured; defer to the database-scope
+		// gate downstream.
+		return false
+	}
+	host := ""
+	if f.upstream != nil {
+		host = f.upstream.HostnameOnly()
+	}
+	verdict := activeProfile.EvaluateConnectionHost(host)
+	if !verdict.Denied {
+		return false
+	}
+	f.srv.totalProfileScopeRefused.Add(1)
+	// writePGScopeRefusalPreambleErrorResponse consumes the SSL
+	// preamble + startup header so the PG client moves past its
+	// handshake phase before reading the ErrorResponse. Produces a
+	// profile-scope-honest message (mirrors the #324c
+	// writePGRefusalErrorResponse shape but with §A40 labels).
+	if werr := writePGScopeRefusalPreambleErrorResponse(
+		f.in, verdict.ProfileName, verdict.DenyReason, verdict.Reason); werr != nil {
+		log.Debug().Err(werr).
+			Str("remote", f.in.RemoteAddr().String()).
+			Str("deny_reason", verdict.DenyReason).
+			Msg("dbounce: write profile-host-scope refusal failed (client disconnected?)")
+	}
+	f.srv.emitProfileScopeRefused(audit.ProfileScopeRefusedInfo{
+		ProfileName: verdict.ProfileName,
+		DenyReason:  verdict.DenyReason,
+		Reason:      verdict.Reason,
+		Host:        host,
+		Database:    "",
+		RemoteAddr:  f.in.RemoteAddr().String(),
+	})
+	log.Warn().
+		Str("remote", f.in.RemoteAddr().String()).
+		Str("profile", verdict.ProfileName).
+		Str("deny_reason", verdict.DenyReason).
+		Str("upstream_host", host).
+		Msg("dbounce: refused new connection by profile host-scope (pre-dial)")
+	return true
+}
+
+// refuseIfProfileScopeViolation runs the §A40 DATABASE-scope gate.
+// HOST-scope is enforced earlier in refuseIfProfileHostScopeViolation
+// (BEFORE the upstream dial). This function runs INSIDE
+// handshakeAndAuth after the StartupMessage body is parsed; we know
+// the database name now + we've already confirmed the host (or it
+// wasn't restricted). Returns (true, nil) when refused.
+//
+// Database resolution order:
+//  1. PG StartupMessage `database` param.
+//  2. Upstream URL path (when the client omitted the param — PG
+//     defaults to the user's name on the upstream side, but we
+//     compare against what dbounce KNOWS, which is the URL config).
+func (f *Forwarder) refuseIfProfileScopeViolation(body []byte) (bool, error) {
+	activeProfile, _ := f.srv.loadActiveProfile()
+	if activeProfile == nil || activeProfile.Name == profile.FullUserProfileName {
+		return false, nil
+	}
+	if len(activeProfile.OnlyDatabases) == 0 {
+		return false, nil
+	}
+	host := ""
+	if f.upstream != nil {
+		host = f.upstream.HostnameOnly()
+	}
+	database := resolvePGDatabase(body, f.upstream)
+	verdict := activeProfile.EvaluateConnectionDatabase(database)
+	if !verdict.Denied {
+		return false, nil
+	}
+	f.srv.totalProfileScopeRefused.Add(1)
+	msg := fmt.Sprintf("dbounce: %s", verdict.Reason)
+	if werr := writePGScopeRefusalErrorResponse(f.in, verdict.DenyReason, msg); werr != nil {
+		log.Debug().Err(werr).
+			Str("remote", f.in.RemoteAddr().String()).
+			Str("deny_reason", verdict.DenyReason).
+			Msg("dbounce: write profile-scope refusal ErrorResponse failed (client disconnected?)")
+	}
+	f.srv.emitProfileScopeRefused(audit.ProfileScopeRefusedInfo{
+		ProfileName: verdict.ProfileName,
+		DenyReason:  verdict.DenyReason,
+		Reason:      verdict.Reason,
+		Host:        host,
+		Database:    database,
+		RemoteAddr:  f.in.RemoteAddr().String(),
+	})
+	log.Warn().
+		Str("remote", f.in.RemoteAddr().String()).
+		Str("profile", verdict.ProfileName).
+		Str("deny_reason", verdict.DenyReason).
+		Str("upstream_host", host).
+		Str("database", database).
+		Msg("dbounce: refused new connection by profile database-scope")
+	return true, nil
+}
+
+// resolvePGDatabase pulls the database name from a PG StartupMessage
+// body, falling back to the upstream URL's path component when the
+// client omitted the param. The PG protocol allows a client to omit
+// `database` entirely — the server then defaults to the user name,
+// but for §A40 scope-matching we compare against what dbounce KNOWS:
+// the operator's `--upstream postgres://host/dbname` config.
+func resolvePGDatabase(body []byte, up *upstream.Upstream) string {
+	params := audit.ParsePGStartupParams(body)
+	if d := strings.TrimSpace(params["database"]); d != "" {
+		return d
+	}
+	if up != nil {
+		return up.Database()
+	}
+	return ""
+}
+
+// writePGScopeRefusalErrorResponse writes a PG ErrorResponse with
+// SQLSTATE 42501 + the operator-facing message. Mirrors
+// writePGRefusalErrorResponse (the #324c dynamic-deny shape) except
+// we already have the startup body so no preamble re-read is needed.
+func writePGScopeRefusalErrorResponse(conn net.Conn, denyReason, msg string) error {
+	var b []byte
+	b = append(b, 'S')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'V')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'C')
+	b = append(b, []byte(sqlStateInsufficientPrivilege)...)
+	b = append(b, 0)
+	b = append(b, 'M')
+	b = append(b, []byte(msg)...)
+	b = append(b, 0)
+	// Include the deny_reason in a 'D' (Detail) field so a PG client
+	// that surfaces the detail (psql does) gives the operator the
+	// stable filter constant.
+	b = append(b, 'D')
+	b = append(b, []byte(denyReason)...)
+	b = append(b, 0)
+	b = append(b, 0)
+	hdrBuf := make([]byte, 5)
+	hdrBuf[0] = 'E'
+	binary.BigEndian.PutUint32(hdrBuf[1:5], uint32(len(b)+4))
+	if _, err := conn.Write(hdrBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(b); err != nil {
+		return err
+	}
+	return nil
 }
 
 // PG AuthenticationRequest sub-codes (from the 'R' message payload).
