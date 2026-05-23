@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 // Profile YAML + evaluator tests. Mirrors kbouncer's profile_test.go
@@ -461,15 +462,18 @@ func TestEnsureDefaultProfilesFile_PreservesExisting(t *testing.T) {
 		"existing profile body must survive verbatim")
 }
 
-func TestInstall_RefusesHTTP(t *testing.T) {
+func TestInstall_RefusesUnknownScheme(t *testing.T) {
+	// Per §A26 (#350) http:// is no longer hard-refused — it
+	// proceeds with a stderr WARN at the CLI layer. The hard refusal
+	// now applies only to genuinely-unknown schemes.
 	_, err := Install(context.Background(), InstallOptions{
-		From: "http://example.com/p.yaml",
+		From: "gopher://example.com/p.yaml",
 	})
 	require.Error(t, err)
 	var ie *InstallError
 	require.ErrorAs(t, err, &ie)
 	assert.Equal(t, InstallExitOperator, ie.ExitCode)
-	assert.Contains(t, ie.Message, "only https")
+	assert.Contains(t, ie.Message, "gopher")
 }
 
 func TestInstall_RoundTrip_WithSHA256Pin(t *testing.T) {
@@ -781,5 +785,202 @@ func TestAddLocalProfile_RoundTripDetectsConcurrentEdit(t *testing.T) {
 		_, present := reloaded.All[want]
 		assert.True(t, present,
 			"AddLocalProfile re-read must preserve %q across the append", want)
+	}
+}
+
+// -------------------------------------------------------------------
+// §A26 (#349 + #350) — schema bridge + local-path install
+// -------------------------------------------------------------------
+
+func TestInstall_FromLocalFilePath(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "bundle.yaml")
+	require.NoError(t, os.WriteFile(src, []byte(
+		"profiles:\n  local-disk:\n    description: from disk\n"+
+			"    deny_keywords: [sensitive]\n",
+	), 0o600))
+	out := filepath.Join(tmp, "profiles.yaml")
+	r, err := Install(context.Background(), InstallOptions{
+		From:         src,
+		ProfilesPath: out,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	assert.Equal(t, []string{"local-disk"}, r.InstalledNames)
+	// SourceURL is the canonical (absolute) on-disk path.
+	abs, _ := filepath.Abs(src)
+	assert.Equal(t, abs, r.SourceURL)
+
+	ps, err := LoadProfiles(out)
+	require.NoError(t, err)
+	p := ps.All["local-disk"]
+	require.NotNil(t, p)
+	assert.Equal(t, abs, p.Source)
+	assert.Contains(t, p.DenyKeywords, "sensitive")
+}
+
+func TestInstall_FromFileURL(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "via-file-url.yaml")
+	require.NoError(t, os.WriteFile(src, []byte(
+		"profiles:\n  url-shaped:\n    description: file:// scheme\n",
+	), 0o600))
+	out := filepath.Join(tmp, "profiles.yaml")
+	r, err := Install(context.Background(), InstallOptions{
+		From:         "file://" + src,
+		ProfilesPath: out,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"url-shaped"}, r.InstalledNames)
+}
+
+func TestInstall_FromMissingPathFails(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := Install(context.Background(), InstallOptions{
+		From:         filepath.Join(tmp, "absent.yaml"),
+		ProfilesPath: filepath.Join(tmp, "profiles.yaml"),
+	})
+	require.Error(t, err)
+	var ie *InstallError
+	require.ErrorAs(t, err, &ie)
+	assert.Equal(t, InstallExitOperator, ie.ExitCode)
+	assert.Contains(t, ie.Message, "does not exist")
+}
+
+func TestInstall_FromBundleDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	bundleDir := filepath.Join(tmp, "audit-pinned")
+	require.NoError(t, os.MkdirAll(bundleDir, 0o700))
+	// Per-bouncer slot the install layer looks for first.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, "dbounce.yaml"),
+		[]byte("profile_name: from-bundle\nbouncer: dbounce\n"+
+			"deny_keywords: [prod]\n"),
+		0o600,
+	))
+	out := filepath.Join(tmp, "profiles.yaml")
+	r, err := Install(context.Background(), InstallOptions{
+		From:         bundleDir,
+		ProfilesPath: out,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"from-bundle"}, r.InstalledNames)
+}
+
+func TestInstall_FromGeneratorShapeSingleFile(t *testing.T) {
+	// Per §A26 (#349) the dbounce profile parser accepts the
+	// `iam-jit profile generate-from-audit` per-bouncer file shape
+	// — top-level `profile_name:` + `bouncer:` + `denies: [{sql_patterns,
+	// reason}]`. Pre-fix this YAML parsed to a Profile with empty
+	// DenyKeywords + DenyActions; the bouncer enforced nothing.
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "dbounce.yaml")
+	require.NoError(t, os.WriteFile(src, []byte(`schema_version: 1
+profile_name: audit-pinned-dbounce
+bouncer: dbounce
+provenance:
+  source: generate-from-audit
+denies:
+  - sql_patterns:
+      - DROP SCHEMA pg_catalog*
+      - DROP DATABASE mysql
+    reason: system-catalog DDL is destructive admin action
+  - sql_patterns:
+      - GRANT * TO PUBLIC
+    reason: GRANT TO PUBLIC is silent privilege escalation
+`), 0o600))
+	out := filepath.Join(tmp, "profiles.yaml")
+	_, err := Install(context.Background(), InstallOptions{
+		From:         src,
+		ProfilesPath: out,
+	})
+	require.NoError(t, err)
+
+	ps, err := LoadProfiles(out)
+	require.NoError(t, err)
+	p := ps.All["audit-pinned-dbounce"]
+	require.NotNil(t, p)
+	// The translator pulls identifier-like tokens from sql_patterns
+	// into deny_keywords. Pre-fix DenyKeywords was EMPTY.
+	require.NotEmpty(t, p.DenyKeywords,
+		"generator-shape sql_patterns must translate to deny_keywords")
+	denyLowered := make(map[string]struct{}, len(p.DenyKeywords))
+	for _, k := range p.DenyKeywords {
+		denyLowered[strings.ToLower(k)] = struct{}{}
+	}
+	_, hasPgCatalog := denyLowered["pg_catalog"]
+	_, hasMysql := denyLowered["mysql"]
+	assert.True(t, hasPgCatalog,
+		"pg_catalog (schema identifier from DROP SCHEMA pg_catalog*) "+
+			"must surface as a deny_keyword. Got: %v", p.DenyKeywords)
+	assert.True(t, hasMysql,
+		"mysql (database identifier from DROP DATABASE mysql) must "+
+			"surface as a deny_keyword. Got: %v", p.DenyKeywords)
+}
+
+func TestParseProfile_CanonicalShapeUnchanged(t *testing.T) {
+	// Per [[creates-never-mutates]]: operator-authored profiles
+	// using the canonical fields must keep parsing identically.
+	body := []byte(`description: hand-written
+deny_keywords: [prod]
+deny_actions: [INSERT, UPDATE]
+allow_baseline: sql_read_only
+deny_dcl_targets_public: true
+`)
+	var p Profile
+	require.NoError(t, yaml.Unmarshal(body, &p))
+	assert.Equal(t, []string{"prod"}, p.DenyKeywords)
+	assert.Equal(t, []string{"INSERT", "UPDATE"}, p.DenyActions)
+	assert.Equal(t, BaselineSQLReadOnly, p.AllowBaseline)
+	assert.True(t, p.DenyDCLTargetsPublic)
+}
+
+func TestParseProfile_GeneratorShapeBridges(t *testing.T) {
+	// Unit-level: a single Profile body in generator shape decodes
+	// into a Profile whose canonical fields are populated via the
+	// UnmarshalYAML bridge.
+	body := []byte(`schema_version: 1
+profile_name: bridge-test
+bouncer: dbounce
+denies:
+  - sql_patterns: [DROP SCHEMA pg_catalog*]
+    reason: catalog ddl
+`)
+	var p Profile
+	require.NoError(t, yaml.Unmarshal(body, &p))
+	require.NotEmpty(t, p.DenyKeywords)
+	found := false
+	for _, k := range p.DenyKeywords {
+		if strings.EqualFold(k, "pg_catalog") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found,
+		"generator-shape denies must bridge into DenyKeywords; "+
+			"got: %v", p.DenyKeywords)
+}
+
+func TestExtractKeywordsFromSQLPattern(t *testing.T) {
+	// Unit test for the bridge helper — confirms identifier tokens
+	// come out, SQL reserved words are filtered, glob meta is
+	// stripped. Locks in the v1.0 behavior so future scope additions
+	// don't quietly change what gets denied.
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"DROP SCHEMA pg_catalog*", []string{"pg_catalog"}},
+		{"DROP DATABASE mysql", []string{"mysql"}},
+		{"GRANT * TO PUBLIC", nil}, // all tokens reserved
+		{"ALTER SCHEMA pg_catalog*", []string{"pg_catalog"}},
+		{"DROP DATABASE information_schema", []string{"information_schema"}},
+		{"", nil},
+	}
+	for _, tc := range cases {
+		got := extractKeywordsFromSQLPattern(tc.in)
+		// Normalize for comparison
+		assert.Equal(t, tc.want, got,
+			"extractKeywordsFromSQLPattern(%q)", tc.in)
 	}
 }

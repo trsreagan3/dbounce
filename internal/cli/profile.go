@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	neturl "net/url"
 	"os"
 	"sort"
 	"strings"
@@ -398,22 +399,33 @@ func newProfileInstallCmd() *cobra.Command {
 		actor          string
 	)
 	cmd := &cobra.Command{
-		Use:   "install --from URL [--sha256 HEX] [--force] [--timeout 10]",
-		Short: "Fetch + install profiles from an HTTPS URL",
-		Long: `Fetch a profiles.yaml fragment from an HTTPS URL and install
-the profiles it contains. Composes with the enterprise-profile-
-distribution onboarding pattern: IT teams publish curated profiles
-at an internal URL, and engineers install them on day 1.
+		Use:   "install --from URL_OR_PATH [--sha256 HEX] [--force] [--timeout 10]",
+		Short: "Fetch + install profiles from a URL or local path",
+		Long: `Install profiles from any of:
 
-  dbounce profile install --from https://internal.example/profiles.yaml
+  * an HTTPS URL — preferred + recommended distribution channel
+    (IT teams publish curated profiles at an internal URL, engineers
+    install them on day 1).
 
-The fetched URL becomes the ` + "`source`" + ` of each installed profile.
+      dbounce profile install --from https://internal.example/profiles.yaml
+
+  * an HTTP URL — accepted for local-dev parity with the
+    audit-export HTTP surface. A one-line WARN fires for non-
+    loopback hosts; loopback (localhost / 127.0.0.1 / ::1) gets a
+    silent pass.
+
+  * file:///abs/path/...  or a bare local path (relative or
+    absolute) — accepts a single YAML file OR a bundle directory
+    produced by ` + "`iam-jit profile generate-from-audit`" + `; the
+    directory form looks for ` + "`dbounce.yaml`" + ` first then
+    falls back to ` + "`index.yaml`" + ` + the bouncer entry naming
+    dbounce.
+
+      dbounce profile install --from ./profiles/
+
+The source string becomes the ` + "`source`" + ` of each installed profile.
 Profiles with a non-local source are READ-ONLY at the CLI surface —
 engineers cannot edit them to bypass org guardrails.
-
-HTTPS-only: http:// URLs are refused because plaintext distribution
-is MITM-substitutable. IT teams should ALSO pin --sha256 in their
-onboarding docs to defend against a compromised distribution server.
 
 Conflict policy: if a profile of the same name already exists,
 install refuses without --force.`,
@@ -426,7 +438,23 @@ install refuses without --force.`,
 				Timeout:        time.Duration(timeoutSecs) * time.Second,
 				ProfilesPath:   profilesPath,
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "fetching %s ...\n", fromURL)
+			// Emit a "WARN" line for non-loopback HTTP fetches at the
+			// CLI layer (the profile package keeps the source-string
+			// gate pure). Loopback gets a silent pass.
+			if parsed, perr := neturl.Parse(fromURL); perr == nil &&
+				strings.EqualFold(parsed.Scheme, "http") {
+				host := parsed.Hostname()
+				isLoopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+				if !isLoopback {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"WARN: fetching %q over plaintext HTTP — a network "+
+							"attacker can MITM-substitute a permissive profile. "+
+							"Prefer https:// for IT-distributed profiles. This "+
+							"warning does NOT block the install (per §A26 local-"+
+							"dev parity with audit-export HTTP).\n", fromURL)
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "loading %s ...\n", fromURL)
 			result, err := profile.Install(cmd.Context(), opts)
 			if err != nil {
 				var ie *profile.InstallError

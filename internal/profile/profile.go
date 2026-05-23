@@ -350,6 +350,237 @@ func (p *Profile) IsLocalSource() bool {
 	return p.Source == "" || p.Source == "local"
 }
 
+// generatorProfileShim is the shape `iam-jit profile generate-from-
+// audit` emits per-bouncer (see iam-roles/src/iam_jit/llm/
+// profile_generator.py:_render_profile_yaml). UnmarshalYAML on
+// Profile decodes BOTH the canonical shape AND this shape so the
+// generated YAML can install without a manual translation step.
+//
+// Per §A26 (#349). Pre-fix, a generator-emitted dbounce.yaml parsed
+// into a Profile with every enforcement field empty — denies fired
+// for nothing.
+type generatorProfileShim struct {
+	// SchemaVersion + ProfileName + Bouncer are bundle-routing fields;
+	// recognized + ignored at parse time (the install path already has
+	// the bouncer routing baked in: a dbounce-emitted file installs
+	// into dbounce).
+	SchemaVersion any `yaml:"schema_version,omitempty"`
+	ProfileName   any `yaml:"profile_name,omitempty"`
+	Bouncer       any `yaml:"bouncer,omitempty"`
+	Provenance    any `yaml:"provenance,omitempty"`
+
+	// Allows + Denies carry the generator's rule lists. The dbounce-
+	// side schema mostly uses sql_patterns + reason fields per-entry;
+	// some entries are bouncer-other shapes (target/actions for
+	// ibounce, target/verbs for kbounce) and are skipped at the
+	// translator because dbounce can't enforce them.
+	Allows []generatorRule `yaml:"allows,omitempty"`
+	Denies []generatorRule `yaml:"denies,omitempty"`
+
+	// FlaggedForReview + Skipped are operator-review metadata,
+	// recognized but unused at parse time.
+	FlaggedForReview []any `yaml:"flagged_for_review,omitempty"`
+	Skipped          []any `yaml:"skipped,omitempty"`
+}
+
+// generatorRule is one entry under generator-shape `denies:` /
+// `allows:`. The fields are a superset across the four bouncers so
+// the same struct decodes ibounce / kbounce / dbounce / gbounce
+// rules; the dbounce translator only consults SQLPatterns + Reason +
+// Bouncer (the per-rule bouncer override; rare).
+type generatorRule struct {
+	Target      any      `yaml:"target,omitempty"`
+	Actions     []string `yaml:"actions,omitempty"`
+	Verbs       []string `yaml:"verbs,omitempty"`
+	Resources   []string `yaml:"resources,omitempty"`
+	Scope       any      `yaml:"scope,omitempty"`
+	SQLPatterns []string `yaml:"sql_patterns,omitempty"`
+	Reason      string   `yaml:"reason,omitempty"`
+	Bouncer     string   `yaml:"bouncer,omitempty"`
+}
+
+// UnmarshalYAML accepts the canonical Profile shape AND the generator
+// shape. The two never collide structurally — the canonical shape has
+// no `denies:` field at all and the generator shape has no
+// `deny_actions:` field at all — so a body containing fields from
+// both shapes is interpreted as the canonical author having layered
+// a generator-shape addendum on top (each shape's fields are merged).
+//
+// Per [[creates-never-mutates]]: pre-existing canonical profiles
+// continue to parse identically (the generator-shape fields are
+// optional + default to their zero values).
+func (p *Profile) UnmarshalYAML(node *yaml.Node) error {
+	// First, decode into a type-alias of Profile so the standard
+	// yaml.v3 reflection-based decoder runs without recursing into
+	// our custom UnmarshalYAML. The Go pattern: alias the type so it
+	// loses the method set, decode, copy back.
+	type rawProfile Profile
+	var canonical rawProfile
+	if err := node.Decode(&canonical); err != nil {
+		return err
+	}
+	*p = Profile(canonical)
+
+	// Then decode the same node into the generator shim. yaml.v3
+	// silently ignores fields the target struct doesn't declare, so
+	// this is a no-op for profiles that don't use the shim's fields.
+	var shim generatorProfileShim
+	if err := node.Decode(&shim); err != nil {
+		return err
+	}
+	if len(shim.Denies) == 0 && len(shim.Allows) == 0 {
+		return nil
+	}
+
+	// Merge the shim's rules into the canonical Profile fields. For
+	// dbounce the only directly-actionable shape from the generator's
+	// rules is `sql_patterns` (identifier tokens become deny_keywords)
+	// + bouncer-other shapes are deliberately skipped.
+	seenKW := make(map[string]struct{}, len(p.DenyKeywords))
+	for _, k := range p.DenyKeywords {
+		seenKW[strings.ToLower(k)] = struct{}{}
+	}
+	for _, rule := range shim.Denies {
+		// Bouncer-other rule shapes (ibounce target/actions,
+		// kbounce verbs/resources) are skipped here — dbounce
+		// cannot enforce an AWS action or a K8s verb. The install-
+		// time bundle routing already targeted this file at
+		// dbounce so a per-rule `bouncer:` override that names a
+		// different product is also skipped silently.
+		if rule.Bouncer != "" && !strings.EqualFold(rule.Bouncer, "dbounce") {
+			continue
+		}
+		for _, pat := range rule.SQLPatterns {
+			for _, kw := range extractKeywordsFromSQLPattern(pat) {
+				lk := strings.ToLower(kw)
+				if _, ok := seenKW[lk]; ok {
+					continue
+				}
+				seenKW[lk] = struct{}{}
+				p.DenyKeywords = append(p.DenyKeywords, kw)
+			}
+		}
+	}
+
+	// allow rules: when the rule names an explicit statement type or
+	// table glob, lift it into AllowRules under the canonical pattern
+	// shape (`statement_type:table_glob`). dbounce's allow_rules
+	// matcher already understands this shape.
+	seenAllow := make(map[string]struct{}, len(p.AllowRules))
+	for _, ar := range p.AllowRules {
+		seenAllow[strings.ToLower(ar.Pattern)] = struct{}{}
+	}
+	for _, rule := range shim.Allows {
+		if rule.Bouncer != "" && !strings.EqualFold(rule.Bouncer, "dbounce") {
+			continue
+		}
+		for _, pat := range rule.SQLPatterns {
+			for _, allowPat := range allowPatternsFromSQLPattern(pat) {
+				lk := strings.ToLower(allowPat)
+				if _, ok := seenAllow[lk]; ok {
+					continue
+				}
+				seenAllow[lk] = struct{}{}
+				p.AllowRules = append(p.AllowRules, ProfileAllowRule{
+					Pattern: allowPat,
+					Note:    rule.Reason,
+				})
+			}
+		}
+	}
+	return nil
+}
+
+// extractKeywordsFromSQLPattern walks a SQL-pattern string from a
+// generator-shape rule (e.g. `DROP DATABASE mysql`, `GRANT * TO
+// PUBLIC`, `DROP SCHEMA pg_catalog*`) and returns the identifier-
+// like tokens that are worth turning into deny_keywords. The
+// canonical bridge: pull the bare-word tokens that aren't SQL
+// reserved verbs and use them as substring/word-boundary keys
+// against the parsed statement's tables + schemas.
+//
+// Per [[v1-scope-bar]] we deliberately do NOT build a SQL-pattern
+// matcher — that's a follow-up. The keyword bridge handles the
+// 80%-case (catching schema/database/table names in destructive
+// statements) without inventing new enforcement primitives.
+func extractKeywordsFromSQLPattern(pattern string) []string {
+	if pattern == "" {
+		return nil
+	}
+	// Reserved-token set kept tiny + lowercased; anything not here
+	// is considered an identifier candidate. Glob metacharacters are
+	// stripped (`*` / `?`) since they're not part of any identifier.
+	reserved := map[string]struct{}{
+		"select": {}, "from": {}, "where": {}, "and": {}, "or": {},
+		"insert": {}, "into": {}, "values": {}, "update": {}, "set": {},
+		"delete": {}, "drop": {}, "create": {}, "alter": {}, "truncate": {},
+		"table": {}, "database": {}, "schema": {}, "grant": {}, "revoke": {},
+		"to": {}, "on": {}, "by": {}, "all": {}, "any": {}, "privileges": {},
+		"public": {}, "user": {}, "role": {}, "with": {},
+	}
+	rawTokens := strings.FieldsFunc(pattern, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', ',', ';', '(', ')', '*', '?', '\'', '"', '`':
+			return true
+		}
+		return false
+	})
+	var out []string
+	seen := make(map[string]struct{}, len(rawTokens))
+	for _, raw := range rawTokens {
+		t := strings.TrimSpace(raw)
+		if t == "" {
+			continue
+		}
+		// Skip glob-only tokens.
+		if strings.TrimLeft(t, "*?") == "" {
+			continue
+		}
+		// Strip trailing globs from identifier-like prefixes
+		// (`pg_catalog*` → `pg_catalog`).
+		core := strings.TrimRight(t, "*?")
+		if core == "" {
+			continue
+		}
+		if _, isReserved := reserved[strings.ToLower(core)]; isReserved {
+			continue
+		}
+		// Require at least one letter to avoid pulling numeric
+		// literals.
+		hasLetter := false
+		for _, r := range core {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				hasLetter = true
+				break
+			}
+		}
+		if !hasLetter {
+			continue
+		}
+		key := strings.ToLower(core)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, core)
+	}
+	return out
+}
+
+// allowPatternsFromSQLPattern is the inverse for allows. For now we
+// reduce to a permissive `SELECT:<table>` wildcard per identifier
+// token (the safe assumption when an audit-derived rule says "this
+// table is observed"). This is a minimal bridge — operators tuning
+// further allow shapes should hand-author the AllowRules entry.
+func allowPatternsFromSQLPattern(pattern string) []string {
+	tokens := extractKeywordsFromSQLPattern(pattern)
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		out = append(out, "SELECT:"+strings.ToLower(t))
+	}
+	return out
+}
+
 // Profiles is a loaded collection of named profiles plus metadata.
 type Profiles struct {
 	// Path is the on-disk YAML the profiles were loaded from, or "" when
