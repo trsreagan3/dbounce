@@ -160,6 +160,10 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newInitTLSCmd())
 	// D-Slice 7: environment profile + MCP server subcommand trees.
 	root.AddCommand(newProfileCmd())
+	// #387 / §A25 Phase 2 — `dbounce denies recent` cross-bouncer
+	// deny-visibility surface (the symmetric flip of dynamic-deny
+	// rules).
+	root.AddCommand(newDeniesCmd())
 	root.AddCommand(newMCPCmd())
 	// D-Slice 8: pause + prompts + presets + rules subcommands.
 	// ProfileWriter wiring bridges D-Slice 7's internal/profile package

@@ -404,6 +404,10 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolListAuditWebhookPresets(args)
 	case "dbounce_posture":
 		return s.toolPosture(args)
+	case "dbounce_profile_allow":
+		return s.toolProfileAllow(args)
+	case "dbounce_denies_recent":
+		return s.toolDeniesRecent(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }

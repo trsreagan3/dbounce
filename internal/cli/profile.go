@@ -45,6 +45,7 @@ prints the full record for a single profile.`,
 	cmd.AddCommand(newProfileInstallCmd())
 	cmd.AddCommand(newProfileInstallDefaultsCmd())
 	cmd.AddCommand(newProfileDoctorCmd())
+	cmd.AddCommand(newProfileAllowCmd())
 	return cmd
 }
 

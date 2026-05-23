@@ -1110,6 +1110,14 @@ func (s *Server) Serve() error {
 	// /audit/events.
 	mux.HandleFunc("/admin/dynamic-denies/reload",
 		s.dynamicDenyReloadHandler(s.cfg.AuditEventsToken))
+	// #387 / §A25 Phase 2 — POST /admin/profile/reload mgmt endpoint.
+	// Re-reads profiles.yaml from disk + hot-swaps the active profile
+	// pointer so a `dbounce profile allow` mutation takes effect on
+	// the very next decision without a bouncer restart. Same auth
+	// model as /audit/events. Mirrors ibounce + kbouncer response
+	// shape per [[cross-product-agent-parity]].
+	mux.HandleFunc("/admin/profile/reload",
+		s.profileReloadHandler(s.cfg.AuditEventsToken, ""))
 	s.mgmtSrv = &http.Server{
 		Addr:              mgmtAddr,
 		Handler:           mux,
