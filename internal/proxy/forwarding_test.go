@@ -353,6 +353,17 @@ func TestForward_TransparentDenyDoesNotForward(t *testing.T) {
 		"transparent-mode deny must emit SQLSTATE 42501")
 	assert.Contains(t, string(reply), "dbounce: denied",
 		"reply must include the dbounce deny prefix")
+	// #459 / §A57b — wire-level structured-deny suffix MUST ride
+	// alongside the legacy "dbounce: denied:" prefix per
+	// [[cross-product-agent-parity]]. The marker + a couple of
+	// load-bearing structured-deny fields must appear in the wire bytes
+	// so a downstream agent can split-on-marker + parse the JSON.
+	assert.Contains(t, string(reply), "iam-jit-structured-deny:",
+		"wire reply must carry the structured-deny marker (#459 / cross-product-agent-parity)")
+	assert.Contains(t, string(reply), `"caught_by_bouncer":"dbounce"`,
+		"wire reply must carry caught_by_bouncer:dbounce")
+	assert.Contains(t, string(reply), `"classifier_hook":"go-heuristic-only"`,
+		"wire reply must mark classifier_hook=go-heuristic-only (ibounce-honest-positioning)")
 
 	// Fake upstream must have seen ONLY the startup, not the Query.
 	for _, r := range fake.received {

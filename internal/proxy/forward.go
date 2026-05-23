@@ -886,8 +886,12 @@ func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload
 			row.UpstreamResponseSummary = "transparent-mode deny: " + row.DecisionReason
 			row.Enforced = true
 			f.recordDecision(row, source)
-			if err := f.writeErrorToClient(sqlStateInsufficientPrivilege,
-				fmt.Sprintf("dbounce: denied: %s", row.DecisionReason)); err != nil {
+			// #459 / §A57b — append the structured-deny suffix per
+			// [[cross-product-agent-parity]]. Legacy "dbounce: denied:
+			// ..." prefix preserved per [[creates-never-mutates]].
+			legacyMsg := fmt.Sprintf("dbounce: denied: %s", row.DecisionReason)
+			msgWithStructured := dbounceDenyMessageWithStructured(legacyMsg, row, string(f.srv.cfg.Dialect))
+			if err := f.writeErrorToClient(sqlStateInsufficientPrivilege, msgWithStructured); err != nil {
 				return fmt.Errorf("write transparent-deny ErrorResponse: %w", err)
 			}
 			if msgType == msgQuery {

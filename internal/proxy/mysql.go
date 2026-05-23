@@ -740,9 +740,14 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 			row.UpstreamResponseSummary = "transparent-mode deny: " + row.DecisionReason
 			row.Enforced = true
 			f.recordMySQLDecision(row)
+			// #459 / §A57b — append the structured-deny suffix per
+			// [[cross-product-agent-parity]]. Legacy "dbounce: denied:
+			// ..." prefix preserved per [[creates-never-mutates]].
+			legacyMsg := "dbounce: denied: " + row.DecisionReason
+			msgWithStructured := dbounceDenyMessageWithStructured(legacyMsg, row, string(f.srv.cfg.Dialect))
 			if err := writeMySQLErr(f.in, seq+1, mysqlErrSpecificAccessDenied,
 				mysqlSQLStateAccessDenied,
-				"dbounce: denied: "+row.DecisionReason); err != nil {
+				msgWithStructured); err != nil {
 				return fmt.Errorf("write transparent-deny ErrPacket: %w", err)
 			}
 			return nil
