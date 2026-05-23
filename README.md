@@ -442,6 +442,25 @@ a shipped binary, not a library other Go programs link against.
 
 ---
 
+## API credits required?
+
+**No** when an AI agent is in the loop. `dbounce` is pure
+deterministic SQL rules + audit + MCP server. Your agent (Claude
+Code / Cursor / Codex / Devin / any MCP-compatible client) uses its
+own LLM credentials (Max / Plus / Pro / API key / Ollama / etc.).
+The bouncer never makes an LLM call in this mode — `dbounce` ships
+with zero LLM credentials required for local-dev.
+
+**Yes** for standalone deployments (CI/CD / cron / daemon mode with
+no agent in the loop). Opt in via `--llm-backend
+anthropic|openai|bedrock|ollama` + supply credentials. This is the
+minority case.
+
+See [[bouncer-zero-llm-when-agent-in-loop]] in the iam-roles memory
+for the full architecture.
+
+---
+
 ## License
 
 Apache-2.0 — see [LICENSE](./LICENSE).
