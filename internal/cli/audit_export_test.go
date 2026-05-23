@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,17 +40,22 @@ func TestBuildAuditExporter_LogOnly_FreeTier(t *testing.T) {
 	require.NoError(t, e.Shutdown(context.Background()))
 }
 
-// TestBuildAuditExporter_WebhookWithoutLicense_Rejected: the placeholder
-// license gate must reject --audit-webhook-url + error must point at
-// the FREE-tier fallback + the #235 issue.
-func TestBuildAuditExporter_WebhookWithoutLicense_Rejected(t *testing.T) {
-	// Make sure we're using the default (rejecting) license gate.
+// TestBuildAuditExporter_WebhookGateReinstateableForV1_1: the
+// license-gate function (licensedForAuditWebhook) is retained at
+// v1.0 per [[oss-only-launch-decision]] as the future-reinstate
+// hook for the v1.1+ paid tier. This test PINS the reinstate path
+// by overriding the function with a rejecting closure + asserting
+// the error propagates through buildAuditExporter unchanged. When
+// v1.1 launches, swapping the default-implementation back to a
+// rejecting closure (gated on actual license-file verification)
+// re-enables paid-tier enforcement without touching the call sites.
+func TestBuildAuditExporter_WebhookGateReinstateableForV1_1(t *testing.T) {
 	prev := licensedForAuditWebhook
 	licensedForAuditWebhook = func() error {
 		return errors.New(
 			"--audit-webhook-url requires an Enterprise license " +
-				"(placeholder: dbounce's license-file plumbing has not yet " +
-				"landed — tracked as #235)")
+				"(simulated v1.1+ paid-tier rejection: dbounce's " +
+				"license-file plumbing rejected the request; #235)")
 	}
 	t.Cleanup(func() { licensedForAuditWebhook = prev })
 
@@ -60,9 +66,40 @@ func TestBuildAuditExporter_WebhookWithoutLicense_Rejected(t *testing.T) {
 		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Enterprise license",
-		"webhook flag without license must produce a license-tier error")
+		"reinstate path: the rejecting closure's error must propagate")
 	assert.Contains(t, err.Error(), "#235",
-		"error must reference the license-file plumbing issue")
+		"reinstate path: the closure's #235 reference must propagate")
+}
+
+// TestBuildAuditExporter_WebhookNoLicenseShipsFree pins the v1.0
+// OSS-only behavior per [[oss-only-launch-decision]]: with the
+// default (now no-op) licensedForAuditWebhook gate, --audit-webhook-url
+// constructs cleanly without a license-file present. The downstream
+// failure (if any) must NOT mention licensing — confirming the
+// calibration claim that the webhook ships free at v1.0.
+func TestBuildAuditExporter_WebhookNoLicenseShipsFree(t *testing.T) {
+	// Use the DEFAULT license-gate (no override) — proves the
+	// default-implementation no longer rejects per
+	// [[oss-only-launch-decision]].
+	_, err := buildAuditExporter("", false, -1, -1, -1, "https://93.184.216.34/audit", "test-token", 1, false,
+		"", "", "",
+		"", // alertRoutesPath
+		0, 0, 0,
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+	if err != nil {
+		// Downstream IO failures are acceptable (the SSRF / DNS / TLS
+		// guards are orthogonal to licensing). The calibration
+		// assertion is the error MUST NOT mention licensing — that
+		// would prove the gate is still active.
+		assert.NotContains(t, err.Error(), "Enterprise license",
+			"v1.0 OSS-only disable: webhook construction must not produce a license error")
+		assert.NotContains(t, err.Error(), "license", // belt-and-suspenders
+			"v1.0 OSS-only disable: webhook construction must not mention licensing")
+		t.Logf("webhook downstream failure (expected; not a license error): %v", err)
+		return
+	}
+	// If construction succeeds outright, that's also a valid pass —
+	// the SSRF gate may have allowed the public IP.
 }
 
 // TestBuildAuditExporter_WebhookWithLicenseOverride: when the license
@@ -85,21 +122,43 @@ func TestBuildAuditExporter_WebhookWithLicenseOverride(t *testing.T) {
 	require.NoError(t, e.Shutdown(context.Background()))
 }
 
-// TestBuildAuditExporter_AlertRoutesLicensePlaceholderRejects pins
-// the #280 Enterprise license gate for the per-org routing engine.
-// Same placeholder shape as the webhook gate; both wait on #235.
-func TestBuildAuditExporter_AlertRoutesLicensePlaceholderRejects(t *testing.T) {
+// TestBuildAuditExporter_AlertRoutesNoLicenseShipsFree pins the v1.0
+// OSS-only behavior per [[oss-only-launch-decision]]: the #280 per-org
+// routing engine ships FREE at v1.0. Writes a minimal valid routes.yaml
+// + asserts the routes engine constructs cleanly + the Exporter wires
+// it (exp.Routes != nil).
+func TestBuildAuditExporter_AlertRoutesNoLicenseShipsFree(t *testing.T) {
 	dir := t.TempDir()
-	_, err := buildAuditExporter("", false, -1, -1, -1, "", "", 0, false,
+	t.Setenv("AUDIT_NLSF_TOKEN", "test-token")
+	routesYAML := `routes:
+  - name: all-events
+    match: {}
+    destinations:
+      - webhook:
+          url: https://93.184.216.34/audit
+          token: ${AUDIT_NLSF_TOKEN}
+`
+	routesPath := filepath.Join(dir, "routes.yaml")
+	require.NoError(t, os.WriteFile(routesPath, []byte(routesYAML), 0o600))
+
+	exp, err := buildAuditExporter(filepath.Join(dir, "audit.jsonl"), false, -1, -1, -1, "", "", 0, false,
 		"", "", "",
-		dir+"/routes.yaml",
+		routesPath,
 		0, 0, 0,
 		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
-	require.Error(t, err)
-	assert.ErrorIs(t, err, audit.ErrRoutesLicenseRequired,
-		"--alert-routes must return ErrRoutesLicenseRequired until license-file plumbing lands")
-	assert.Contains(t, err.Error(), "#235",
-		"error message should direct the operator to the tracking issue")
+	require.NoError(t, err,
+		"--alert-routes ships FREE at v1.0 per [[oss-only-launch-decision]]")
+	require.NotNil(t, exp)
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+}
+
+// TestAudit_LicenseSentinelsStillExported pins that the license error
+// sentinels stay exported at v1.0 — they're the v1.1+ paid-tier
+// reinstate hook per [[oss-only-launch-decision]].
+func TestAudit_LicenseSentinelsStillExported(t *testing.T) {
+	require.NotNil(t, audit.ErrRoutesLicenseRequired,
+		"sentinel must stay exported; future paid tier reinstates via this symbol")
+	require.NotEmpty(t, audit.ErrRoutesLicenseRequired.Error())
 }
 
 // TestRunCmdRegistersAlertRoutesFlag confirms the #280 --alert-routes

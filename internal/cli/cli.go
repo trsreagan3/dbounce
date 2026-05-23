@@ -43,31 +43,43 @@ import (
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
 
-// licensedForAuditWebhook is the #252 Slice 1 placeholder license
-// gate. The audit-webhook transport is an Enterprise-tier feature per
-// the [[security-team-audit-export]] memo + [[enterprise-self-host-
-// only]]. dbounce does NOT yet have license-file plumbing (tracked as
-// issue #235); until that lands, --audit-webhook-url is rejected at
-// CLI parse time with an actionable error pointing the operator at
-// the JSONL log path (the FREE-tier transport that ships now) +
-// the future license-file path.
+// licensedForAuditWebhook is the audit-webhook license gate.
 //
-// When #235 lands, this function reads the Ed25519-signed license
-// file + returns nil iff the license includes the
-// "audit-export-webhook" entitlement. Until then, it always returns a
-// not-licensed error. The function is exported via a package-level
-// var so tests can override it without depending on a real license
-// file on disk.
+// v1.0 update per [[oss-only-launch-decision]]: license enforcement is
+// DISABLED at v1.0; the webhook transport ships FREE in the OSS-only
+// launch. Per the memo: "license code stays but does NOT enforce."
+// This function is retained (rather than deleted) so the v1.1+ paid
+// tier reinstate path is a one-line change (re-add the rejecting
+// closure under a `licensed()` check). Tests can still override the
+// package-level var to simulate a paid-tier future.
+//
+// On first invocation per process the function logs an INFO advisory
+// noting the v1.0 disable + the [[oss-only-launch-decision]] memo
+// reference so an operator grepping zerolog output finds the
+// rationale. Subsequent invocations are silent to avoid log spam.
+//
+// Per [[ibounce-honest-positioning]]: this disable closes the
+// calibration-drift gap where the help text claimed "ships free at
+// v1.0" while the runtime returned an Enterprise-license error.
+//
+// Original gate text (preserved as the unused-paid-tier sentinel
+// shape, restored in v1.1 when the paid tier launches):
+//
+//	"--audit-webhook-url requires an Enterprise license (placeholder:
+//	dbounce's license-file plumbing has not yet landed — tracked as
+//	#235). The JSONL log file transport --audit-log-path PATH is the
+//	FREE-tier audit-export channel and is available on all tiers.
+//	Ship the JSONL file to your collector via Fluent Bit / Vector /
+//	logrotate until the webhook gate unlocks. See
+//	[[security-team-audit-export]] for the full transport-tier matrix."
+var licensedForAuditWebhookAdvisoryOnce sync.Once
+
 var licensedForAuditWebhook = func() error {
-	return errors.New(
-		"--audit-webhook-url requires an Enterprise license " +
-			"(placeholder: dbounce's license-file plumbing has not yet " +
-			"landed — tracked as #235). The JSONL log file transport " +
-			"--audit-log-path PATH is the FREE-tier audit-export channel " +
-			"and is available on all tiers. Ship the JSONL file to your " +
-			"collector via Fluent Bit / Vector / logrotate until the " +
-			"webhook gate unlocks. See [[security-team-audit-export]] " +
-			"for the full transport-tier matrix.")
+	licensedForAuditWebhookAdvisoryOnce.Do(func() {
+		log.Info().
+			Msg("dbounce: --audit-webhook-url ships FREE at v1.0 per [[oss-only-launch-decision]] (license enforcement disabled; license-file plumbing retained for future v1.1+ paid tier)")
+	})
+	return nil
 }
 
 // loopbackHosts mirrors kbounce + ibounce's CRIT-32-02 closure:
@@ -1904,12 +1916,31 @@ func buildAuditExporter(
 				"--audit-object-storage-bucket (passing an endpoint " +
 				"without a target bucket has no effect)")
 	}
-	// #280 — per-org routing engine license gate. Same placeholder
-	// shape as licensedForAuditWebhook; both wait on #235. The
-	// alternative-with-routes-engine path can't fail without going
-	// through this gate, so we surface the error before any IO.
+	// #280 — per-org routing engine. Per [[oss-only-launch-decision]]
+	// this ships FREE at v1.0; the prior license gate (which returned
+	// audit.ErrRoutesLicenseRequired) was a calibration-drift gap vs
+	// the help-text claim that the feature ships free at v1.0 per
+	// [[ibounce-honest-positioning]]. When the v1.1+ paid tier lands,
+	// reinstate the gate here; today the routes engine wires
+	// unconditionally. The engine attaches to exp.Routes after the
+	// Exporter is constructed below.
+	var routesEngine *audit.RoutesEngine
 	if alertRoutesPath != "" {
-		return nil, audit.ErrRoutesLicenseRequired
+		log.Info().
+			Str("path", alertRoutesPath).
+			Msg("dbounce: --alert-routes ships FREE at v1.0 per [[oss-only-launch-decision]] (license enforcement disabled; sentinel audit.ErrRoutesLicenseRequired retained for future v1.1+ paid tier)")
+		routesCfg, err := audit.LoadRoutesConfig(alertRoutesPath)
+		if err != nil {
+			return nil, fmt.Errorf("dbounce: --alert-routes: %w", err)
+		}
+		eng, err := audit.NewRoutesEngine(context.Background(), audit.RoutesEngineOptions{
+			Cfg:     routesCfg,
+			Product: "dbounce",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("dbounce: routes engine: %w", err)
+		}
+		routesEngine = eng
 	}
 	var logWriter *audit.LogWriter
 	if logPath != "" {
@@ -2165,6 +2196,11 @@ func buildAuditExporter(
 	exp.Recorder = sessRecorder
 	exp.SecurityLake = securityLakeWriter
 	exp.ObjectStorage = objectStorageWriter
+	// Wire the v1.0-FREE routes engine constructed above per
+	// [[oss-only-launch-decision]]; the Exporter's Emit fans events
+	// to routesEngine.Push when set, in preference to the single-
+	// webhook pusher.
+	exp.Routes = routesEngine
 	if heartbeatInterval > 0 {
 		hb := audit.NewHeartbeater(audit.HeartbeatOptions{
 			Interval:     heartbeatInterval,

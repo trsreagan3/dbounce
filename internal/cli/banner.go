@@ -164,8 +164,12 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 				st.Log.Path, st.Log.Fsync, st.Log.QueueLimit)
 		}
 		if st.Webhook != nil {
+			// Per [[oss-only-launch-decision]]: v1.0 ships fully free; no
+			// ENTERPRISE-tier label in operator-facing banners. The token
+			// mask note remains so operators can verify their bearer
+			// secret was not leaked to stdout.
 			fmt.Fprintf(w,
-				"audit-export webhook : %s  (batch=%d, queue=%d; ENTERPRISE — token masked)\n",
+				"audit-export webhook : %s  (batch=%d, queue=%d; token masked)\n",
 				st.Webhook.URLRedacted, st.Webhook.BatchSize, st.Webhook.QueueLimit)
 		}
 		// #258 — Security Lake banner. AWS account + caller ARN come
