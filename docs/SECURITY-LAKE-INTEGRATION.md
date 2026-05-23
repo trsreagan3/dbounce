@@ -1,5 +1,14 @@
 # AWS Security Lake Integration
 
+> **Vendor-integration qualifier** (per `[[vendor-integration-claim-qualifier]]`):
+> the parquet column set + partition layout below are verified
+> against the AWS Security Lake custom-source spec + the OCSF v1.1.0
+> class 6003 column reference. Live-tenant ingestion has NOT been
+> performed against a paid AWS Security Lake instance — that is a
+> ~60-second exercise the operator runs on first install. Do NOT
+> claim "tested with Security Lake" or "live-validated" in downstream
+> copy until your AWS account has actually exercised the ingestion.
+
 Cross-product runbook for the `--security-lake-*` flags shipped by
 every audit-export Bounce product (ibounce, kbounce, dbounce). The
 adapter writes OCSF v1.1.0 class 6003 events as parquet files into
