@@ -66,4 +66,16 @@ const (
 	// rule was removed / expired / no longer matches, and new
 	// connections will be accepted again.
 	AdminActionKindDynamicDenyInstanceNowAllowed AdminActionKind = "dynamic_deny.instance_now_allowed"
+
+	// AdminActionKindDiskPressureTransition — #461 / §A63c. The
+	// disk-pressure subsystem's status crossed a threshold (ok →
+	// degraded, degraded → critical, critical → emergency, or any
+	// reverse transition). Surfaced so a SIEM dashboard can answer
+	// "when did this bouncer cross into critical / emergency /
+	// recover to ok?" from the same event stream that carries proxy
+	// decisions + admin actions. Wire-shape parity with Python
+	// ibounce's iam_jit.bouncer.audit_export.disk_pressure
+	// ADMIN_ACTION_DISK_PRESSURE_TRANSITION per
+	// [[cross-product-agent-parity]].
+	AdminActionKindDiskPressureTransition AdminActionKind = "disk_pressure.transition"
 )

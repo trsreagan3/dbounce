@@ -322,6 +322,23 @@ type Config struct {
 	// targets against. Empty disables RDS-ARN matching; the matcher
 	// still consults the hostname axis derived from `--upstream`.
 	UpstreamRDSARN string
+
+	// DiskPressure (#461 / §A63c) is the optional disk-pressure
+	// circuit-breaker state. When non-nil the proxy:
+	//   - surfaces an audit_log block on /healthz with disk usage +
+	//     mode + refuse_requests flag,
+	//   - refuses new DB connections with a PG ErrorResponse
+	//     SQLSTATE 53300 ("too many connections" — closest standard
+	//     SQLSTATE for "server unwilling to accept connections") on
+	//     every accept when state.RefuseRequests() reports true
+	//     (pause-requests mode at critical / emergency),
+	//   - starts a background periodic goroutine in Serve() that ticks
+	//     every DiskPressureCheckInterval to re-evaluate state +
+	//     emit admin-action disk_pressure.transition OCSF events on
+	//     status changes.
+	// When nil the proxy behavior is byte-identical to the pre-#461
+	// shape per [[creates-never-mutates]].
+	DiskPressure *audit.DiskPressureState
 }
 
 // Normalize fills in zero-valued fields with sensible defaults.
@@ -486,6 +503,13 @@ type Server struct {
 	// connWG.Wait so the 1s-cadence ticker exits + the goroutine's
 	// connWG.Done fires. nil-safe.
 	auditEventsPollerCancel context.CancelFunc
+
+	// diskPressureCancel is the context.CancelFunc the #461 / §A63c
+	// disk-pressure check loop listens on. Same shutdown-ordering
+	// constraint as the burst sweeper: cancelled by Shutdown BEFORE
+	// connWG.Wait so the periodic ticker exits + the admin-action
+	// emit channel can drain. nil-safe.
+	diskPressureCancel context.CancelFunc
 
 	// totalAgentHeadersRejected (#318 / §A16) counts inbound
 	// `application_name` values that match the canonical
@@ -1076,6 +1100,29 @@ func (s *Server) Serve() error {
 	s.auditEventsPollerCancel = pollCancel
 	go s.runPendingAuditEventsPoller(pollCtx)
 
+	// #461 / §A63c — disk-pressure check loop. Ticks every
+	// DiskPressureCheckInterval (60s); admin-action transition
+	// events ride the wired auditExporter so the SIEM dashboard
+	// sees status crossings on the same stream as proxy decisions.
+	if s.cfg.DiskPressure != nil {
+		dpCtx, dpCancel := context.WithCancel(context.Background())
+		s.diskPressureCancel = dpCancel
+		go func() {
+			stop := make(chan struct{})
+			go func() {
+				<-dpCtx.Done()
+				close(stop)
+			}()
+			var emit audit.DiskPressureEmitFunc
+			if s.auditExporter != nil {
+				emit = func(ctx context.Context, evt audit.Event) error {
+					return s.auditExporter.Emit(ctx, evt)
+				}
+			}
+			audit.RunDiskPressureLoop(dpCtx, s.cfg.DiskPressure, emit, s.listenerAddr(), stop)
+		}()
+	}
+
 	mgmtAddr := fmt.Sprintf("%s:%d", s.cfg.MgmtHost, s.cfg.MgmtPort)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
@@ -1186,6 +1233,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Same shutdown-ordering pattern the heartbeater follows
 	// (276298f) — without this, connWG.Wait would block on the
 	// sweeper's ticker indefinitely.
+	if s.diskPressureCancel != nil {
+		s.diskPressureCancel()
+	}
 	if s.burstSweeperCancel != nil {
 		s.burstSweeperCancel()
 	}
@@ -1341,6 +1391,104 @@ func writePGRefusalErrorResponse(conn net.Conn, ruleID, reason string) error {
 	return nil
 }
 
+// refuseIfDiskPressure is the #461 / §A63c hot-path gate. When the
+// disk-pressure subsystem has flipped this instance into pause-
+// requests-at-critical (or emergency), refuse the new connection at
+// the wire-protocol layer with a PG ErrorResponse SQLSTATE 53300
+// ("too many connections" — closest standard SQLSTATE for "server
+// unwilling to accept new connections"; clients display it as
+// "FATAL: too many connections" which honestly maps to the operator
+// experience of "the bouncer paused itself because the audit log
+// is at risk").
+//
+// Returns true when the connection was refused (caller must NOT
+// continue the dispatch); false when no disk-pressure refusal
+// applies + the normal handler should proceed.
+//
+// MySQL clients get the same audit trail (via the periodic loop's
+// admin-action emit) but no protocol-specific error packet — the
+// MySQL handshake hasn't run yet, so a PG ErrorResponse would be
+// garbled bytes. Mirrors the existing refuseIfDynamicDenied posture.
+func (s *Server) refuseIfDiskPressure(conn net.Conn) bool {
+	if s == nil || s.cfg.DiskPressure == nil {
+		return false
+	}
+	if !s.cfg.DiskPressure.RefuseRequests() {
+		return false
+	}
+	snap := s.cfg.DiskPressure.Snapshot()
+	usedPct := 0.0
+	if snap.UsedPct != nil {
+		usedPct = *snap.UsedPct
+	}
+	reason := fmt.Sprintf(audit.PauseRequestsRefusalReasonTemplate, usedPct, snap.CritPct)
+	// PG path: consume the startup preamble + send a structured
+	// ErrorResponse. Best-effort; failures fall through to TCP close.
+	if s.cfg.Dialect == DialectPostgres {
+		_ = writePGDiskPressureErrorResponse(conn, reason)
+	}
+	log.Warn().
+		Str("remote", conn.RemoteAddr().String()).
+		Float64("used_pct", usedPct).
+		Str("status", snap.Status).
+		Msg("dbounce: refused new connection — disk-pressure pause-requests at critical")
+	return true
+}
+
+// writePGDiskPressureErrorResponse consumes the inbound PG startup
+// preamble enough to identify a PG client (handles SSLRequest by
+// replying 'N'), then writes an ErrorResponse with SQLSTATE 53300
+// + the operator-facing disk-pressure reason. Mirrors the structure
+// of writePGRefusalErrorResponse with a different SQLSTATE + reason
+// template.
+func writePGDiskPressureErrorResponse(conn net.Conn, reason string) error {
+	hdr := make([]byte, 8)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return err
+	}
+	magic := binary.BigEndian.Uint32(hdr[4:8])
+	if magic == 80877103 {
+		if _, err := conn.Write([]byte{'N'}); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return err
+		}
+	}
+	length := binary.BigEndian.Uint32(hdr[0:4])
+	if length >= 8 && length < 1<<20 {
+		body := make([]byte, length-8)
+		_, _ = io.ReadFull(conn, body)
+	}
+	// PG ErrorResponse with SQLSTATE 53300. "S" severity FATAL means
+	// the client will not retry on this connection (correct: the
+	// bouncer is paused, the disk hasn't moved yet).
+	var b []byte
+	b = append(b, 'S')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'V')
+	b = append(b, []byte("FATAL")...)
+	b = append(b, 0)
+	b = append(b, 'C')
+	b = append(b, []byte("53300")...)
+	b = append(b, 0)
+	b = append(b, 'M')
+	b = append(b, []byte("dbounce: "+reason)...)
+	b = append(b, 0)
+	b = append(b, 0)
+	hdrBuf := make([]byte, 5)
+	hdrBuf[0] = 'E'
+	binary.BigEndian.PutUint32(hdrBuf[1:5], uint32(len(b)+4))
+	if _, err := conn.Write(hdrBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(b); err != nil {
+		return err
+	}
+	return nil
+}
+
 // writePGScopeRefusalPreambleErrorResponse is the §A40 variant of
 // writePGRefusalErrorResponse. Mirrors the #324c shape (consumes
 // the SSLRequest preamble + drops startup body bytes) but produces
@@ -1435,6 +1583,18 @@ func (s *Server) serveConn(conn net.Conn) {
 	}()
 	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
 
+	// #461 / §A63c — disk-pressure circuit breaker. In pause-requests
+	// mode at critical / emergency the proxy refuses every new
+	// connection with a PG ErrorResponse (SQLSTATE 53300) BEFORE
+	// running the dynamic-deny check or any forwarder logic.
+	// Refusing pre-handshake avoids the audit-write race when the
+	// disk is already at the wall. Other modes
+	// (rotate-aggressively / archive-and-purge) never flip
+	// refuse_requests so this is a no-op for them. Mirrors the
+	// dynamic-deny gate's connection-refuse contract.
+	if s.refuseIfDiskPressure(conn) {
+		return
+	}
 	// #324c — dynamic-deny instance gate. When the watcher has flipped
 	// this instance into the denied state, refuse new connections at
 	// the wire-protocol layer. Existing connections (already running
@@ -2144,27 +2304,29 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	payload := struct {
-		Status                              string                    `json:"status"`
-		Mode                                string                    `json:"mode"`
-		DefaultPolicy                       string                    `json:"default_policy"`
-		Dialect                             string                    `json:"dialect"`
-		ActiveProfile                       string                    `json:"active_profile"`
-		DecisionsCount                      int64                     `json:"decisions_count"`
-		LookupErrorsCounter                 int64                     `json:"lookup_errors_counter"`
-		TotalAgentHeadersRejected           int64                     `json:"total_agent_headers_rejected"`
-		Pause                               *HealthzPause             `json:"pause"`
-		AuditExport                         *HealthzAuditExport       `json:"audit_export,omitempty"`
-		AuditExportHealth                   *HealthzAuditExportHealth `json:"audit_export_health,omitempty"`
-		DynamicDeniesEnabled                bool                      `json:"dynamic_denies_enabled"`
-		DynamicDeniesPath                   string                    `json:"dynamic_denies_path,omitempty"`
-		DynamicDeniesCount                  int                       `json:"dynamic_denies_count"`
-		UpstreamDenied                      bool                      `json:"upstream_denied"`
-		UpstreamDeniedRuleID                string                    `json:"upstream_denied_rule_id,omitempty"`
-		TotalDynamicDenyConnectionsRefused  int64                     `json:"total_dynamic_deny_connections_refused"`
-		TotalDynamicDenyReloads             int64                     `json:"total_dynamic_deny_reloads"`
-		TotalDynamicDenyParseErrors         int64                     `json:"total_dynamic_deny_parse_errors"`
+		Status                              string                       `json:"status"`
+		Mode                                string                       `json:"mode"`
+		DefaultPolicy                       string                       `json:"default_policy"`
+		Dialect                             string                       `json:"dialect"`
+		ActiveProfile                       string                       `json:"active_profile"`
+		DecisionsCount                      int64                        `json:"decisions_count"`
+		LookupErrorsCounter                 int64                        `json:"lookup_errors_counter"`
+		TotalAgentHeadersRejected           int64                        `json:"total_agent_headers_rejected"`
+		Pause                               *HealthzPause                `json:"pause"`
+		AuditExport                         *HealthzAuditExport          `json:"audit_export,omitempty"`
+		AuditExportHealth                   *HealthzAuditExportHealth    `json:"audit_export_health,omitempty"`
+		DynamicDeniesEnabled                bool                         `json:"dynamic_denies_enabled"`
+		DynamicDeniesPath                   string                       `json:"dynamic_denies_path,omitempty"`
+		DynamicDeniesCount                  int                          `json:"dynamic_denies_count"`
+		UpstreamDenied                      bool                         `json:"upstream_denied"`
+		UpstreamDeniedRuleID                string                       `json:"upstream_denied_rule_id,omitempty"`
+		TotalDynamicDenyConnectionsRefused  int64                        `json:"total_dynamic_deny_connections_refused"`
+		TotalDynamicDenyReloads             int64                        `json:"total_dynamic_deny_reloads"`
+		TotalDynamicDenyParseErrors         int64                        `json:"total_dynamic_deny_parse_errors"`
 		// §A40 — profile scope refusal counter.
 		TotalProfileScopeRefused int64 `json:"total_profile_scope_refused"`
+		// #461 / §A63c — disk-pressure circuit-breaker snapshot.
+		AuditLog *audit.DiskPressureSnapshot `json:"audit_log,omitempty"`
 	}{
 		Status:                              "ok",
 		Mode:                                string(s.cfg.Mode),
@@ -2218,6 +2380,17 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		health := s.auditExporter.Health()
 		payload.AuditExportHealth = &health
 		if health.Degraded {
+			payload.Status = "degraded"
+		}
+	}
+	// #461 / §A63c — surface disk-pressure subsystem + flip to 503
+	// when refuse_requests is true so external monitors (liveness
+	// probes, monit) see the same paused-bouncer signal the connection
+	// hot path uses.
+	if s.cfg.DiskPressure != nil {
+		snap := s.cfg.DiskPressure.Snapshot()
+		payload.AuditLog = &snap
+		if snap.RefuseRequests {
 			payload.Status = "degraded"
 		}
 	}

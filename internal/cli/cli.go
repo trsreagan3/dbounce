@@ -519,6 +519,13 @@ func newRunCmd() *cobra.Command {
 		auditLogMaxSizeMB    int64
 		auditLogMaxAgeDays   int
 		auditDBRetentionDays int
+		// #461 / §A63c — disk-pressure circuit breaker flags.
+		// dbounce defaults to pause-requests (compliance-heavy).
+		diskPressureMode     string
+		diskPressureWarnPct  int
+		diskPressureCritPct  int
+		diskPressureEmergPct int
+		stopOnDiskCritical   bool
 		// auditWebhookURL + Token enable the Enterprise webhook
 		// transport. License-gated (placeholder until #235 lands the
 		// real license-file plumbing). batchSize defaults to 1 (one
@@ -955,6 +962,27 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				}
 			}
 
+			// #461 / §A63c — resolve mode + build disk-pressure state.
+			// --stop-on-disk-critical overrides --disk-pressure-mode (the
+			// more conservative choice wins). Empty audit-log-path =
+			// state is a no-op (Snapshot still surfaces the mode but
+			// RefuseRequests is always false).
+			effectiveDPMode := diskPressureMode
+			if stopOnDiskCritical {
+				effectiveDPMode = audit.DiskPressureModePauseRequests
+			}
+			normalizedDPMode, dpErr := audit.NormalizeDiskPressureMode(effectiveDPMode)
+			if dpErr != nil {
+				return fmt.Errorf("dbounce: --disk-pressure-mode: %w", dpErr)
+			}
+			diskPressureState := audit.NewDiskPressureState(
+				normalizedDPMode,
+				audit.ResolveLogDir(auditLogPath),
+				diskPressureWarnPct,
+				diskPressureCritPct,
+				diskPressureEmergPct,
+			)
+
 			cfg := proxy.Config{
 				Host:               host,
 				Port:               port,
@@ -978,6 +1006,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				AuditEventsToken:   auditEventsToken,
 				DynamicDenyWatcher: ddWatcher,
 				UpstreamRDSARN:     upstreamRDSARN,
+				DiskPressure:       diskPressureState,
 			}.Normalize()
 
 			// Heartbeat — parse + validate BEFORE the exporter build so a
@@ -1520,6 +1549,34 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"LOG-RETENTION.md spec). Active audit DB is NEVER deleted by "+
 			"this path; only rotated archives are eligible. Honors "+
 			"$DBOUNCE_AUDIT_DB_RETENTION_DAYS for non-flag overrides.")
+	// #461 / §A63c — disk-pressure circuit breaker. dbounce's
+	// compliance-heavy default (pause-requests) matches the cross-
+	// product floor; operators on dev laptops can flip to
+	// rotate-aggressively for the liveness-over-retention tradeoff.
+	// Per [[cross-product-agent-parity]] the flag names match
+	// kbouncer + gbounce + ibounce.
+	cmd.Flags().StringVar(&diskPressureMode, "disk-pressure-mode",
+		audit.DefaultDiskPressureMode,
+		"#461 — disk-pressure response mode. One of: "+
+			"pause-requests (default for dbounce: refuses new DB connections "+
+			"with PG ErrorResponse SQLSTATE 53300 at critical), "+
+			"rotate-aggressively (drops oldest archives at critical), "+
+			"archive-and-purge (drops oldest archives + signals operator-"+
+			"configured object-storage sink should ship before next tick). "+
+			"Cross-product field name matches ibounce + kbouncer + gbounce.")
+	cmd.Flags().BoolVar(&stopOnDiskCritical, "stop-on-disk-critical", false,
+		"#461 — shorthand for --disk-pressure-mode pause-requests. When both "+
+			"flags are passed pause-requests wins (the more conservative "+
+			"choice).")
+	cmd.Flags().IntVar(&diskPressureWarnPct, "disk-pressure-warn-pct", audit.DefaultDiskWarnPercent,
+		"#461 — disk-usage percent at which the audit_log status flips to "+
+			"degraded (informational; no behavior change). Default 85.")
+	cmd.Flags().IntVar(&diskPressureCritPct, "disk-pressure-crit-pct", audit.DefaultDiskCritPercent,
+		"#461 — disk-usage percent at which the operator-declared mode reacts. "+
+			"Default 95.")
+	cmd.Flags().IntVar(&diskPressureEmergPct, "disk-pressure-emergency-pct", audit.DefaultDiskEmergencyPercent,
+		"#461 — disk-usage percent at which the bouncer surfaces an emergency "+
+			"status. Default 98.")
 	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
 		"HTTPS webhook URL to POST audit-export events to. ENTERPRISE tier "+
 			"(license-gated; #235 will land the license-file plumbing — "+
