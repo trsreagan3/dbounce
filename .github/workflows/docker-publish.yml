@@ -134,6 +134,13 @@ jobs:
           # /healthz, which is the boot-readiness signal we assert on.
           # Both ports bound to 0.0.0.0 so we can hit them from the host
           # — gated behind the threat-model acknowledgement flags.
+          #
+          # --audit-events-token is ALSO mandatory when --mgmt-host is
+          # non-loopback (binding 0.0.0.0 inside the container is needed
+          # so the docker bridge can forward host requests in). The smoke
+          # isn't exercising /audit/events; we just need a value that
+          # satisfies the gate. Random hex is fine for a throwaway run.
+          SMOKE_TOKEN="$(openssl rand -hex 16)"
           docker run -d --name db-smoke \
             -p 15433:5433 \
             -p 18768:8768 \
@@ -146,6 +153,7 @@ jobs:
               --mgmt-port 8768 \
               --i-know-this-binds-externally \
               --i-know-mgmt-binds-externally \
+              --audit-events-token "${SMOKE_TOKEN}" \
               --mode cooperative
 
           # Wait for the mgmt port to come up + answer /healthz.
