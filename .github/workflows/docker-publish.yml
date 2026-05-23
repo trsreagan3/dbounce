@@ -102,6 +102,89 @@ jobs:
         run: |
           docker images dbounce:smoke --format '{{.Repository}}:{{.Tag}} {{.Size}}'
 
+      # ---- Real-deploy smoke (§A37) ---------------------------------------
+      # The --version + --help smoke above only proves the binary STARTS.
+      # It would NOT have caught flag-drift like §A33 (Helm chart's
+      # --active-profile vs binary's --profile) if the binary changed.
+      #
+      # This step actually boots dbounce in a container, hits /healthz on
+      # the management port, and asserts the SQLite audit DB was written
+      # to a bind-mounted host directory. If `dbounce run` rejects a flag,
+      # fails to bind, or never opens the store, this catches it before
+      # the multi-arch push.
+      #
+      # Mirrors what an operator does locally — to run the same smoke on
+      # a dev machine: copy the block under "RUN_LOCALLY" comments and
+      # adjust the image tag to ghcr.io/trsreagan3/dbounce:latest.
+      - name: Real-deploy smoke — boot + healthz + audit DB written
+        run: |
+          set -euo pipefail
+          # RUN_LOCALLY: replace ${IMAGE} with ghcr.io/trsreagan3/dbounce:latest
+          IMAGE=dbounce:smoke
+
+          # Host dir that the container's UID 65532 must be able to
+          # write. chown matches the README's "Bind-mounting volumes"
+          # guidance.
+          DATA_DIR="$(mktemp -d)/dbounce"
+          mkdir -p "${DATA_DIR}"
+          sudo chown 65532:65532 "${DATA_DIR}"
+
+          # D-Slice 1 is OBSERVATION-ONLY (no --upstream needed); the
+          # listener still binds + the management port still serves
+          # /healthz, which is the boot-readiness signal we assert on.
+          # Both ports bound to 0.0.0.0 so we can hit them from the host
+          # — gated behind the threat-model acknowledgement flags.
+          docker run -d --name db-smoke \
+            -p 15433:5433 \
+            -p 18768:8768 \
+            -v "${DATA_DIR}:/home/nonroot/.dbounce" \
+            "${IMAGE}" \
+            run \
+              --host 0.0.0.0 \
+              --port 5433 \
+              --mgmt-host 0.0.0.0 \
+              --mgmt-port 8768 \
+              --i-know-this-binds-externally \
+              --i-know-mgmt-binds-externally \
+              --mode cooperative
+
+          # Wait for the mgmt port to come up + answer /healthz.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18768/healthz >/dev/null 2>&1; then
+              echo "dbounce /healthz answered after ${i}s"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "dbounce /healthz never answered; container logs:"
+              docker logs db-smoke || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # /healthz is the canonical readiness check.
+          curl -fsS http://127.0.0.1:18768/healthz | head -c 400
+          echo
+
+          # Assert the SQLite audit DB was opened + written to the
+          # bind-mounted host directory. This is the core §A37 check:
+          # if `dbounce run` accepted the flags but silently never opened
+          # the store, the file won't exist. Existence on disk proves
+          # the binary actually exercised its persistence path.
+          if [ ! -f "${DATA_DIR}/state.db" ]; then
+            echo "FAIL: ${DATA_DIR}/state.db not created — dbounce did not open the audit DB"
+            ls -la "${DATA_DIR}"
+            docker logs db-smoke || true
+            exit 1
+          fi
+          echo "PASS: state.db created ($(stat -c%s "${DATA_DIR}/state.db") bytes)"
+
+          # Cleanup. `|| true` so a stop failure doesn't mask the
+          # assertion result above.
+          docker stop db-smoke >/dev/null || true
+          docker rm db-smoke >/dev/null || true
+          rm -rf "${DATA_DIR}" || sudo rm -rf "${DATA_DIR}" || true
+
       # ---- Multi-arch build + push ----
       - name: Build and push (linux/amd64 + linux/arm64)
         uses: docker/build-push-action@v6

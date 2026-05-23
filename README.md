@@ -316,7 +316,88 @@ the bind-mount keeps the SQLite audit log, profiles, and rules across
 container restarts (the runtime image has no writable filesystem of
 its own).
 
-Tags:
+### Bind-mounting volumes (UID 65532)
+
+The distroless `:nonroot` base runs as **UID 65532** (non-root for
+security; no shell, no package manager). When you bind-mount a host
+directory into the container, that directory must be writable by UID
+65532 — otherwise dbounce's first attempt to open the SQLite audit
+DB will fail with a cryptic error like:
+
+```
+open store: unable to open database file
+```
+
+Two ways to fix this:
+
+```sh
+# Option A — chown the host directory once (preferred for daemons).
+mkdir -p ~/.dbounce
+sudo chown -R 65532:65532 ~/.dbounce
+docker run --rm -it \
+  -v ~/.dbounce:/home/nonroot/.dbounce \
+  -p 127.0.0.1:5433:5433 \
+  -p 127.0.0.1:8768:8768 \
+  ghcr.io/trsreagan3/dbounce:latest \
+  run --upstream postgres://user:pass@host.docker.internal:5432/mydb
+
+# Option B — run as your host UID (preferred for short-lived dev runs
+# where you don't want to leave a host directory owned by 65532).
+mkdir -p ~/.dbounce
+docker run --rm -it \
+  --user $(id -u):$(id -g) \
+  -v ~/.dbounce:/home/nonroot/.dbounce \
+  -p 127.0.0.1:5433:5433 \
+  -p 127.0.0.1:8768:8768 \
+  ghcr.io/trsreagan3/dbounce:latest \
+  run --upstream postgres://user:pass@host.docker.internal:5432/mydb
+```
+
+**macOS / colima caveat**: colima only bind-mounts `/Users/*` paths
+reliably. Mounts under `/tmp`, `/var`, or `/private` silently diverge
+between the host and the colima VM — files written by the container
+may not appear on the host, and vice versa. Always mount paths under
+`/Users/<you>/` on Mac.
+
+### docker-compose example
+
+```yaml
+# compose.yaml — dbounce with host-owned audit dir.
+services:
+  dbounce:
+    image: ghcr.io/trsreagan3/dbounce:latest
+    user: "65532:65532"             # match the distroless :nonroot UID
+    command:
+      - run
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5433"
+      - --mgmt-host
+      - 0.0.0.0
+      - --mgmt-port
+      - "8768"
+      - --i-know-this-binds-externally
+      - --i-know-mgmt-binds-externally
+    ports:
+      - "127.0.0.1:5433:5433"       # loopback-only on the host
+      - "127.0.0.1:8768:8768"
+    volumes:
+      - ./dbounce-data:/home/nonroot/.dbounce
+    # Before `docker compose up`, run once:
+    #   mkdir -p ./dbounce-data && sudo chown 65532:65532 ./dbounce-data
+```
+
+### Common errors
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `open store: unable to open database file` | Bind-mounted dir not writable by UID 65532 | See **Bind-mounting volumes** above |
+| `permission denied` on `/home/nonroot/.dbounce/...` | Same UID-65532 ownership issue | `chown -R 65532:65532 <hostdir>` or `--user $(id -u):$(id -g)` |
+| Files written in container don't appear on host (macOS) | Mount path under `/tmp` or `/var` on colima | Move mount under `/Users/<you>/` |
+| `bind: address already in use` on `:5433` | Local PostgreSQL or another dbounce on the port | `lsof -i :5433` then stop the conflicting process or change `-p 5434:5433` |
+
+### Tags
 
 | Tag | Source |
 | --- | --- |
