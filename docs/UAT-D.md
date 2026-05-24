@@ -52,7 +52,7 @@ D-Slice 7 ships:
    go test ./... -count=1
    ```
 
-   Expect: every package green. No `Reagan`, no `Omise`, no
+   Expect: every package green. No `Omise`, no
    `/Users/reagan/` leak.
 
 2. Materialize the embedded defaults on disk:
