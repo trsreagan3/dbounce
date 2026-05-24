@@ -34,6 +34,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/dbounce/internal/decision"
 	"github.com/trsreagan3/dbounce/internal/parser"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
@@ -445,6 +446,21 @@ func evalDecide(
 		out.Verdict = "allow"
 		out.DecisionSource = "global.allow"
 		out.Reason = fmt.Sprintf("matched allow rule pattern %q", res.Rule.Pattern)
+		return out, nil
+	}
+
+	// #559: admin-tight floor (UC-34 + #556). Mirrors proxy.decide()
+	// Step 5.5 byte-for-byte via the shared decision.AdminTightFloor
+	// helper so the CLI dry-run verdict matches the production hot-
+	// path verdict on identical DCL inputs. Per
+	// [[ibounce-honest-positioning]]: CLI/proxy divergence is a
+	// calibration-drift bug class — single source of truth lives in
+	// internal/decision/admin_tight.go.
+	if deny, reason, applicable := decision.AdminTightFloor(
+		ps, activeProfile, string(defaultPol)); applicable && deny {
+		out.Verdict = "deny"
+		out.DecisionSource = "default"
+		out.Reason = reason
 		return out, nil
 	}
 

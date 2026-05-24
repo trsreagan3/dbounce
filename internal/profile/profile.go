@@ -1334,6 +1334,31 @@ func matchesActionToken(token string, ps *ParsedStatement) bool {
 
 // matchAnyAllowRule returns the first profile-scoped allow rule that
 // matches.
+// MatchAllowRule reports whether any of the profile's allow_rules
+// matches the given parsed statement. Exposed so external decision
+// helpers (e.g. internal/decision) can consult the profile's allow-
+// rule layer WITHOUT re-evaluating the deny half of the profile (which
+// the proxy + CLI decide paths handle upstream via Profile.Evaluate).
+//
+// Per #559: the admin-tight floor shared helper uses this to honor an
+// explicit allow_rule override on DCL statements, mirroring the
+// "override path" documented on proxy.decide() Step 5.5. Nil receiver,
+// the full-user sentinel, or zero allow_rules returns matched=false +
+// empty pattern.
+//
+// Returns (matched bool, pattern string): pattern is the matched
+// allow_rule's Pattern string when matched=true; empty otherwise. Pure
+// + concurrency-safe; no mutation of receiver state.
+func (p *Profile) MatchAllowRule(ps *ParsedStatement) (bool, string) {
+	if p == nil || p.Name == FullUserProfileName || ps == nil {
+		return false, ""
+	}
+	if len(p.AllowRules) == 0 {
+		return false, ""
+	}
+	return matchAnyAllowRule(p.AllowRules, ps)
+}
+
 func matchAnyAllowRule(allowRules []ProfileAllowRule, ps *ParsedStatement) (bool, string) {
 	for _, ar := range allowRules {
 		pattern := strings.TrimSpace(ar.Pattern)
