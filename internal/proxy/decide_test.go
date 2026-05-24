@@ -387,6 +387,85 @@ func TestDecide_AdminGrantUnderDefaultDenyStillDenied(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// MySQL DCL parity (#556 follow-up from UC-34). The admin-tight floor in
+// decide() Step 5.5 gates on IsDCL=true + StatementType in
+// {StmtGrant,StmtAlterPrivileges}; this is dialect-agnostic by design so
+// the MySQL classifier setting IsDCL=true on GRANT/CREATE USER etc.
+// fires the SAME floor. These tests pin that wire-up — if anyone
+// refactors the MySQL classifier without preserving IsDCL+StatementType
+// semantics, these break.
+// ---------------------------------------------------------------------------
+
+// parseMySQL is a test helper that parses raw SQL through the MySQL
+// dialect dispatcher.
+func parseMySQL(t *testing.T, sql string) *parser.ParsedStatement {
+	t.Helper()
+	ps := parser.Parse(parser.DialectMySQL, sql)
+	require.NotNil(t, ps)
+	return ps
+}
+
+func TestMySQLAdminGrantDeniedByDefault(t *testing.T) {
+	// MySQL admin-grant equivalent of TestDecide_AdminGrantDeniedByDefault.
+	// Before #556 the MySQL classifier didn't surface IsDCL=true on
+	// GRANT, so the admin-tight floor never fired + default-allow let
+	// `GRANT ALL ON foo.* TO PUBLIC` through. After #556: DENY via
+	// admin-tight floor (same code path as PG; the parser fix is what
+	// enables it).
+	srv, _ := newDecideTestServer(t, DefaultPolicyAllow)
+	d := srv.decide(parseMySQL(t, "GRANT ALL ON foo.* TO PUBLIC"))
+	assert.Equal(t, VerdictDeny, d.Verdict,
+		"MySQL GRANT under default-allow + no rules MUST deny via admin-tight floor (#556)")
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.Contains(t, d.Reason, "admin-tight floor",
+		"deny reason must name the admin-tight floor (cross-dialect parity with PG)")
+	assert.Contains(t, d.Reason, "GRANT")
+}
+
+func TestMySQLAdminGrantAllowedWithExplicitRule(t *testing.T) {
+	// Override path: a global allow_rule matching GRANT lets the admin
+	// operate. Fires BEFORE the floor (the global-allow short-circuit
+	// is the layer above). Verifies the override works the SAME way
+	// for MySQL as for PG (i.e. operators don't need a separate
+	// MySQL-specific override pattern).
+	srv, st := newDecideTestServer(t, DefaultPolicyAllow)
+	_, err := st.AddRule(dbrules.ProxyRule{
+		Pattern: "GRANT:*", Effect: dbrules.EffectAllow,
+	})
+	require.NoError(t, err)
+	d := srv.decide(parseMySQL(t, "GRANT SELECT ON foo.bar TO 'bob'@'%'"))
+	assert.Equal(t, VerdictAllow, d.Verdict,
+		"explicit global allow_rule MUST override the admin-tight floor for MySQL too")
+	assert.Equal(t, SourceGlobalAllow, d.Source)
+}
+
+func TestMySQLCreateUserDeniedByDefault(t *testing.T) {
+	// CREATE USER is admin-grant per #556 — classified as StmtGrant +
+	// IsDCL=true, so the admin-tight floor fires. Defense-in-depth
+	// check: creating users requires explicit approval even under
+	// default-allow.
+	srv, _ := newDecideTestServer(t, DefaultPolicyAllow)
+	d := srv.decide(parseMySQL(t,
+		"CREATE USER 'newuser'@'%' IDENTIFIED BY 'secret'"))
+	assert.Equal(t, VerdictDeny, d.Verdict,
+		"MySQL CREATE USER MUST default-deny via admin-tight floor (#556)")
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.Contains(t, d.Reason, "admin-tight floor")
+}
+
+func TestMySQLRevokeNotCaughtByAdminFloor(t *testing.T) {
+	// REVOKE is cleanup direction; admin-tight floor MUST NOT refuse
+	// it. Cross-dialect parity with TestDecide_RevokeNotCaughtByAdminFloor.
+	srv, _ := newDecideTestServer(t, DefaultPolicyAllow)
+	d := srv.decide(parseMySQL(t, "REVOKE SELECT ON foo.* FROM 'bob'@'%'"))
+	assert.Equal(t, VerdictAllow, d.Verdict,
+		"MySQL REVOKE is cleanup; admin-tight floor MUST NOT refuse it")
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.NotContains(t, d.Reason, "admin-tight floor",
+		"REVOKE reason must NOT name the admin-tight floor")
+}
+
+// ---------------------------------------------------------------------------
 // MED-D8-09 (AUDIT-WB-DSLICES-1-8.md): --redact-literals round-trip tests.
 // ---------------------------------------------------------------------------
 

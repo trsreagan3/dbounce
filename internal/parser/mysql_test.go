@@ -367,3 +367,234 @@ func TestParse_EmptyDialectDefaultsToPostgres(t *testing.T) {
 	assert.Equal(t, DialectPostgres, ps.Dialect)
 	assert.Equal(t, StmtSelect, ps.StatementType)
 }
+
+// ---------------------------------------------------------------------------
+// MySQL DCL parity tests — per #556 follow-up from UC-34. Before this slice
+// the MySQL classifier had ZERO DCL handling (xwb1989 doesn't model
+// GRANT/REVOKE/CREATE USER/etc.), so the proxy.decide() Step 5.5
+// admin-tight floor NEVER fired on MySQL upstreams. Every test below
+// asserts:
+//   - StatementType (drives the floor's isAdminGrantShape predicate)
+//   - IsDCL=true (drives the floor's first-half check)
+//   - MutatingNodeType (cross-product rule-pack vocabulary)
+//   - Operation-relevant field population (Privileges/Grantees/etc.)
+//   - RiskIndicators (SIEM-filter vocabulary parity w/ PG path)
+//
+// Per [[ibounce-honest-positioning]]: the MySQL DCL parser is
+// keyword-based (xwb1989 doesn't have an AST for these statements), so
+// edge cases that the PG AST parser handles via tree-walking may be
+// less precisely captured here. Mirroring the PG path's risk-indicator
+// vocabulary keeps the cross-dialect audit experience consistent.
+// ---------------------------------------------------------------------------
+
+func TestGrantAllOnTableToPublicMySQL(t *testing.T) {
+	// The canonical UC-34 hostile shape ported to MySQL: GRANT ALL ON
+	// foo.* TO PUBLIC. MUST classify as StmtGrant + IsDCL=true so the
+	// admin-tight floor in proxy.decide() Step 5.5 refuses it.
+	// risk_indicators MUST include "public_grant" + "all_privileges"
+	// for SIEM filter parity with the PG path's UC-34 audit row.
+	ps := myParse(`GRANT ALL ON foo.* TO PUBLIC`)
+	assert.Equal(t, StmtGrant, ps.StatementType,
+		"GRANT MUST classify as StmtGrant so admin-tight floor fires")
+	assert.True(t, ps.IsDCL, "MySQL GRANT MUST set IsDCL=true")
+	assert.Equal(t, mysqlDCLOpGrant, ps.MutatingNodeType,
+		"MutatingNodeType MUST surface mysqlDCLOpGrant for rule-pack matching")
+	assert.Equal(t, []string{"ALL"}, ps.Privileges)
+	assert.Equal(t, []string{"public"}, ps.Grantees)
+	assert.Equal(t, "schema:foo.*", ps.TargetObject)
+	assert.Contains(t, ps.RiskIndicators, "public_grant",
+		"GRANT ... TO PUBLIC MUST flag public_grant indicator")
+	assert.Contains(t, ps.RiskIndicators, "all_privileges",
+		"GRANT ALL ... MUST flag all_privileges indicator")
+	// DCL is not DML — HasMutatingNode stays false (matches PG semantics).
+	assert.False(t, ps.IsDML, "DCL MUST NOT set IsDML")
+	assert.False(t, ps.IsDDL, "DCL MUST NOT set IsDDL")
+}
+
+func TestGrantSelectToUserMySQL(t *testing.T) {
+	// Non-PUBLIC, non-ALL: still admin-grant (StmtGrant + IsDCL=true)
+	// but with neither public_grant NOR all_privileges flagged. The
+	// wildcard_host indicator DOES fire because grantee is 'bob'@'%'
+	// (any-host grant) — distinct from a public_grant but still worth
+	// audit attention.
+	ps := myParse(`GRANT SELECT ON foo.bar TO 'bob'@'%'`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, []string{"SELECT"}, ps.Privileges)
+	assert.Equal(t, []string{"'bob'@'%'"}, ps.Grantees)
+	assert.Equal(t, "table:foo.bar", ps.TargetObject)
+	assert.NotContains(t, ps.RiskIndicators, "public_grant",
+		"specific user is NOT PUBLIC; public_grant must NOT fire")
+	assert.NotContains(t, ps.RiskIndicators, "all_privileges")
+	assert.Contains(t, ps.RiskIndicators, "wildcard_host",
+		"'bob'@'%' is any-host; wildcard_host indicator MUST fire")
+}
+
+func TestGrantWithGrantOptionMySQL(t *testing.T) {
+	// WITH GRANT OPTION — grantee can re-grant the privilege. Always
+	// flagged. Matches PG path's with_grant_option indicator semantics.
+	ps := myParse(`GRANT SELECT ON foo.* TO 'bob'@'%' WITH GRANT OPTION`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.RiskIndicators, "with_grant_option",
+		"WITH GRANT OPTION MUST flag with_grant_option indicator")
+}
+
+func TestRevokeMySQL(t *testing.T) {
+	// REVOKE — cleanup direction. MUST classify as StmtRevoke + IsDCL.
+	// The admin-tight floor (proxy decide Step 5.5) does NOT fire on
+	// StmtRevoke (only StmtGrant + StmtAlterPrivileges), so REVOKE
+	// remains advisory under default-policy=allow even with no rules.
+	// Privileges + grantees + target still extracted (audit signal).
+	ps := myParse(`REVOKE SELECT ON foo.* FROM 'bob'@'%'`)
+	assert.Equal(t, StmtRevoke, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpRevoke, ps.MutatingNodeType)
+	assert.Equal(t, []string{"SELECT"}, ps.Privileges)
+	assert.Equal(t, []string{"'bob'@'%'"}, ps.Grantees)
+	assert.Equal(t, "schema:foo.*", ps.TargetObject)
+	// REVOKE never flags public_grant / all_privileges (cleanup, not
+	// escalation).
+	assert.NotContains(t, ps.RiskIndicators, "public_grant")
+	assert.NotContains(t, ps.RiskIndicators, "all_privileges")
+}
+
+func TestCreateUserMySQL(t *testing.T) {
+	// CREATE USER ... IDENTIFIED BY '...'. Classified as StmtGrant
+	// (creating a user IS an admin-grant — they exist solely to be the
+	// target of subsequent GRANTs). Two risk_indicators MUST fire:
+	// "create_user" (the shape itself) + "identified_by_password" (the
+	// password literal is now in the audit row's Statement column).
+	ps := myParse(`CREATE USER 'newuser'@'%' IDENTIFIED BY 'secret'`)
+	assert.Equal(t, StmtGrant, ps.StatementType,
+		"CREATE USER classifies as StmtGrant so admin-tight floor fires")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpCreateUser, ps.MutatingNodeType)
+	assert.Contains(t, ps.RiskIndicators, "create_user",
+		"CREATE USER MUST flag create_user indicator")
+	assert.Contains(t, ps.RiskIndicators, "identified_by_password",
+		"IDENTIFIED BY '...' MUST flag identified_by_password indicator")
+	assert.Contains(t, ps.RiskIndicators, "wildcard_host",
+		"'newuser'@'%' MUST flag wildcard_host indicator")
+	assert.Contains(t, ps.Grantees, "'newuser'@'%'",
+		"CREATE USER grantee list MUST include the new account")
+	assert.Equal(t, []string{"CREATE USER"}, ps.Privileges)
+}
+
+func TestDropUserMySQL(t *testing.T) {
+	// DROP USER — cleanup direction. Classified as StmtRevoke so the
+	// admin-tight floor does NOT refuse it (paralleling REVOKE
+	// semantics). Operators who want DROP USER gated add an explicit
+	// MUTATING:* or DROP-USER MutatingNodeType deny.
+	ps := myParse(`DROP USER 'olduser'@'%'`)
+	assert.Equal(t, StmtRevoke, ps.StatementType,
+		"DROP USER classifies as StmtRevoke (cleanup direction)")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpDropUser, ps.MutatingNodeType)
+	assert.Contains(t, ps.Grantees, "'olduser'@'%'")
+	assert.Equal(t, []string{"DROP USER"}, ps.Privileges)
+}
+
+func TestGrantWildcardHostMySQL(t *testing.T) {
+	// GRANT ALL ON *.* TO 'admin'@'%' — the canonical
+	// "give-admin-everything-from-anywhere" shape. Three indicators
+	// MUST fire: all_privileges + wildcard_host + (NOT public_grant
+	// because 'admin'@'%' is not PUBLIC).
+	ps := myParse(`GRANT ALL ON *.* TO 'admin'@'%'`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.RiskIndicators, "all_privileges")
+	assert.Contains(t, ps.RiskIndicators, "wildcard_host")
+	assert.NotContains(t, ps.RiskIndicators, "public_grant",
+		"'admin'@'%' is wildcard-host but NOT PUBLIC; public_grant must NOT fire")
+	assert.Equal(t, "global:*.*", ps.TargetObject,
+		"*.* MUST surface as global:*.* TargetObject")
+	assert.Equal(t, []string{"'admin'@'%'"}, ps.Grantees)
+}
+
+func TestRenameUserMySQL(t *testing.T) {
+	// RENAME USER — silently invalidates downstream allow_rules pinned
+	// to the old name. Classified as StmtAlterPrivileges so admin-tight
+	// floor fires.
+	ps := myParse(`RENAME USER 'old'@'%' TO 'new'@'%'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"RENAME USER classifies as StmtAlterPrivileges (admin-tight class)")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpRenameUser, ps.MutatingNodeType)
+}
+
+func TestSetPasswordMySQL(t *testing.T) {
+	// SET PASSWORD FOR <user> = ... — credential mutation. Classified
+	// as StmtAlterPrivileges (admin-tight floor fires) +
+	// identified_by_password risk_indicator (the literal IS in the
+	// audit row).
+	ps := myParse(`SET PASSWORD FOR 'bob'@'%' = 'newpass'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"SET PASSWORD classifies as StmtAlterPrivileges (admin-tight class)")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpSetPwd, ps.MutatingNodeType)
+	assert.Contains(t, ps.RiskIndicators, "identified_by_password")
+}
+
+func TestGrantMultiplePrivilegesMySQL(t *testing.T) {
+	// Multi-privilege grant: every privilege surfaces in upper-case +
+	// order. Parallels TestParse_GrantMultiplePrivileges on the PG side.
+	ps := myParse(`GRANT SELECT, INSERT, UPDATE ON foo.bar TO 'bob'@'%'`)
+	assert.Equal(t, []string{"SELECT", "INSERT", "UPDATE"}, ps.Privileges)
+	assert.Equal(t, []string{"'bob'@'%'"}, ps.Grantees)
+	assert.Equal(t, "table:foo.bar", ps.TargetObject)
+}
+
+func TestGrantAllPrivilegesNormalizationMySQL(t *testing.T) {
+	// "ALL PRIVILEGES" (full keyword) should normalize to "ALL" so the
+	// all_privileges indicator's predicate stays simple.
+	ps := myParse(`GRANT ALL PRIVILEGES ON foo.* TO 'bob'@'%'`)
+	assert.Equal(t, []string{"ALL"}, ps.Privileges,
+		`"ALL PRIVILEGES" MUST normalize to single-element ["ALL"]`)
+	assert.Contains(t, ps.RiskIndicators, "all_privileges")
+}
+
+func TestCreateUserIfNotExistsMySQL(t *testing.T) {
+	// IF NOT EXISTS clause — optional in MySQL 5.7+ / mandatory-ish in
+	// idempotent migrations. MUST still classify as StmtGrant with
+	// create_user indicator (the IF NOT EXISTS doesn't change the
+	// shape's risk profile — the user still exists after).
+	ps := myParse(`CREATE USER IF NOT EXISTS 'newuser'@'localhost' IDENTIFIED BY 'pw'`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.RiskIndicators, "create_user")
+	assert.Contains(t, ps.RiskIndicators, "identified_by_password")
+	assert.Contains(t, ps.Grantees, "'newuser'@'localhost'")
+}
+
+func TestNonDCLStatementHasEmptyDCLFieldsMySQL(t *testing.T) {
+	// Regression: plain SELECT MUST NOT populate Privileges / Grantees
+	// / TargetObject / RiskIndicators. These are DCL-only fields;
+	// bleeding into non-DCL parsing confuses downstream filters.
+	// Parallels the PG TestParse_NonDCLStatementHasEmptyDCLFields test.
+	ps := myParse(`SELECT * FROM foo`)
+	assert.Nil(t, ps.Privileges)
+	assert.Nil(t, ps.Grantees)
+	assert.Empty(t, ps.TargetObject)
+	assert.Nil(t, ps.RiskIndicators)
+	assert.False(t, ps.IsDCL)
+}
+
+func TestRevokeAllGlobalMySQL(t *testing.T) {
+	// REVOKE ALL PRIVILEGES, GRANT OPTION FROM <user> — the global
+	// revoke shape. No "ON <obj>" clause; the parser must handle that
+	// branch + still classify as StmtRevoke + IsDCL.
+	ps := myParse(`REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'bob'@'%'`)
+	assert.Equal(t, StmtRevoke, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.Grantees, "'bob'@'%'")
+}
+
+func TestGrantOnGlobalShapeMySQL(t *testing.T) {
+	// GRANT SELECT ON *.* TO ... — global scope, all schemas. TargetObject
+	// MUST read "global:*.*" so a downstream filter can match "grants
+	// on the global scope" without re-parsing.
+	ps := myParse(`GRANT SELECT ON *.* TO 'monitor'@'localhost'`)
+	assert.Equal(t, "global:*.*", ps.TargetObject)
+	assert.Equal(t, []string{"SELECT"}, ps.Privileges)
+}

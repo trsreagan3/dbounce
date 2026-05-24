@@ -229,9 +229,14 @@ func TestStartupWarningSuppressedWhenNilProfile(t *testing.T) {
 		"nil ActiveProfile MUST suppress the admin-grant warning (indeterminate state)")
 }
 
-func TestStartupWarningSuppressedForNonPostgresDialect(t *testing.T) {
-	// MySQL dialect → no warning (MySQL classifier doesn't surface DCL
-	// yet; separate follow-up task). The floor only applies to PG.
+func TestStartupWarningEmittedForMySQLWithoutAdminGrantRules(t *testing.T) {
+	// MySQL dialect parity with PostgreSQL per #556 follow-up from
+	// UC-34. The MySQL classifier now surfaces DCL (GRANT / REVOKE /
+	// CREATE USER / DROP USER / RENAME USER / SET PASSWORD), so the
+	// admin-tight floor in proxy.decide() Step 5.5 fires on MySQL
+	// upstreams. The warning text MUST adapt — MySQL's DCL surface is
+	// broader than PG's (CREATE USER, etc.), so the wording mentions
+	// those shapes specifically.
 	cfg := bannerCfg()
 	cfg.Dialect = proxy.DialectMySQL
 	emptyProfile := &profile.Profile{Name: "test-empty"}
@@ -245,8 +250,67 @@ func TestStartupWarningSuppressedForNonPostgresDialect(t *testing.T) {
 		Quiet:                false,
 		ActiveProfile:        emptyProfile,
 	})
+	got := buf.String()
+	assert.Contains(t, got, "WARNING:",
+		"MySQL + no admin-grant rules MUST emit a WARNING line (#556 parity with PG path)")
+	assert.Contains(t, got, "MySQL handler enabled",
+		"warning must name MySQL specifically so operators know which dialect's floor fired")
+	assert.Contains(t, got, "GRANT / CREATE USER",
+		"MySQL warning must name CREATE USER (MySQL-specific admin-grant shape)")
+	assert.Contains(t, got, "admin-grant rules in profile",
+		"warning text must name admin-grant rules")
+	assert.Contains(t, got, "REVOKE / DROP USER are unaffected",
+		"MySQL warning must clarify REVOKE + DROP USER are NOT denied (cleanup direction)")
+	assert.Contains(t, got, "dbounce rules add 'GRANT:*' --effect allow",
+		"warning must show the override-rule one-liner so operators have the fix")
+}
+
+func TestStartupWarningSuppressedForSnowflakeDialect(t *testing.T) {
+	// Snowflake + BigQuery parsers don't classify DCL — the admin-tight
+	// floor never fires on them, so emitting the warning would mislead.
+	// Verifies the dialect gate in shouldEmitAdminGrantWarning still
+	// excludes them after #556 added MySQL.
+	cfg := bannerCfg()
+	cfg.Dialect = proxy.DialectSnowflake
+	emptyProfile := &profile.Profile{Name: "test-empty"}
+	var buf bytes.Buffer
+	writeStartupBanner(&buf, bannerOpts{
+		Cfg:                  cfg,
+		StoredAuditDBPath:    "/tmp/state.db",
+		ActiveProfileName:    "test-empty",
+		ResolvedProfilesPath: "/etc/dbounce/profiles.yaml",
+		ProfileFromFlag:      true,
+		Quiet:                false,
+		ActiveProfile:        emptyProfile,
+	})
 	assert.NotContains(t, buf.String(), "WARNING:",
-		"non-PostgreSQL dialect MUST suppress the admin-grant warning (MySQL DCL classifier is a follow-up task)")
+		"Snowflake dialect MUST suppress the admin-grant warning (parser doesn't classify DCL)")
+}
+
+func TestStartupWarningMySQLSuppressedWhenProfileAllowsGrant(t *testing.T) {
+	// MySQL parity for the override-suppress path: a profile with
+	// GRANT:* allow_rule MUST suppress the warning on MySQL too (not
+	// just PG). Cross-dialect parity for the override semantics.
+	cfg := bannerCfg()
+	cfg.Dialect = proxy.DialectMySQL
+	pwithGrant := &profile.Profile{
+		Name: "test-with-grant",
+		AllowRules: []profile.ProfileAllowRule{
+			{Pattern: "GRANT:*", Note: "admin DCL allowed"},
+		},
+	}
+	var buf bytes.Buffer
+	writeStartupBanner(&buf, bannerOpts{
+		Cfg:                  cfg,
+		StoredAuditDBPath:    "/tmp/state.db",
+		ActiveProfileName:    "test-with-grant",
+		ResolvedProfilesPath: "/etc/dbounce/profiles.yaml",
+		ProfileFromFlag:      true,
+		Quiet:                false,
+		ActiveProfile:        pwithGrant,
+	})
+	assert.NotContains(t, buf.String(), "WARNING:",
+		"MySQL profile with GRANT:* allow_rule MUST suppress the admin-grant warning")
 }
 
 func TestWriteStartupBanner_Full_UpstreamObservationOnlyNote(t *testing.T) {

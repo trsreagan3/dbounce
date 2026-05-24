@@ -89,6 +89,20 @@ func parseMySQL(raw string) *ParsedStatement {
 		return out
 	}
 
+	// MySQL DCL pre-check — per #556 follow-up from UC-34. xwb1989's
+	// grammar doesn't recognize GRANT / REVOKE / CREATE USER / DROP
+	// USER / RENAME USER / SET PASSWORD, so without this pre-check the
+	// proxy.decide() Step 5.5 admin-tight floor (which gates on
+	// IsDCL=true + StatementType in StmtGrant/StmtAlterPrivileges)
+	// NEVER fires on MySQL upstreams. Same shape as the LOAD pre-check
+	// above: comment-stripped, ToUpper-ed, keyword-prefix-matched.
+	//
+	// See mysql_dcl.go for the full grammar coverage + honest
+	// limitations vs. the AST-based PostgreSQL path.
+	if detectMySQLDCL(out, stripped, upper) {
+		return out
+	}
+
 	// xwb1989/sqlparser can handle multi-statement batches via
 	// ParseNext + Tokenizer; the simpler Parse() consumes just the
 	// first statement. We mirror the PG parser's batch semantics: the

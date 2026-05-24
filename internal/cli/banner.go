@@ -222,28 +222,53 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 		}
 	}
 	// UC-34 admin-tight warning. Per MRR-1 audit (commit 7d69e68) +
-	// [[safety-mode-lean-permissive]]: PostgreSQL handler + no
+	// [[safety-mode-lean-permissive]]: PostgreSQL or MySQL handler + no
 	// admin-grant allow_rules in the active profile (or no profile
 	// loaded at all) → emit a WARNING so the operator isn't surprised
 	// when their first GRANT attempt is denied.
+	//
+	// MySQL parity (#556 follow-up from UC-34): the MySQL classifier
+	// now surfaces GRANT / REVOKE / CREATE USER / DROP USER / RENAME
+	// USER / SET PASSWORD as DCL, so the admin-tight floor fires on
+	// MySQL upstreams too. The warning text is dialect-aware — MySQL
+	// has a broader DCL surface (CREATE USER, etc.) than PostgreSQL
+	// (GRANT + ALTER DEFAULT PRIVILEGES), so the wording adapts.
 	//
 	// Quiet-banner suppresses this too — operators who opted into the
 	// fingerprint-suppressed banner shape opted out of all banner
 	// hints. The /healthz endpoint still surfaces the admin-tight
 	// floor state via the per-decision audit row.
 	if !opts.Quiet && shouldEmitAdminGrantWarning(cfg.Dialect, opts.ActiveProfile) {
-		fmt.Fprintln(w,
-			"WARNING: PostgreSQL handler enabled with no admin-grant rules in profile.")
-		fmt.Fprintln(w,
-			"  GRANT / ALTER DEFAULT PRIVILEGES statements will be DENIED by default")
-		fmt.Fprintln(w,
-			"  (admin-tight per [[safety-mode-lean-permissive]]; UC-34 admin-grant floor).")
-		fmt.Fprintln(w,
-			"  Add an explicit allow_rule for admin-grant operations if your workflow needs them:")
-		fmt.Fprintln(w,
-			"    dbounce rules add 'GRANT:*' --effect allow --note 'admin DCL allowed for migrations'")
-		fmt.Fprintln(w,
-			"  REVOKE is unaffected (cleanup direction is always allowed).")
+		switch cfg.Dialect {
+		case proxy.DialectMySQL:
+			fmt.Fprintln(w,
+				"WARNING: MySQL handler enabled with no admin-grant rules in profile.")
+			fmt.Fprintln(w,
+				"  GRANT / CREATE USER / RENAME USER / SET PASSWORD statements will be")
+			fmt.Fprintln(w,
+				"  DENIED by default (admin-tight per [[safety-mode-lean-permissive]];")
+			fmt.Fprintln(w,
+				"  #556 MySQL DCL parity follow-up from UC-34 admin-grant floor).")
+			fmt.Fprintln(w,
+				"  Add an explicit allow_rule for admin-grant operations if your workflow needs them:")
+			fmt.Fprintln(w,
+				"    dbounce rules add 'GRANT:*' --effect allow --note 'admin DCL allowed for migrations'")
+			fmt.Fprintln(w,
+				"  REVOKE / DROP USER are unaffected (cleanup direction is always allowed).")
+		default:
+			fmt.Fprintln(w,
+				"WARNING: PostgreSQL handler enabled with no admin-grant rules in profile.")
+			fmt.Fprintln(w,
+				"  GRANT / ALTER DEFAULT PRIVILEGES statements will be DENIED by default")
+			fmt.Fprintln(w,
+				"  (admin-tight per [[safety-mode-lean-permissive]]; UC-34 admin-grant floor).")
+			fmt.Fprintln(w,
+				"  Add an explicit allow_rule for admin-grant operations if your workflow needs them:")
+			fmt.Fprintln(w,
+				"    dbounce rules add 'GRANT:*' --effect allow --note 'admin DCL allowed for migrations'")
+			fmt.Fprintln(w,
+				"  REVOKE is unaffected (cleanup direction is always allowed).")
+		}
 	}
 	fmt.Fprintln(w, "Ctrl+C to stop.")
 }
@@ -251,11 +276,15 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 // shouldEmitAdminGrantWarning returns true when the startup banner
 // should emit the UC-34 admin-tight warning. Fires when:
 //
-//   - dialect is PostgreSQL (the only dialect with full DCL parsing
-//     in v1.0; MySQL classifier doesn't surface DCL yet — separate
-//     follow-up task), AND
+//   - dialect is PostgreSQL OR MySQL (both dialects now surface DCL
+//     via their respective parsers; #556 closed the MySQL parity gap),
+//     AND
 //   - the active profile has no allow_rule whose statement_type half
 //     matches GRANT (literal pattern OR wildcard).
+//
+// Snowflake + BigQuery dialects DO NOT trigger the warning because
+// their parsers don't currently classify DCL — the admin-tight floor
+// won't fire on them either, so emitting a hint would mislead.
 //
 // A nil profile suppresses the warning — the operator's setup is
 // indeterminate and emitting a misleading hint is worse than no hint
@@ -266,7 +295,7 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 // REVOKE carve-out so the operator reads "here is what dbounce will
 // do + how to override," not "you have misconfigured something."
 func shouldEmitAdminGrantWarning(dialect proxy.Dialect, p *profile.Profile) bool {
-	if dialect != proxy.DialectPostgres {
+	if dialect != proxy.DialectPostgres && dialect != proxy.DialectMySQL {
 		return false
 	}
 	if p == nil {
