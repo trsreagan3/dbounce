@@ -1284,6 +1284,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				ProfileEnvSet:        os.Getenv(envProfileVar) != "",
 				Quiet:                quietBanner,
 				AuditExporter:        auditExporter,
+				ActiveProfile:        activeProfile,
 			})
 			// #324c — dynamic-denies banner line. One line (with optional
 			// upstream-denied second line) per [[cross-product-agent-

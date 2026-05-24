@@ -15,9 +15,12 @@ package cli
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/trsreagan3/dbounce/internal/audit"
+	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
+	"github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
 
@@ -49,6 +52,11 @@ type bannerOpts struct {
 	// WebhookPusher's RedactedURL helper guarantees the bearer
 	// header never leaks via the banner path).
 	AuditExporter *audit.Exporter
+	// ActiveProfile, when non-nil, lets the banner inspect the
+	// resolved profile's allow_rules to decide whether the UC-34
+	// admin-grant warning fires. nil → warning is skipped (the
+	// banner can't introspect what it doesn't have).
+	ActiveProfile *profile.Profile
 }
 
 // writeStartupBanner writes the post-startup banner to w. Returns no
@@ -213,5 +221,87 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 					"alert on log/webhook failure)")
 		}
 	}
+	// UC-34 admin-tight warning. Per MRR-1 audit (commit 7d69e68) +
+	// [[safety-mode-lean-permissive]]: PostgreSQL handler + no
+	// admin-grant allow_rules in the active profile (or no profile
+	// loaded at all) → emit a WARNING so the operator isn't surprised
+	// when their first GRANT attempt is denied.
+	//
+	// Quiet-banner suppresses this too — operators who opted into the
+	// fingerprint-suppressed banner shape opted out of all banner
+	// hints. The /healthz endpoint still surfaces the admin-tight
+	// floor state via the per-decision audit row.
+	if !opts.Quiet && shouldEmitAdminGrantWarning(cfg.Dialect, opts.ActiveProfile) {
+		fmt.Fprintln(w,
+			"WARNING: PostgreSQL handler enabled with no admin-grant rules in profile.")
+		fmt.Fprintln(w,
+			"  GRANT / ALTER DEFAULT PRIVILEGES statements will be DENIED by default")
+		fmt.Fprintln(w,
+			"  (admin-tight per [[safety-mode-lean-permissive]]; UC-34 admin-grant floor).")
+		fmt.Fprintln(w,
+			"  Add an explicit allow_rule for admin-grant operations if your workflow needs them:")
+		fmt.Fprintln(w,
+			"    dbounce rules add 'GRANT:*' --effect allow --note 'admin DCL allowed for migrations'")
+		fmt.Fprintln(w,
+			"  REVOKE is unaffected (cleanup direction is always allowed).")
+	}
 	fmt.Fprintln(w, "Ctrl+C to stop.")
+}
+
+// shouldEmitAdminGrantWarning returns true when the startup banner
+// should emit the UC-34 admin-tight warning. Fires when:
+//
+//   - dialect is PostgreSQL (the only dialect with full DCL parsing
+//     in v1.0; MySQL classifier doesn't surface DCL yet — separate
+//     follow-up task), AND
+//   - the active profile has no allow_rule whose statement_type half
+//     matches GRANT (literal pattern OR wildcard).
+//
+// A nil profile suppresses the warning — the operator's setup is
+// indeterminate and emitting a misleading hint is worse than no hint
+// (cross-product banner discipline: only emit signal we're sure about).
+//
+// Per [[ibounce-honest-positioning]]: the warning is informational,
+// not prescriptive. It names the floor + the override path + the
+// REVOKE carve-out so the operator reads "here is what dbounce will
+// do + how to override," not "you have misconfigured something."
+func shouldEmitAdminGrantWarning(dialect proxy.Dialect, p *profile.Profile) bool {
+	if dialect != proxy.DialectPostgres {
+		return false
+	}
+	if p == nil {
+		return false
+	}
+	if profileAllowsAdminGrant(p) {
+		return false
+	}
+	return true
+}
+
+// profileAllowsAdminGrant returns true when the profile carries at
+// least one allow_rule whose statement_type half matches GRANT (literal
+// GRANT, wildcard *, or the DML/DDL/MUTATING categories are NOT
+// matched — those don't cover DCL per the rule-engine semantics).
+//
+// Conservative match: we accept GRANT literals + bare wildcards + the
+// generator-shape pattern "*:*". A rule whose statement_type is one of
+// the rule-engine categories (DML/DDL/MUTATING/READ) doesn't cover DCL
+// per the matcher in internal/rules — same semantics applied here.
+func profileAllowsAdminGrant(p *profile.Profile) bool {
+	if p == nil {
+		return false
+	}
+	for _, ar := range p.AllowRules {
+		stmtType, _, err := rules.ParsePattern(ar.Pattern)
+		if err != nil {
+			continue
+		}
+		if stmtType == rules.WildcardAny {
+			return true
+		}
+		if strings.EqualFold(stmtType, "GRANT") {
+			return true
+		}
+	}
+	return false
 }

@@ -139,6 +139,43 @@ type ParsedStatement struct {
 	// Always false for REVOKE — revoking from PUBLIC is a cleanup
 	// operation and stays advisory under safe-default.
 	DCLTargetsPublic bool
+	// Privileges is the list of privilege names extracted from a DCL
+	// statement (e.g. ["ALL"], ["SELECT", "INSERT"], ["USAGE"]). Empty
+	// for non-DCL statements. Surfaced for audit + so downstream policy
+	// can decide on the privilege shape (e.g. "ALL" is more severe than
+	// "SELECT"). Always upper-case for stable string comparison.
+	//
+	// For role-membership grants (`GRANT role_a TO role_b`) the
+	// privilege list is empty — the implicit privilege is "membership"
+	// which is captured by Grantees + IsDCL alone.
+	Privileges []string
+	// Grantees is the list of principal names the DCL statement grants
+	// privileges to (or revokes from). Lower-case for stable matching;
+	// the PG `PUBLIC` pseudo-role appears as the literal string "public".
+	// Empty for non-DCL statements.
+	Grantees []string
+	// TargetObject identifies the database object the DCL statement
+	// operates on. Shape examples:
+	//   "database:mydb"      — GRANT ... ON DATABASE mydb ...
+	//   "schema:public"      — GRANT ... ON SCHEMA public ...
+	//   "table:public.users" — GRANT ... ON TABLE public.users ...
+	//   "sequence:seq_id"    — GRANT ... ON SEQUENCE seq_id ...
+	//   "all-tables-in-schema:public" — ALTER DEFAULT PRIVILEGES IN SCHEMA public ...
+	//   ""                   — non-DCL OR object-kind not yet enumerated
+	// Per [[ibounce-honest-positioning]]: not every libpg_query object
+	// type maps cleanly to a TargetObject string; unknown kinds leave
+	// this field empty rather than fabricate a label.
+	TargetObject string
+	// RiskIndicators is the set of risk-flag strings attached to a DCL
+	// statement. Vocabulary (stable across versions; SIEM filters key
+	// on these):
+	//   "public_grant"     — grantee list includes PUBLIC
+	//   "all_privileges"   — privilege list is the wildcard ALL
+	//   "with_grant_option"— grantee can re-grant
+	//   "alter_default_privileges" — affects ALL FUTURE objects in scope
+	//   "role_membership"  — GRANT role_a TO role_b (membership shape)
+	// Empty for non-DCL statements and for DCL with no risk flags.
+	RiskIndicators []string
 	// HasMutatingNode is the Layer-2 backstop: AST walker found at least
 	// one mutating node anywhere in the tree, regardless of nesting
 	// depth. Catches CTE-wrapped writes whose top-level keyword is WITH

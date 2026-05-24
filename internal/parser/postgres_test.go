@@ -453,6 +453,161 @@ func TestParse_GrantMultipleGranteesIncludesPublic(t *testing.T) {
 		"PUBLIC mixed into a grantee list still triggers the floor")
 }
 
+// DCL field-extraction tests — per UC-34 spec: privileges + grantees +
+// target_object + risk_indicators must populate so downstream policy +
+// audit can reason about the privilege shape without re-parsing the
+// raw SQL.
+
+func TestParse_GrantAllToPublicPopulatesFields(t *testing.T) {
+	// The canonical UC-34 shape: GRANT ALL ON TABLE foo TO PUBLIC.
+	// Must surface:
+	//   operation=GRANT (StatementType)
+	//   grantees=["public"]
+	//   privileges=["ALL"]  (PG encodes empty privilege list as ALL;
+	//                        parser surfaces explicitly)
+	//   target_object="table:foo"
+	//   risk_indicators contains "public_grant" AND "all_privileges"
+	ps := pgParse(`GRANT ALL ON TABLE foo TO PUBLIC`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, []string{"public"}, ps.Grantees)
+	assert.Equal(t, []string{"ALL"}, ps.Privileges)
+	assert.Equal(t, "table:foo", ps.TargetObject)
+	assert.Contains(t, ps.RiskIndicators, "public_grant",
+		"GRANT ... TO PUBLIC MUST flag public_grant")
+	assert.Contains(t, ps.RiskIndicators, "all_privileges",
+		"GRANT ALL ... MUST flag all_privileges")
+}
+
+func TestParse_GrantSelectToUserPopulatesFields(t *testing.T) {
+	// Non-PUBLIC, non-ALL grant: still classified as admin-grant
+	// (StmtGrant + IsDCL) but with NEITHER public_grant NOR
+	// all_privileges flagged — risk_indicators may be empty for the
+	// "boring" case.
+	ps := pgParse(`GRANT SELECT ON TABLE foo TO bob`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, []string{"bob"}, ps.Grantees)
+	assert.Equal(t, []string{"SELECT"}, ps.Privileges)
+	assert.Equal(t, "table:foo", ps.TargetObject)
+	assert.NotContains(t, ps.RiskIndicators, "public_grant")
+	assert.NotContains(t, ps.RiskIndicators, "all_privileges")
+	assert.NotContains(t, ps.RiskIndicators, "with_grant_option")
+}
+
+func TestParse_GrantWithGrantOptionFlagged(t *testing.T) {
+	// WITH GRANT OPTION — grantee can re-grant the privilege. Always
+	// flagged as a risk_indicator regardless of who the grantee is.
+	ps := pgParse(`GRANT SELECT ON foo TO bob WITH GRANT OPTION`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.RiskIndicators, "with_grant_option",
+		"WITH GRANT OPTION MUST flag with_grant_option indicator")
+}
+
+func TestParse_GrantMultiplePrivileges(t *testing.T) {
+	// Multi-privilege grant: every privilege surfaces in upper-case,
+	// in declared order, with no dedup needed (PG doesn't allow
+	// duplicate privileges in the same GRANT).
+	ps := pgParse(`GRANT SELECT, INSERT, UPDATE ON TABLE foo TO bob`)
+	assert.Equal(t, []string{"SELECT", "INSERT", "UPDATE"}, ps.Privileges)
+	assert.Equal(t, []string{"bob"}, ps.Grantees)
+}
+
+func TestParse_GrantOnDatabasePopulatesTarget(t *testing.T) {
+	// The MRR-1 audit's literal shape: GRANT ALL PRIVILEGES ON DATABASE
+	// mydb TO PUBLIC. TargetObject must read "database:mydb" so a
+	// downstream filter can match "grants on prod-account databases"
+	// without re-parsing.
+	ps := pgParse(`GRANT ALL PRIVILEGES ON DATABASE mydb TO PUBLIC`)
+	assert.Equal(t, "database:mydb", ps.TargetObject)
+	assert.Equal(t, []string{"public"}, ps.Grantees)
+	assert.Equal(t, []string{"ALL"}, ps.Privileges)
+	assert.Contains(t, ps.RiskIndicators, "public_grant")
+	assert.Contains(t, ps.RiskIndicators, "all_privileges")
+}
+
+func TestParse_GrantOnSchemaPopulatesTarget(t *testing.T) {
+	ps := pgParse(`GRANT USAGE ON SCHEMA public TO bob`)
+	assert.Equal(t, "schema:public", ps.TargetObject)
+	assert.Equal(t, []string{"USAGE"}, ps.Privileges)
+	assert.Equal(t, []string{"bob"}, ps.Grantees)
+}
+
+func TestParse_RevokeClassifiedAsAdminRevoke(t *testing.T) {
+	// REVOKE direction (IsGrant=false on the AST). Per UC-34 spec test
+	// #4: classified as admin-revoke (StmtRevoke). Privileges +
+	// grantees still extracted (audit signal — operators want to know
+	// what got revoked from whom). risk_indicators stay empty for
+	// REVOKE — revoking IS cleanup; no escalation shape applies.
+	ps := pgParse(`REVOKE SELECT ON foo FROM bob`)
+	assert.Equal(t, StmtRevoke, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, []string{"SELECT"}, ps.Privileges)
+	assert.Equal(t, []string{"bob"}, ps.Grantees)
+	assert.Equal(t, "table:foo", ps.TargetObject)
+	assert.NotContains(t, ps.RiskIndicators, "public_grant")
+	assert.NotContains(t, ps.RiskIndicators, "all_privileges")
+}
+
+func TestParse_AlterDefaultPrivilegesFlaggedAsAlteringFutureObjects(t *testing.T) {
+	// ALTER DEFAULT PRIVILEGES affects EVERY FUTURE object created in
+	// the schema — a dangerous escalation shape distinct from a
+	// one-time GRANT. risk_indicators MUST include
+	// "alter_default_privileges" so audit + SIEM can prioritize.
+	ps := pgParse(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO bob`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.RiskIndicators, "alter_default_privileges",
+		"ALTER DEFAULT PRIVILEGES MUST flag alter_default_privileges indicator")
+	assert.Equal(t, "all-tables-in-schema:public", ps.TargetObject)
+	assert.Equal(t, []string{"SELECT"}, ps.Privileges)
+	assert.Equal(t, []string{"bob"}, ps.Grantees)
+}
+
+func TestParse_AlterDefaultPrivilegesAllToPublicMultipleIndicators(t *testing.T) {
+	// The dangerous combo: ALTER DEFAULT PRIVILEGES ... GRANT ALL ... TO
+	// PUBLIC. Three risk_indicators MUST fire:
+	//   alter_default_privileges + all_privileges + public_grant
+	ps := pgParse(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO PUBLIC`)
+	assert.Contains(t, ps.RiskIndicators, "alter_default_privileges")
+	assert.Contains(t, ps.RiskIndicators, "all_privileges")
+	assert.Contains(t, ps.RiskIndicators, "public_grant")
+	assert.True(t, ps.DCLTargetsPublic)
+}
+
+func TestParse_GrantRoleMembershipFlagged(t *testing.T) {
+	// `GRANT role_a TO bob` — role-membership grant (GrantRoleStmt
+	// node). Must flag role_membership indicator + surface the granted
+	// role as ROLE:role_a in Privileges so the audit row carries the
+	// role-name context.
+	ps := pgParse(`GRANT manager_role TO bob`)
+	assert.Equal(t, StmtGrant, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+	assert.Contains(t, ps.RiskIndicators, "role_membership")
+	assert.Contains(t, ps.Privileges, "ROLE:manager_role")
+	assert.Equal(t, []string{"bob"}, ps.Grantees)
+}
+
+func TestParse_GrantRoleWithAdminOptionFlagged(t *testing.T) {
+	// WITH ADMIN OPTION on a role-membership grant = bob can grant
+	// manager_role to others. Risk indicator with_admin_option.
+	ps := pgParse(`GRANT manager_role TO bob WITH ADMIN OPTION`)
+	assert.Contains(t, ps.RiskIndicators, "with_admin_option",
+		"WITH ADMIN OPTION MUST flag with_admin_option indicator")
+}
+
+func TestParse_NonDCLStatementHasEmptyDCLFields(t *testing.T) {
+	// Regression: a plain SELECT must NOT populate Privileges / Grantees /
+	// TargetObject / RiskIndicators. These are DCL-only fields; bleeding
+	// into non-DCL parsing would confuse downstream filters.
+	ps := pgParse(`SELECT * FROM foo`)
+	assert.Nil(t, ps.Privileges)
+	assert.Nil(t, ps.Grantees)
+	assert.Empty(t, ps.TargetObject)
+	assert.Nil(t, ps.RiskIndicators)
+}
+
 // Multi-statement batches: the FIRST statement drives StatementType,
 // but TablesTouched + HasMutatingNode aggregate across all statements
 // in the batch so a "SELECT 1; UPDATE secrets ..." batch still

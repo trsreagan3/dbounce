@@ -2232,6 +2232,41 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 		}
 	}
 
+	// Step 5.5: admin-tight floor for DCL (GRANT / ALTER DEFAULT PRIVILEGES).
+	// Per UC-34 (MRR-1 audit, commit 7d69e68) + [[safety-mode-lean-
+	// permissive]]: admin/IAM operations are default-tight even when
+	// the surrounding default-policy is "allow." Without this floor a
+	// `GRANT ALL ... TO PUBLIC` slipped through any deployment running
+	// with --default-policy=allow + no profile + no explicit allow rule.
+	//
+	// Scope: GRANT and ALTER DEFAULT PRIVILEGES are denied. REVOKE is
+	// NOT denied — revoking a privilege is a cleanup operation and
+	// admin-tight denying it would refuse the safer direction of every
+	// GRANT/REVOKE pair.
+	//
+	// Override path: an operator who wants admin-grant traffic to flow
+	// adds an explicit allow rule via `dbounce rules add` (a global
+	// allow that matches GRANT) OR via a profile allow_rule. Both
+	// override paths fire BEFORE this floor (the global match check
+	// directly above; the profile path at Step 1/2 returns early).
+	//
+	// Source: SourceDefault tagged with the floor reason so audit
+	// reviewers see "this would have allowed under the surrounding
+	// default-policy but the admin-tight floor refused." Cross-product
+	// SIEM filters key on the reason string.
+	if ps != nil && ps.IsDCL && isAdminGrantShape(ps.StatementType) {
+		return Decision{
+			Verdict: VerdictDeny,
+			Reason: fmt.Sprintf(
+				"admin-tight floor: %s requires an explicit allow_rule "+
+					"(profile or global) — DCL operations are default-deny "+
+					"per [[safety-mode-lean-permissive]]; default-policy=%s "+
+					"is bypassed for privilege management",
+				ps.StatementType, s.cfg.DefaultPolicy),
+			Source: SourceDefault,
+		}
+	}
+
 	// Step 6: default-policy fall-through.
 	verdict := VerdictAllow
 	reason := "default policy: allow (no rule matched)"
@@ -2244,6 +2279,19 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 		Reason:  reason,
 		Source:  SourceDefault,
 	}
+}
+
+// isAdminGrantShape returns true when the parsed statement type is one
+// of the privilege-granting DCL shapes that get default-deny treatment
+// per the UC-34 admin-tight floor. StmtRevoke is NOT in the set —
+// revoking is cleanup; the floor would refuse the safer direction of
+// every GRANT/REVOKE pair. Per [[safety-mode-lean-permissive]].
+func isAdminGrantShape(stmtType string) bool {
+	switch stmtType {
+	case parser.StmtGrant, parser.StmtAlterPrivileges:
+		return true
+	}
+	return false
 }
 
 // taskIDOrEmpty returns the active task id or "" when nil. Tiny helper

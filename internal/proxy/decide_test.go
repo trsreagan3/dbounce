@@ -309,6 +309,84 @@ func TestDecide_CooperativeMode_DenyNotEnforced(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// UC-34 admin-grant default-deny floor. Per MRR-1 audit (commit 7d69e68)
+// + [[safety-mode-lean-permissive]]: GRANT / ALTER DEFAULT PRIVILEGES
+// operations default-deny even when --default-policy=allow — the
+// default-policy fall-through bypassed every other deny path before the
+// floor landed. REVOKE stays advisory (cleanup direction). An explicit
+// allow_rule (global OR task-allow OR profile) lets the admin operate.
+// ---------------------------------------------------------------------------
+
+func TestDecide_AdminGrantDeniedByDefault(t *testing.T) {
+	// UC-34 core regression: DefaultPolicyAllow + no rules + GRANT ALL
+	// ON TABLE foo TO PUBLIC. Before the floor: ALLOW via default-allow.
+	// After: DENY via admin-tight floor with SourceDefault + reason
+	// naming the floor.
+	srv, _ := newDecideTestServer(t, DefaultPolicyAllow)
+	d := srv.decide(parse(t, "GRANT ALL ON TABLE foo TO PUBLIC"))
+	assert.Equal(t, VerdictDeny, d.Verdict,
+		"GRANT under default-allow + no rules MUST deny via admin-tight floor (UC-34)")
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.Contains(t, d.Reason, "admin-tight floor",
+		"deny reason must name the admin-tight floor so audit reviewers see the source")
+	assert.Contains(t, d.Reason, "GRANT")
+}
+
+func TestDecide_AdminGrantAllowedWithExplicitGlobalRule(t *testing.T) {
+	// Override path: a global allow rule matching GRANT lets the admin
+	// operate. Fires BEFORE the floor (the global-allow short-circuit
+	// is the layer above).
+	srv, st := newDecideTestServer(t, DefaultPolicyAllow)
+	_, err := st.AddRule(dbrules.ProxyRule{
+		Pattern: "GRANT:*", Effect: dbrules.EffectAllow,
+	})
+	require.NoError(t, err)
+	d := srv.decide(parse(t, "GRANT SELECT ON TABLE foo TO bob"))
+	assert.Equal(t, VerdictAllow, d.Verdict,
+		"explicit global allow_rule MUST override the admin-tight floor")
+	assert.Equal(t, SourceGlobalAllow, d.Source)
+}
+
+func TestDecide_AdminAlterDefaultPrivilegesDeniedByDefault(t *testing.T) {
+	// ALTER DEFAULT PRIVILEGES affects every FUTURE object — same
+	// admin-tight class as GRANT. Floor must fire.
+	srv, _ := newDecideTestServer(t, DefaultPolicyAllow)
+	d := srv.decide(parse(t,
+		"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO bob"))
+	assert.Equal(t, VerdictDeny, d.Verdict,
+		"ALTER DEFAULT PRIVILEGES MUST default-deny via admin-tight floor")
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.Contains(t, d.Reason, "admin-tight floor")
+	assert.Contains(t, d.Reason, parser.StmtAlterPrivileges)
+}
+
+func TestDecide_RevokeNotCaughtByAdminFloor(t *testing.T) {
+	// REVOKE is the cleanup direction — admin-tight floor MUST NOT
+	// refuse it. Falls through to default-policy=allow.
+	srv, _ := newDecideTestServer(t, DefaultPolicyAllow)
+	d := srv.decide(parse(t, "REVOKE SELECT ON foo FROM bob"))
+	assert.Equal(t, VerdictAllow, d.Verdict,
+		"REVOKE is cleanup; admin-tight floor MUST NOT refuse it")
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.NotContains(t, d.Reason, "admin-tight floor",
+		"REVOKE reason must NOT name the admin-tight floor")
+}
+
+func TestDecide_AdminGrantUnderDefaultDenyStillDenied(t *testing.T) {
+	// Defense-in-depth check: even with default-policy=deny the GRANT
+	// is denied (the floor + default-deny both refuse). Source is the
+	// admin-tight floor (it fires first); reason names the floor so
+	// audit reviewers see WHY rather than just "default deny."
+	srv, _ := newDecideTestServer(t, DefaultPolicyDeny)
+	d := srv.decide(parse(t, "GRANT ALL ON TABLE foo TO PUBLIC"))
+	assert.Equal(t, VerdictDeny, d.Verdict)
+	assert.Equal(t, SourceDefault, d.Source)
+	assert.Contains(t, d.Reason, "admin-tight floor",
+		"default-deny + GRANT MUST surface the admin-tight floor reason so reviewers see "+
+			"the specific safety rule that fired (not just 'default deny')")
+}
+
+// ---------------------------------------------------------------------------
 // MED-D8-09 (AUDIT-WB-DSLICES-1-8.md): --redact-literals round-trip tests.
 // ---------------------------------------------------------------------------
 

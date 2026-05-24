@@ -460,11 +460,13 @@ func walkNode(n *pg_query.Node, ctx *walkCtx) {
 		// SEQUENCE / FUNCTION / etc.). Walker surfaces:
 		//   - touched tables (so table-scope rules still apply)
 		//   - dcl_targets_public when any grantee is the PUBLIC pseudo-role
+		//   - privileges + grantees + target_object + risk_indicators
 		// REVOKE direction (IsGrant=false) NEVER sets dcl_targets_public —
 		// revoking FROM PUBLIC is cleanup and the safe-default profile lets
 		// it through.
 		if v.GrantStmt != nil {
-			for _, obj := range v.GrantStmt.Objects {
+			gs := v.GrantStmt
+			for _, obj := range gs.Objects {
 				if obj == nil {
 					continue
 				}
@@ -472,8 +474,25 @@ func walkNode(n *pg_query.Node, ctx *walkCtx) {
 					ctx.tables[qualify(rng.RangeVar)] = struct{}{}
 				}
 			}
-			if v.GrantStmt.IsGrant && granteesIncludePublic(v.GrantStmt.Grantees) {
-				ctx.parsed.DCLTargetsPublic = true
+			// privileges + grantees + target_object extraction (for both
+			// GRANT and REVOKE — downstream filters use these on either
+			// direction, e.g. "what got revoked" is an audit signal too).
+			ctx.parsed.Privileges = appendUnique(ctx.parsed.Privileges, extractGrantPrivileges(gs.Privileges, gs.Targtype)...)
+			ctx.parsed.Grantees = appendUnique(ctx.parsed.Grantees, extractGranteeNames(gs.Grantees)...)
+			if ctx.parsed.TargetObject == "" {
+				ctx.parsed.TargetObject = grantTargetObjectLabel(gs)
+			}
+			if gs.IsGrant {
+				if granteesIncludePublic(gs.Grantees) {
+					ctx.parsed.DCLTargetsPublic = true
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "public_grant")
+				}
+				if grantHasAllPrivileges(gs.Privileges) {
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "all_privileges")
+				}
+				if gs.GrantOption {
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "with_grant_option")
+				}
 			}
 		}
 	case *pg_query.Node_GrantRoleStmt:
@@ -484,9 +503,24 @@ func walkNode(n *pg_query.Node, ctx *walkCtx) {
 		// PUBLIC, but the predicate stays consistent across both
 		// GrantStmt shapes so downstream callers don't have to dispatch
 		// on the inner type.
-		if v.GrantRoleStmt != nil && v.GrantRoleStmt.IsGrant {
-			if granteesIncludePublic(v.GrantRoleStmt.GranteeRoles) {
-				ctx.parsed.DCLTargetsPublic = true
+		if v.GrantRoleStmt != nil {
+			grs := v.GrantRoleStmt
+			ctx.parsed.Grantees = appendUnique(ctx.parsed.Grantees, extractGranteeNames(grs.GranteeRoles)...)
+			// Role-membership grants have no privilege list per se; the
+			// implicit privilege is "membership in <role>". Surface the
+			// granted roles into Privileges as "ROLE:<name>" so audit
+			// rows + downstream filters carry the role-name context
+			// without overloading TargetObject.
+			ctx.parsed.Privileges = appendUnique(ctx.parsed.Privileges, extractRoleNames(grs.GrantedRoles)...)
+			if grs.IsGrant {
+				ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "role_membership")
+				if granteesIncludePublic(grs.GranteeRoles) {
+					ctx.parsed.DCLTargetsPublic = true
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "public_grant")
+				}
+				if grantRoleHasAdminOption(grs.Opt) {
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "with_admin_option")
+				}
 			}
 		}
 	case *pg_query.Node_AlterDefaultPrivilegesStmt:
@@ -496,8 +530,27 @@ func walkNode(n *pg_query.Node, ctx *walkCtx) {
 		// GrantStmt) so granteesIncludePublic fires consistently.
 		if v.AlterDefaultPrivilegesStmt != nil && v.AlterDefaultPrivilegesStmt.Action != nil {
 			action := v.AlterDefaultPrivilegesStmt.Action
-			if action.IsGrant && granteesIncludePublic(action.Grantees) {
-				ctx.parsed.DCLTargetsPublic = true
+			ctx.parsed.Privileges = appendUnique(ctx.parsed.Privileges, extractGrantPrivileges(action.Privileges, action.Targtype)...)
+			ctx.parsed.Grantees = appendUnique(ctx.parsed.Grantees, extractGranteeNames(action.Grantees)...)
+			ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "alter_default_privileges")
+			// TargetObject for ADP is the schema scope (when supplied),
+			// expressed as `all-<objtype>-in-schema:<schema>` so an
+			// operator reading the audit row sees "this affects every
+			// future TABLE in `public`" rather than just `schema:public`.
+			if ctx.parsed.TargetObject == "" {
+				ctx.parsed.TargetObject = alterDefaultPrivTargetLabel(v.AlterDefaultPrivilegesStmt, action)
+			}
+			if action.IsGrant {
+				if granteesIncludePublic(action.Grantees) {
+					ctx.parsed.DCLTargetsPublic = true
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "public_grant")
+				}
+				if grantHasAllPrivileges(action.Privileges) {
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "all_privileges")
+				}
+				if action.GrantOption {
+					ctx.parsed.RiskIndicators = appendUnique(ctx.parsed.RiskIndicators, "with_grant_option")
+				}
 			}
 		}
 	case *pg_query.Node_RawStmt:
@@ -626,4 +679,421 @@ func sortedKeys(m map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// appendUnique appends each value to the slice if it is not already
+// present (case-sensitive). Used by the DCL walker to grow Privileges /
+// Grantees / RiskIndicators without duplicates when the same predicate
+// fires twice (e.g. a multi-statement batch with two GRANT ... TO PUBLIC
+// statements would otherwise list "public_grant" twice).
+//
+// O(n*m) where n = current length + m = new values. Both are tiny in
+// practice (DCL statements rarely carry >10 privileges / grantees) so
+// a map allocation per call would be more overhead than the linear scan.
+func appendUnique(slice []string, values ...string) []string {
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		found := false
+		for _, existing := range slice {
+			if existing == v {
+				found = true
+				break
+			}
+		}
+		if !found {
+			slice = append(slice, v)
+		}
+	}
+	return slice
+}
+
+// extractGrantPrivileges turns a GrantStmt.Privileges list into the
+// upper-case privilege-name slice we expose via ParsedStatement.Privileges.
+//
+// pg_query encoding: each Node in the list wraps an *AccessPriv whose
+// PrivName is the bare privilege keyword ("SELECT", "INSERT", "UPDATE",
+// etc.). An empty Privileges list is PG's encoding for `GRANT ALL ...`
+// per the grammar — we surface that as the single-element ["ALL"] so
+// downstream filters don't have to special-case "empty list = ALL".
+//
+// targtype distinguishes object-scoped grants from schema-fan-out
+// grants. We don't currently use it to label privileges differently,
+// but it's preserved in the signature so a future per-targtype filter
+// (e.g. "ALL TABLES IN SCHEMA" is broader than per-table "ALL") has
+// the hook without re-walking the AST.
+func extractGrantPrivileges(privs []*pg_query.Node, _ pg_query.GrantTargetType) []string {
+	if len(privs) == 0 {
+		// PG grammar: empty privilege list = ALL.
+		return []string{"ALL"}
+	}
+	out := make([]string, 0, len(privs))
+	for _, p := range privs {
+		if p == nil {
+			continue
+		}
+		ap, ok := p.Node.(*pg_query.Node_AccessPriv)
+		if !ok || ap.AccessPriv == nil {
+			continue
+		}
+		name := strings.ToUpper(strings.TrimSpace(ap.AccessPriv.PrivName))
+		if name == "" {
+			// PG encodes "ALL" as PrivName="" + non-nil AccessPriv. Surface
+			// it explicitly so the downstream stays uniform.
+			name = "ALL"
+		}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return []string{"ALL"}
+	}
+	return out
+}
+
+// grantHasAllPrivileges returns true when the GrantStmt.Privileges list
+// indicates a wildcard ALL grant. PG encodes ALL one of two ways:
+//
+//   - empty Privileges list (the canonical `GRANT ALL ON ...` shape), OR
+//   - a single AccessPriv with PrivName="" (defensive — older bindings)
+//
+// Risk-indicator population uses this; same predicate the safe-default
+// floor would use if a future profile rule wanted "deny ALL grants
+// regardless of grantee."
+func grantHasAllPrivileges(privs []*pg_query.Node) bool {
+	if len(privs) == 0 {
+		return true
+	}
+	for _, p := range privs {
+		if p == nil {
+			continue
+		}
+		ap, ok := p.Node.(*pg_query.Node_AccessPriv)
+		if !ok || ap.AccessPriv == nil {
+			continue
+		}
+		if strings.TrimSpace(ap.AccessPriv.PrivName) == "" ||
+			strings.EqualFold(strings.TrimSpace(ap.AccessPriv.PrivName), "ALL") {
+			return true
+		}
+	}
+	return false
+}
+
+// extractGranteeNames turns a grantee list (Node wrapping RoleSpec)
+// into lower-case principal names. The PG `PUBLIC` pseudo-role appears
+// as the literal "public" so downstream string matchers see it without
+// a separate predicate.
+func extractGranteeNames(grantees []*pg_query.Node) []string {
+	if len(grantees) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(grantees))
+	for _, g := range grantees {
+		if g == nil {
+			continue
+		}
+		rs, ok := g.Node.(*pg_query.Node_RoleSpec)
+		if !ok || rs.RoleSpec == nil {
+			continue
+		}
+		if rs.RoleSpec.Roletype == pg_query.RoleSpecType_ROLESPEC_PUBLIC {
+			out = append(out, "public")
+			continue
+		}
+		if name := strings.ToLower(strings.TrimSpace(rs.RoleSpec.Rolename)); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// extractRoleNames pulls the role names out of a GrantRoleStmt's
+// GrantedRoles list. pg_query encodes the "granted role" half as
+// AccessPriv nodes (NOT RoleSpec — that's the grantee half), with
+// the role name in priv_name. We lower-case + prefix with "ROLE:"
+// so downstream callers can distinguish a granted role from an
+// object-privilege when both populate ParsedStatement.Privileges.
+//
+// Defensive fallback: a future libpg_query version that switches the
+// encoding to RoleSpec is also handled (the role name comes off
+// RoleSpec.Rolename in that case).
+func extractRoleNames(roles []*pg_query.Node) []string {
+	if len(roles) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(roles))
+	for _, r := range roles {
+		if r == nil {
+			continue
+		}
+		switch n := r.Node.(type) {
+		case *pg_query.Node_AccessPriv:
+			if n.AccessPriv == nil {
+				continue
+			}
+			if name := strings.ToLower(strings.TrimSpace(n.AccessPriv.PrivName)); name != "" {
+				out = append(out, "ROLE:"+name)
+			}
+		case *pg_query.Node_RoleSpec:
+			if n.RoleSpec == nil {
+				continue
+			}
+			if name := strings.ToLower(strings.TrimSpace(n.RoleSpec.Rolename)); name != "" {
+				out = append(out, "ROLE:"+name)
+			}
+		}
+	}
+	return out
+}
+
+// grantRoleHasAdminOption returns true when the GrantRoleStmt's Opt
+// list contains a DefElem with defname="admin" (the WITH ADMIN OPTION
+// clause). pg_query encodes options as DefElem nodes inside the Opt
+// list; the canonical shape for WITH ADMIN OPTION is one DefElem
+// {defname:"admin", arg:bool true}.
+//
+// Defensive: we treat presence of a defname="admin" DefElem as the
+// option being set; older libpg_query builds that surface the option
+// differently are caught by the StatementType+IsDCL+role_membership
+// indicator path so the risk_indicator just narrows further when this
+// helper matches.
+func grantRoleHasAdminOption(opts []*pg_query.Node) bool {
+	for _, o := range opts {
+		if o == nil {
+			continue
+		}
+		def, ok := o.Node.(*pg_query.Node_DefElem)
+		if !ok || def.DefElem == nil {
+			continue
+		}
+		if strings.EqualFold(def.DefElem.Defname, "admin") {
+			return true
+		}
+	}
+	return false
+}
+
+// grantTargetObjectLabel renders a stable "<kind>:<identifier>" label
+// describing what the GrantStmt operates on. Per ParsedStatement.TargetObject
+// docstring — examples include "database:mydb", "schema:public",
+// "table:public.users".
+//
+// Object-kind dispatch keys off GrantStmt.Objtype (the ObjectType
+// enum). Identifier shape depends on which Node type the Objects list
+// carries — RangeVar for tables/sequences, String for database/schema
+// names, ObjectWithArgs for functions.
+//
+// Per [[ibounce-honest-positioning]]: we only label the object kinds
+// most commonly used in DCL workflows + the ones a deny-floor would
+// most need to discriminate. Unmapped kinds (foreign tables, types,
+// languages, etc.) leave TargetObject empty rather than fabricating
+// a label that downstream policy might misinterpret as a known kind.
+func grantTargetObjectLabel(gs *pg_query.GrantStmt) string {
+	if gs == nil {
+		return ""
+	}
+	switch gs.Targtype {
+	case pg_query.GrantTargetType_ACL_TARGET_ALL_IN_SCHEMA:
+		schemaName := firstSchemaName(gs.Objects)
+		if schemaName == "" {
+			return ""
+		}
+		return objtypeAllInSchemaLabel(gs.Objtype) + ":" + schemaName
+	}
+	// ACL_TARGET_OBJECT (or undefined, which PG treats as object-targeted):
+	switch gs.Objtype {
+	case pg_query.ObjectType_OBJECT_DATABASE:
+		if name := firstStringName(gs.Objects); name != "" {
+			return "database:" + name
+		}
+	case pg_query.ObjectType_OBJECT_SCHEMA:
+		if name := firstStringName(gs.Objects); name != "" {
+			return "schema:" + name
+		}
+	case pg_query.ObjectType_OBJECT_TABLE:
+		if name := firstRangeVarLabel(gs.Objects); name != "" {
+			return "table:" + name
+		}
+	case pg_query.ObjectType_OBJECT_SEQUENCE:
+		if name := firstRangeVarLabel(gs.Objects); name != "" {
+			return "sequence:" + name
+		}
+	case pg_query.ObjectType_OBJECT_FUNCTION:
+		if name := firstObjectWithArgsLabel(gs.Objects); name != "" {
+			return "function:" + name
+		}
+	}
+	// Unmapped object kind — leave empty rather than guess a label.
+	return ""
+}
+
+// alterDefaultPrivTargetLabel renders the TargetObject string for
+// ALTER DEFAULT PRIVILEGES. Shape:
+//
+//	all-tables-in-schema:public  — IN SCHEMA public + objtype=TABLE
+//	all-tables                   — no schema scope (server-wide ADP)
+//
+// The schema scope lives in the outer AlterDefaultPrivilegesStmt.Options
+// list as a DefElem with defname="schemas" + arg=List of String nodes.
+// The object kind lives on the inner action.Objtype.
+func alterDefaultPrivTargetLabel(adp *pg_query.AlterDefaultPrivilegesStmt, action *pg_query.GrantStmt) string {
+	if adp == nil || action == nil {
+		return ""
+	}
+	schemaName := alterDefaultPrivSchemaName(adp)
+	if schemaName != "" {
+		if kindInSchema := objtypeAllInSchemaLabel(action.Objtype); kindInSchema != "" {
+			return kindInSchema + ":" + schemaName
+		}
+	}
+	// No schema clause = ADP applies to every schema the grantor owns.
+	// Surface that as a kind-only label so downstream filters can match.
+	return objtypeAllLabel(action.Objtype)
+}
+
+// alterDefaultPrivSchemaName extracts the first schema name from an
+// AlterDefaultPrivilegesStmt's options list. Returns "" when no
+// `IN SCHEMA <name>` clause was present (server-wide ADP).
+func alterDefaultPrivSchemaName(adp *pg_query.AlterDefaultPrivilegesStmt) string {
+	if adp == nil {
+		return ""
+	}
+	for _, opt := range adp.Options {
+		if opt == nil {
+			continue
+		}
+		def, ok := opt.Node.(*pg_query.Node_DefElem)
+		if !ok || def.DefElem == nil {
+			continue
+		}
+		if !strings.EqualFold(def.DefElem.Defname, "schemas") {
+			continue
+		}
+		if def.DefElem.Arg == nil {
+			continue
+		}
+		listNode, ok := def.DefElem.Arg.Node.(*pg_query.Node_List)
+		if !ok || listNode.List == nil {
+			continue
+		}
+		for _, item := range listNode.List.Items {
+			if item == nil {
+				continue
+			}
+			str, ok := item.Node.(*pg_query.Node_String_)
+			if !ok || str.String_ == nil {
+				continue
+			}
+			if name := strings.ToLower(strings.TrimSpace(str.String_.Sval)); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// objtypeAllInSchemaLabel maps an ObjectType to the kind half of the
+// "all-X-in-schema:Y" label.
+func objtypeAllInSchemaLabel(ot pg_query.ObjectType) string {
+	switch ot {
+	case pg_query.ObjectType_OBJECT_TABLE:
+		return "all-tables-in-schema"
+	case pg_query.ObjectType_OBJECT_SEQUENCE:
+		return "all-sequences-in-schema"
+	case pg_query.ObjectType_OBJECT_FUNCTION:
+		return "all-functions-in-schema"
+	}
+	return ""
+}
+
+// objtypeAllLabel maps an ObjectType to the kind half of an ADP label
+// when no schema clause is present.
+func objtypeAllLabel(ot pg_query.ObjectType) string {
+	switch ot {
+	case pg_query.ObjectType_OBJECT_TABLE:
+		return "all-tables"
+	case pg_query.ObjectType_OBJECT_SEQUENCE:
+		return "all-sequences"
+	case pg_query.ObjectType_OBJECT_FUNCTION:
+		return "all-functions"
+	case pg_query.ObjectType_OBJECT_SCHEMA:
+		return "all-schemas"
+	case pg_query.ObjectType_OBJECT_TYPE:
+		return "all-types"
+	}
+	return ""
+}
+
+// firstStringName extracts the first String-node value from a Node list.
+// Used for ObjectType_OBJECT_DATABASE / OBJECT_SCHEMA grants where PG
+// encodes the object identifier as a bare String rather than a RangeVar.
+func firstStringName(objs []*pg_query.Node) string {
+	for _, o := range objs {
+		if o == nil {
+			continue
+		}
+		s, ok := o.Node.(*pg_query.Node_String_)
+		if !ok || s.String_ == nil {
+			continue
+		}
+		if name := strings.ToLower(strings.TrimSpace(s.String_.Sval)); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// firstSchemaName extracts the first schema name from an ALL IN SCHEMA
+// grant. The Objects list carries String nodes naming the schemas.
+func firstSchemaName(objs []*pg_query.Node) string {
+	return firstStringName(objs)
+}
+
+// firstRangeVarLabel extracts the first schema.table identifier from
+// an Objects list of RangeVar nodes (TABLE / SEQUENCE grants).
+func firstRangeVarLabel(objs []*pg_query.Node) string {
+	for _, o := range objs {
+		if o == nil {
+			continue
+		}
+		rv, ok := o.Node.(*pg_query.Node_RangeVar)
+		if !ok || rv.RangeVar == nil {
+			continue
+		}
+		if label := qualify(rv.RangeVar); label != "" {
+			return label
+		}
+	}
+	return ""
+}
+
+// firstObjectWithArgsLabel extracts the first function name from an
+// Objects list of ObjectWithArgs nodes (FUNCTION grants).
+func firstObjectWithArgsLabel(objs []*pg_query.Node) string {
+	for _, o := range objs {
+		if o == nil {
+			continue
+		}
+		owa, ok := o.Node.(*pg_query.Node_ObjectWithArgs)
+		if !ok || owa.ObjectWithArgs == nil {
+			continue
+		}
+		parts := make([]string, 0, len(owa.ObjectWithArgs.Objname))
+		for _, p := range owa.ObjectWithArgs.Objname {
+			if p == nil {
+				continue
+			}
+			s, ok := p.Node.(*pg_query.Node_String_)
+			if !ok || s.String_ == nil {
+				continue
+			}
+			parts = append(parts, strings.ToLower(strings.TrimSpace(s.String_.Sval)))
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		return strings.Join(parts, ".")
+	}
+	return ""
 }
