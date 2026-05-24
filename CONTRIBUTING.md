@@ -12,6 +12,12 @@ go install ./...
 go test ./...
 ```
 
+`go install` writes to `$(go env GOPATH)/bin` (defaults to `~/go/bin`).
+If `dbounce --version` reports "command not found", that directory is not
+on your PATH — `export PATH="$PATH:$(go env GOPATH)/bin"` once, and
+persist it in `~/.bashrc` or `~/.zshrc` (closes #549 from UAT L1
+2026-05-24).
+
 Local-test infrastructure (Postgres / MySQL via Docker Compose)
 lives in `compose.test.yaml` and is driven by the `Makefile`
 targets.

@@ -71,10 +71,26 @@ wire-protocol path.
 
 ```sh
 # Canonical install — builds the binary fresh from source into $GOPATH/bin
-# (or $HOME/go/bin if GOPATH is unset). Make sure that directory is on
-# your PATH.
+# (or $HOME/go/bin if GOPATH is unset).
 go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
+
+# Verify the binary is on your PATH:
+dbounce --version
+
+# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
+# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by
+# default. Fix once per shell:
+export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Persist across sessions (pick the right rc for your shell):
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc   # bash
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc    # zsh
 ```
+
+Closes #549 from UAT L1 2026-05-24 — the unmodified `go install` succeeds
+silently with the binary at `~/go/bin/dbounce` while the operator's shell
+reports "command not found", which reads as "install broken" on a fresh
+machine.
 
 ## Quickstart
 
