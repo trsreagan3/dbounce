@@ -231,12 +231,13 @@ func TestStartupWarningSuppressedWhenNilProfile(t *testing.T) {
 
 func TestStartupWarningEmittedForMySQLWithoutAdminGrantRules(t *testing.T) {
 	// MySQL dialect parity with PostgreSQL per #556 follow-up from
-	// UC-34. The MySQL classifier now surfaces DCL (GRANT / REVOKE /
-	// CREATE USER / DROP USER / RENAME USER / SET PASSWORD), so the
-	// admin-tight floor in proxy.decide() Step 5.5 fires on MySQL
-	// upstreams. The warning text MUST adapt — MySQL's DCL surface is
-	// broader than PG's (CREATE USER, etc.), so the wording mentions
-	// those shapes specifically.
+	// UC-34, extended by #588: the MySQL classifier now surfaces DCL
+	// (GRANT / REVOKE / CREATE USER / DROP USER / DROP ROLE / RENAME
+	// USER / SET PASSWORD) and the admin-tight floor in proxy.decide()
+	// Step 5.5 fires on MySQL upstreams. The warning text MUST adapt —
+	// MySQL's DCL surface is broader than PG's (CREATE USER, etc.) and
+	// after #588 also covers DROP USER / DROP ROLE (which pre-#588 fell
+	// through as cleanup-direction).
 	cfg := bannerCfg()
 	cfg.Dialect = proxy.DialectMySQL
 	emptyProfile := &profile.Profile{Name: "test-empty"}
@@ -255,14 +256,25 @@ func TestStartupWarningEmittedForMySQLWithoutAdminGrantRules(t *testing.T) {
 		"MySQL + no admin-grant rules MUST emit a WARNING line (#556 parity with PG path)")
 	assert.Contains(t, got, "MySQL handler enabled",
 		"warning must name MySQL specifically so operators know which dialect's floor fired")
-	assert.Contains(t, got, "GRANT / CREATE USER",
+	assert.Contains(t, got, "CREATE USER",
 		"MySQL warning must name CREATE USER (MySQL-specific admin-grant shape)")
+	assert.Contains(t, got, "DROP USER",
+		"MySQL warning MUST name DROP USER after #588 closure (was 'unaffected' pre-#588)")
+	assert.Contains(t, got, "DROP ROLE",
+		"MySQL warning MUST name DROP ROLE after #588 closure")
 	assert.Contains(t, got, "admin-grant rules in profile",
 		"warning text must name admin-grant rules")
-	assert.Contains(t, got, "REVOKE / DROP USER are unaffected",
-		"MySQL warning must clarify REVOKE + DROP USER are NOT denied (cleanup direction)")
+	assert.Contains(t, got, "REVOKE is unaffected",
+		"MySQL warning must clarify REVOKE is NOT denied (cleanup direction); "+
+			"DROP USER MUST NO LONGER be listed as 'unaffected' after #588")
+	assert.NotContains(t, got, "REVOKE / DROP USER are unaffected",
+		"#588 regression-guard: the pre-#588 phrasing claiming DROP USER is "+
+			"unaffected MUST be gone — DROP USER now denies")
 	assert.Contains(t, got, "dbounce rules add 'GRANT:*' --effect allow",
 		"warning must show the override-rule one-liner so operators have the fix")
+	assert.Contains(t, got, "ALTER_PRIVILEGES:*",
+		"#588 — warning MUST show the ALTER_PRIVILEGES:* override one-liner "+
+			"so operators rotating users have the matching fix")
 }
 
 func TestStartupWarningSuppressedForSnowflakeDialect(t *testing.T) {

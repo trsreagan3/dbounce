@@ -481,18 +481,100 @@ func TestCreateUserMySQL(t *testing.T) {
 	assert.Equal(t, []string{"CREATE USER"}, ps.Privileges)
 }
 
-func TestDropUserMySQL(t *testing.T) {
-	// DROP USER — cleanup direction. Classified as StmtRevoke so the
-	// admin-tight floor does NOT refuse it (paralleling REVOKE
-	// semantics). Operators who want DROP USER gated add an explicit
-	// MUTATING:* or DROP-USER MutatingNodeType deny.
-	ps := myParse(`DROP USER 'olduser'@'%'`)
-	assert.Equal(t, StmtRevoke, ps.StatementType,
-		"DROP USER classifies as StmtRevoke (cleanup direction)")
+// TestMySQLClassifier_DropUserSingle_IsAlterPrivileges pins the #588
+// UAT-C 2026-05-25 fix: DROP USER 'bob'@'%' MUST classify as
+// StmtAlterPrivileges (admin-tight class) — pre-#588 it mapped to
+// StmtRevoke + the AdminTightFloor never fired even with
+// --profile safe-default --default-policy allow. Same classifier-gap
+// shape as #586 (just fixed for PG); cross-dialect inconsistency in
+// MySQL (CREATE USER + RENAME USER + SET PASSWORD already admin-tight).
+func TestMySQLClassifier_DropUserSingle_IsAlterPrivileges(t *testing.T) {
+	ps := myParse(`DROP USER 'bob'@'%'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"#588 — DROP USER MUST classify as StmtAlterPrivileges so admin-tight floor fires "+
+			"(was StmtRevoke pre-#588; that mapping let DROP USER bypass safe-default profile)")
+	assert.True(t, ps.IsDCL,
+		"#588 — DROP USER MUST set IsDCL=true (admin-tight floor predicate)")
+	assert.Equal(t, mysqlDCLOpDropUser, ps.MutatingNodeType,
+		"MutatingNodeType MUST surface mysqlDCLOpDropUser for rule-pack matching")
+	assert.Contains(t, ps.Grantees, "'bob'@'%'",
+		"grantee extraction MUST survive the reclassification (audit invariant)")
+	assert.Equal(t, []string{"DROP USER"}, ps.Privileges)
+	assert.Equal(t, "user-account", ps.TargetObject)
+}
+
+// TestMySQLClassifier_DropUserIfExists_IsAlterPrivileges pins the
+// idempotent-DROP variant: `DROP USER IF EXISTS 'bob'@'%'` MUST classify
+// identically — IF EXISTS doesn't change the operation's
+// privilege-management shape (same principal gone after either way).
+func TestMySQLClassifier_DropUserIfExists_IsAlterPrivileges(t *testing.T) {
+	ps := myParse(`DROP USER IF EXISTS 'bob'@'%'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"#588 — DROP USER IF EXISTS MUST classify as StmtAlterPrivileges (admin-tight class)")
 	assert.True(t, ps.IsDCL)
 	assert.Equal(t, mysqlDCLOpDropUser, ps.MutatingNodeType)
-	assert.Contains(t, ps.Grantees, "'olduser'@'%'")
-	assert.Equal(t, []string{"DROP USER"}, ps.Privileges)
+	assert.Contains(t, ps.Grantees, "'bob'@'%'",
+		"IF EXISTS prefix MUST be stripped before grantee extraction")
+}
+
+// TestMySQLClassifier_DropUserMultiple_IsAlterPrivileges pins the
+// multi-grantee shape: `DROP USER 'a'@'%', 'b'@'%'` MUST classify as
+// StmtAlterPrivileges + extract BOTH grantees so the audit row carries
+// the full destruction-target list. Adversarial bulk-cleanup is the
+// canonical reason to surface every name.
+func TestMySQLClassifier_DropUserMultiple_IsAlterPrivileges(t *testing.T) {
+	ps := myParse(`DROP USER 'a'@'%', 'b'@'%'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"#588 — multi-grantee DROP USER MUST classify as StmtAlterPrivileges")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpDropUser, ps.MutatingNodeType)
+	assert.ElementsMatch(t, []string{"'a'@'%'", "'b'@'%'"}, ps.Grantees,
+		"multi-grantee DROP USER MUST extract every grantee (audit invariant)")
+}
+
+// TestMySQLClassifier_DropRole_IsAlterPrivileges pins the MySQL 8.0+
+// DROP ROLE variant. Mirrors PG DropRoleStmt classification (#586) for
+// cross-dialect parity. Same admin-tight class as DROP USER per the
+// role-management peer rationale in populateMySQLDropRole.
+func TestMySQLClassifier_DropRole_IsAlterPrivileges(t *testing.T) {
+	ps := myParse(`DROP ROLE 'app_admin'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"#588 — MySQL DROP ROLE MUST classify as StmtAlterPrivileges (admin-tight class; PG parity)")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpDropRole, ps.MutatingNodeType,
+		"MutatingNodeType MUST surface mysqlDCLOpDropRole (distinct from DROP-USER for rule packs)")
+	assert.Contains(t, ps.Grantees, "'app_admin'",
+		"DROP ROLE grantee extraction MUST work the same as DROP USER")
+	assert.Equal(t, []string{"DROP ROLE"}, ps.Privileges)
+	assert.Equal(t, "role", ps.TargetObject,
+		"DROP ROLE TargetObject MUST distinguish role-shape from user-account-shape")
+}
+
+// TestMySQLClassifier_DropRoleIfExistsMultiple pins the
+// `DROP ROLE IF EXISTS 'a', 'b'` shape — idempotent + multi-role.
+func TestMySQLClassifier_DropRoleIfExistsMultiple(t *testing.T) {
+	ps := myParse(`DROP ROLE IF EXISTS 'a', 'b'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"#588 — multi-role DROP ROLE IF EXISTS MUST classify as StmtAlterPrivileges")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpDropRole, ps.MutatingNodeType)
+	assert.ElementsMatch(t, []string{"'a'", "'b'"}, ps.Grantees,
+		"multi-role DROP ROLE MUST extract every role name + strip IF EXISTS prefix")
+}
+
+// TestMySQLClassifier_RevokeStillRevoke_NoRegression pins the
+// regression-guard: REVOKE SELECT ON foo FROM 'bob'@'%' MUST still
+// classify as StmtRevoke (cleanup direction) — the #588 fix MUST NOT
+// accidentally promote REVOKE to admin-tight class. REVOKE is the
+// safer half of every GRANT/REVOKE pair per UC-34.
+func TestMySQLClassifier_RevokeStillRevoke_NoRegression(t *testing.T) {
+	ps := myParse(`REVOKE SELECT ON foo.* FROM 'bob'@'%'`)
+	assert.Equal(t, StmtRevoke, ps.StatementType,
+		"#588 regression-guard: REVOKE MUST still classify as StmtRevoke "+
+			"(NOT StmtAlterPrivileges) — the floor MUST NOT engage on cleanup direction")
+	assert.True(t, ps.IsDCL)
+	assert.Equal(t, mysqlDCLOpRevoke, ps.MutatingNodeType,
+		"REVOKE MutatingNodeType MUST stay mysqlDCLOpRevoke (no #588 spill-over)")
 }
 
 func TestGrantWildcardHostMySQL(t *testing.T) {

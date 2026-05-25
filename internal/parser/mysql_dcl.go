@@ -22,7 +22,8 @@
 //   - REVOKE <privs> ON <object> FROM <grantees>
 //   - REVOKE ALL [PRIVILEGES], GRANT OPTION FROM <users>
 //   - CREATE USER [IF NOT EXISTS] <user> [IDENTIFIED BY '<password>']
-//   - DROP USER [IF EXISTS] <user>
+//   - DROP USER [IF EXISTS] <user>[, <user>...]  (#588 — admin-tight)
+//   - DROP ROLE [IF EXISTS] <role>[, <role>...]  (#588 — MySQL 8.0+)
 //   - RENAME USER <old> TO <new>
 //   - SET PASSWORD [FOR <user>] = ...
 //
@@ -72,6 +73,7 @@ const (
 	mysqlDCLOpRevoke     = "REVOKE"
 	mysqlDCLOpCreateUser = "CREATE-USER"
 	mysqlDCLOpDropUser   = "DROP-USER"
+	mysqlDCLOpDropRole   = "DROP-ROLE"
 	mysqlDCLOpRenameUser = "RENAME-USER"
 	mysqlDCLOpSetPwd     = "SET-PASSWORD"
 )
@@ -131,6 +133,9 @@ func detectMySQLDCL(out *ParsedStatement, stripped, upper string) bool {
 		return true
 	case hasKeywordPrefix(upper, "DROP USER"):
 		populateMySQLDropUser(out, stripped, upper)
+		return true
+	case hasKeywordPrefix(upper, "DROP ROLE"):
+		populateMySQLDropRole(out, stripped, upper)
 		return true
 	case hasKeywordPrefix(upper, "RENAME USER"):
 		populateMySQLRenameUser(out, stripped, upper)
@@ -339,12 +344,36 @@ func populateMySQLCreateUser(out *ParsedStatement, stripped, upper string) {
 
 // populateMySQLDropUser fills out a DROP USER statement.
 //
-// Classified as StmtRevoke — dropping a user revokes everything the
-// user had. Per the REVOKE-is-cleanup path the admin-tight floor does
-// NOT fire on DROP USER. (An operator who wants user-destruction to be
-// gated adds an explicit deny rule for DROP-USER MutatingNodeType.)
+// Per #588 UAT-C 2026-05-25: classified as StmtAlterPrivileges
+// (admin-tight class) so the AdminTightFloor fires by default under
+// --default-policy=allow. Pre-#588 this mapped to StmtRevoke (cleanup
+// direction), which let DROP USER 'bob'@'%' bypass the safe-default
+// floor even with --profile safe-default --default-policy allow. Same
+// classifier-gap shape as #586 (just fixed for PG); cross-dialect
+// inconsistency in MySQL.
+//
+// Rationale: while DROP USER does revoke whatever grants the user had,
+// it is fundamentally a PRIVILEGE-MANAGEMENT shape — orphans audit
+// trails pinned to the old principal, removes a security boundary, and
+// in adversarial workflows is the cleanup step after attacker-owned
+// privilege escalation. Per [[scorer-is-ground-truth]] the classifier
+// reflects the operation's privilege-management semantics; operators
+// who legitimately rotate users add an explicit allow_rule
+// (`ALTER_PRIVILEGES:*` or `DROP-USER` MutatingNodeType match) — the
+// same override path that CREATE USER + RENAME USER already use.
+//
+// Cross-dialect parity: PG DROP ROLE / DROP USER (post-#586) also
+// classify as StmtAlterPrivileges. See decision/admin_tight_test.go
+// TestAdminTightFloor_CrossDialectDropUser_BothDeny for the
+// parity-pin.
+//
+// Handles all DROP USER variants:
+//   - DROP USER 'bob'@'%'                       — single grantee
+//   - DROP USER IF EXISTS 'bob'@'%'             — idempotent form
+//   - DROP USER 'a'@'%', 'b'@'%'                — multi-grantee
+//   - DROP USER IF EXISTS 'a'@'%', 'b'@'%'      — combined
 func populateMySQLDropUser(out *ParsedStatement, stripped, upper string) {
-	out.StatementType = StmtRevoke
+	out.StatementType = StmtAlterPrivileges
 	out.IsDCL = true
 	out.MutatingNodeType = mysqlDCLOpDropUser
 	out.Privileges = []string{"DROP USER"}
@@ -356,6 +385,35 @@ func populateMySQLDropUser(out *ParsedStatement, stripped, upper string) {
 	}
 	out.Grantees = parseMySQLGranteeList(body)
 	out.TargetObject = "user-account"
+}
+
+// populateMySQLDropRole fills out a DROP ROLE statement (MySQL 8.0+).
+//
+// Per #588: DROP ROLE is the role-management peer of DROP USER and
+// shares the same admin-tight classification. Mirrors PG DropRoleStmt
+// handling in postgres.go (also StmtAlterPrivileges post-#586). Same
+// rationale as populateMySQLDropUser: dropping a role removes a
+// privilege-management surface + orphans audit trails; operators with
+// legitimate role-rotation workflows add an explicit allow_rule.
+//
+// Handles:
+//   - DROP ROLE 'role_name'
+//   - DROP ROLE IF EXISTS 'role_name'
+//   - DROP ROLE 'a', 'b'                        — multi-role
+//   - DROP ROLE IF EXISTS 'a', 'b'              — combined
+func populateMySQLDropRole(out *ParsedStatement, stripped, upper string) {
+	out.StatementType = StmtAlterPrivileges
+	out.IsDCL = true
+	out.MutatingNodeType = mysqlDCLOpDropRole
+	out.Privileges = []string{"DROP ROLE"}
+
+	body := strings.TrimSpace(stripped[len("DROP ROLE"):])
+	bodyUpper := strings.ToUpper(body)
+	if strings.HasPrefix(bodyUpper, "IF EXISTS ") {
+		body = strings.TrimSpace(body[len("IF EXISTS "):])
+	}
+	out.Grantees = parseMySQLGranteeList(body)
+	out.TargetObject = "role"
 }
 
 // populateMySQLRenameUser fills out a RENAME USER statement.

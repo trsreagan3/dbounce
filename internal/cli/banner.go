@@ -244,17 +244,19 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 			fmt.Fprintln(w,
 				"WARNING: MySQL handler enabled with no admin-grant rules in profile.")
 			fmt.Fprintln(w,
-				"  GRANT / CREATE USER / RENAME USER / SET PASSWORD statements will be")
+				"  GRANT / CREATE USER / DROP USER / DROP ROLE / RENAME USER / SET PASSWORD")
 			fmt.Fprintln(w,
-				"  DENIED by default (admin-tight per [[safety-mode-lean-permissive]];")
+				"  statements will be DENIED by default (admin-tight per")
 			fmt.Fprintln(w,
-				"  #556 MySQL DCL parity follow-up from UC-34 admin-grant floor).")
+				"  [[safety-mode-lean-permissive]]; #556 MySQL DCL parity + #588 DROP USER/ROLE closure).")
 			fmt.Fprintln(w,
 				"  Add an explicit allow_rule for admin-grant operations if your workflow needs them:")
 			fmt.Fprintln(w,
 				"    dbounce rules add 'GRANT:*' --effect allow --note 'admin DCL allowed for migrations'")
 			fmt.Fprintln(w,
-				"  REVOKE / DROP USER are unaffected (cleanup direction is always allowed).")
+				"    dbounce rules add 'ALTER_PRIVILEGES:*' --effect allow --note 'user/role rotation'")
+			fmt.Fprintln(w,
+				"  REVOKE is unaffected (cleanup direction is always allowed).")
 		default:
 			fmt.Fprintln(w,
 				"WARNING: PostgreSQL handler enabled with no admin-grant rules in profile.")

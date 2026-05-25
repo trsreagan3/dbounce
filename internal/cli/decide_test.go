@@ -464,6 +464,66 @@ func TestEvalDecide_PGCreateRoleWithAllowRule_Allows(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #588 — MySQL DROP USER CLI dry-run parity with proxy.decide().
+// ---------------------------------------------------------------------------
+//
+// UAT-C 2026-05-25 found MySQL `DROP USER 'bob'@'%'` was classified as
+// StmtRevoke (cleanup verb) and bypassed admin-tight floor even with
+// --profile safe-default --default-policy allow. Same classifier-gap
+// shape as #586 (just fixed for PG); cross-dialect inconsistency in
+// MySQL. The classifier fix in internal/parser/mysql_dcl.go
+// (populateMySQLDropUser + populateMySQLDropRole now classify as
+// StmtAlterPrivileges + IsDCL=true) flows through the shared
+// AdminTightFloor. The CLI dry-run path consumes the SAME helper as
+// proxy.decide (per #559), so these tests pin that the dry-run reports
+// DENY on the same statements the proxy would deny.
+
+// TestCLIEvalDecide_MySQLDropUser_Denies pins the #588 regression:
+// MySQL DROP USER 'bob'@'%' under default-allow + no rules MUST report
+// deny via the admin-tight floor on the CLI dry-run path (was silently
+// ALLOW pre-#588 per UAT-C 2026-05-25).
+func TestCLIEvalDecide_MySQLDropUser_Denies(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "mysql", "allow",
+		"DROP USER 'bob'@'%'")
+	require.NoError(t, err)
+	assert.Equal(t, "deny", res.Verdict,
+		"MySQL DROP USER under default-allow MUST report DENY via admin-tight floor "+
+			"(was silently ALLOW pre-#588 per UAT-C 2026-05-25)")
+	assert.Equal(t, "default", res.DecisionSource,
+		"admin-tight floor tags SourceDefault (matches proxy.decide byte-for-byte)")
+	assert.Contains(t, res.Reason, "admin-tight floor",
+		"CLI reason MUST name the floor (parity with proxy.decide)")
+	assert.Contains(t, res.Reason, "default-policy=allow",
+		"CLI reason MUST surface the default-policy the floor superseded")
+}
+
+// TestCLIEvalDecide_MySQLRevoke_AllowsUnderDefaultAllow pins the
+// regression-guard on the CLI surface: REVOKE (cleanup direction) MUST
+// still report ALLOW under default-allow. #588's classifier change MUST
+// NOT accidentally spill into REVOKE — the safer half of every
+// GRANT/REVOKE pair stays unmolested.
+func TestCLIEvalDecide_MySQLRevoke_AllowsUnderDefaultAllow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "mysql", "allow",
+		"REVOKE SELECT ON foo.* FROM 'bob'@'%'")
+	require.NoError(t, err)
+	assert.Equal(t, "allow", res.Verdict,
+		"MySQL REVOKE under default-allow MUST still report ALLOW "+
+			"(#588 regression-guard: cleanup direction is always allowed)")
+	assert.NotContains(t, res.Reason, "admin-tight floor",
+		"MySQL REVOKE reason MUST NOT name the floor (#588 must not spill into REVOKE)")
+}
+
+// ---------------------------------------------------------------------------
 // #587 — CLI dry-run multi-statement parity with proxy.decide().
 //
 // Per UAT-C 2026-05-25: dbounce evaluated only the FIRST statement in a

@@ -299,7 +299,8 @@ func TestAdminTightFloor_PGAlterDefaultPrivileges_StillDenies(t *testing.T) {
 // Per [[scorer-is-ground-truth]]: the calibration vocabulary stays
 // uniform across dialects so SIEM filters + audit reviewers see the
 // same shape on either upstream. Pre-#586 the parity was BROKEN in the
-// wrong direction (MySQL covered, PG missed).
+// wrong direction (MySQL covered, PG missed); #588 closed the residual
+// MySQL DROP USER gap so the matrix is now fully symmetric.
 func TestAdminTightFloor_CrossDialectUserMgmtParity_BothDeny(t *testing.T) {
 	// Parametrized: same conceptual operation on each dialect.
 	cases := []struct {
@@ -314,16 +315,14 @@ func TestAdminTightFloor_CrossDialectUserMgmtParity_BothDeny(t *testing.T) {
 			"mysql", "CREATE USER 'attacker'@'%' IDENTIFIED BY 'pw'", parseMySQL},
 		{"PG-DropUser",
 			"postgres", "DROP USER bob", parsePG},
-		// MySQL DROP USER intentionally classifies as StmtRevoke (cleanup
-		// direction per populateMySQLDropUser doc); admin-tight floor
-		// does NOT fire on REVOKE. PG DROP USER fires the floor because
-		// the classifier maps DropRoleStmt to StmtAlterPrivileges, which
-		// IS in the admin-grant shape set. Cross-dialect parity here is
-		// "admin-grant statements deny" — DROP USER's dialect-specific
-		// classification reflects that dialect's REVOKE-is-cleanup
-		// convention. Documented divergence; not a bypass (the operator
-		// gets the same effective protection because MySQL DROP USER
-		// without prior GRANT is a no-op).
+		// #588 — MySQL DROP USER now denies too (was the residual gap;
+		// pre-#588 it classified as StmtRevoke + bypassed the floor).
+		// The classifier fix in mysql_dcl.go promotes it to
+		// StmtAlterPrivileges per populateMySQLDropUser. See
+		// TestAdminTightFloor_CrossDialectDropUser_BothDeny below for
+		// the dedicated parity-pin.
+		{"MySQL-DropUser",
+			"mysql", "DROP USER 'bob'@'%'", parseMySQL},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -336,9 +335,138 @@ func TestAdminTightFloor_CrossDialectUserMgmtParity_BothDeny(t *testing.T) {
 				"%s user-mgmt MUST trigger admin-tight floor (cross-dialect parity)", tc.dialect)
 			assert.True(t, deny,
 				"%s user-mgmt under no profile MUST default-deny via admin-tight floor "+
-					"(cross-dialect parity; #586 closed PG gap)", tc.dialect)
+					"(cross-dialect parity; #586 closed PG gap; #588 closed MySQL DROP USER gap)",
+				tc.dialect)
 			assert.Contains(t, reason, "admin-tight floor",
 				"%s reason MUST name the admin-tight floor (SIEM filter parity)", tc.dialect)
+		})
+	}
+}
+
+// =============================================================================
+// #588 — MySQL DROP USER / DROP ROLE admin-tight floor closure.
+// =============================================================================
+//
+// UAT-C 2026-05-25 confirmed: MySQL `DROP USER 'bob'@'%'` was classified
+// as StmtRevoke (cleanup verb) and bypassed admin-tight floor even with
+// `--profile safe-default --default-policy allow`. Same classifier-gap
+// shape as #586 (just fixed for PG); cross-dialect inconsistency in
+// MySQL where CREATE USER + RENAME USER + SET PASSWORD already routed
+// through the admin-tight class. Per [[scorer-is-ground-truth]]: the
+// fix lives in internal/parser/mysql_dcl.go which now classifies
+// populateMySQLDropUser + populateMySQLDropRole as StmtAlterPrivileges
+// + IsDCL=true; the floor fires naturally via isAdminGrantShape. These
+// tests pin the END-TO-END floor behavior on real SQL strings.
+
+// TestAdminTightFloor_MySQLDropUser_Denies pins the #588 regression:
+// MySQL `DROP USER 'bob'@'%'` under no profile + default-policy=allow
+// MUST deny via the admin-tight floor. Pre-#588 this returned
+// applicable=false (StatementType was StmtRevoke, which isAdminGrantShape
+// rejects) and the caller fell through to default-allow.
+func TestAdminTightFloor_MySQLDropUser_Denies(t *testing.T) {
+	ps := parseMySQL(t, "DROP USER 'bob'@'%'")
+	require.True(t, ps.IsDCL,
+		"MySQL DROP USER MUST set IsDCL=true (#588 classifier fix)")
+
+	deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable,
+		"MySQL DROP USER MUST trigger the admin-tight floor (#588)")
+	assert.True(t, deny,
+		"MySQL DROP USER under no profile MUST default-deny via admin-tight floor (#588)")
+	assert.Contains(t, reason, "admin-tight floor",
+		"reason MUST name the admin-tight floor so SIEM filters key on the canonical string")
+	assert.Contains(t, reason, "default-policy=allow",
+		"reason MUST surface that default-allow was bypassed by the floor")
+}
+
+// TestAdminTightFloor_MySQLDropUserWithAllowRule_Allows pins the
+// override path on the new shape: a profile allow_rule matching
+// ALTER_PRIVILEGES:* lets DROP USER through. Operators with legitimate
+// user-rotation workflows get the expected verdict — parity with the
+// #586 PG path's override behavior.
+func TestAdminTightFloor_MySQLDropUserWithAllowRule_Allows(t *testing.T) {
+	ps := parseMySQL(t, "DROP USER 'bob'@'%'")
+	prof := &profile.Profile{
+		Name: "ops-user-rotation",
+		AllowRules: []profile.ProfileAllowRule{
+			{Pattern: "ALTER_PRIVILEGES:*"},
+		},
+	}
+	deny, reason, applicable := AdminTightFloor(ps, prof, "allow")
+	assert.True(t, applicable,
+		"MySQL DROP USER MUST trigger floor evaluation (so override path is considered)")
+	assert.False(t, deny,
+		"profile allow_rule matching ALTER_PRIVILEGES:* MUST override the floor for DROP USER (#588)")
+	assert.Contains(t, reason, "overridden",
+		"reason MUST surface override so audit reviewers see WHY this passed")
+	assert.Contains(t, reason, "ops-user-rotation",
+		"reason MUST name the overriding profile")
+}
+
+// TestAdminTightFloor_MySQLDropUserIfExists_Denies pins the idempotent
+// variant: `DROP USER IF EXISTS 'bob'@'%'` MUST deny identically.
+// IF EXISTS doesn't change the operation's privilege-management shape.
+func TestAdminTightFloor_MySQLDropUserIfExists_Denies(t *testing.T) {
+	ps := parseMySQL(t, "DROP USER IF EXISTS 'bob'@'%'")
+	require.True(t, ps.IsDCL)
+
+	deny, _, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable,
+		"MySQL DROP USER IF EXISTS MUST trigger admin-tight floor (#588)")
+	assert.True(t, deny,
+		"MySQL DROP USER IF EXISTS under no profile MUST default-deny via admin-tight floor (#588)")
+}
+
+// TestAdminTightFloor_MySQLDropUserMultiple_Denies pins the
+// multi-grantee variant: `DROP USER 'a'@'%', 'b'@'%'` MUST deny
+// identically — bulk destruction is the adversarial shape that
+// MOST needs the floor to fire.
+func TestAdminTightFloor_MySQLDropUserMultiple_Denies(t *testing.T) {
+	ps := parseMySQL(t, "DROP USER 'a'@'%', 'b'@'%'")
+	require.True(t, ps.IsDCL)
+
+	deny, _, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable,
+		"MySQL multi-grantee DROP USER MUST trigger admin-tight floor (#588)")
+	assert.True(t, deny,
+		"MySQL multi-grantee DROP USER under no profile MUST default-deny "+
+			"(bulk destruction is the adversarial shape; #588)")
+}
+
+// TestAdminTightFloor_CrossDialectDropUser_BothDeny pins the dedicated
+// cross-dialect DROP USER parity assertion: equivalent DROP USER (PG
+// post-#586 + MySQL post-#588) must BOTH DENY under no profile +
+// default-policy=allow. This is the parity-pin that proves the residual
+// MySQL gap is closed — pre-#588 the matrix was asymmetric in the
+// wrong direction (PG covered, MySQL missed).
+func TestAdminTightFloor_CrossDialectDropUser_BothDeny(t *testing.T) {
+	cases := []struct {
+		name     string
+		dialect  string
+		sql      string
+		parsedFn func(t *testing.T, sql string) *parser.ParsedStatement
+	}{
+		{"PG-DropUser-Post586",
+			"postgres", "DROP USER bob", parsePG},
+		{"MySQL-DropUser-Post588",
+			"mysql", "DROP USER 'bob'@'%'", parseMySQL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := tc.parsedFn(t, tc.sql)
+			require.True(t, ps.IsDCL,
+				"%s DROP USER MUST set IsDCL=true (cross-dialect parity invariant)",
+				tc.dialect)
+			deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+			assert.True(t, applicable,
+				"%s DROP USER MUST trigger admin-tight floor "+
+					"(cross-dialect parity; #586 PG + #588 MySQL closures)",
+				tc.dialect)
+			assert.True(t, deny,
+				"%s DROP USER under no profile MUST default-deny via admin-tight floor "+
+					"(cross-dialect parity; pre-#588 MySQL silently allowed)", tc.dialect)
+			assert.Contains(t, reason, "admin-tight floor",
+				"%s reason MUST name the floor (SIEM filter contract)", tc.dialect)
 		})
 	}
 }
