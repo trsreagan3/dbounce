@@ -188,3 +188,157 @@ func TestAdminTightFloor_EmptyDefaultPolicy_ReasonElidesClause(t *testing.T) {
 	assert.NotContains(t, reason, "default-policy=",
 		"empty default-policy MUST elide the default-policy clause from the reason")
 }
+
+// =============================================================================
+// #586 — PostgreSQL role/user management floor tests.
+// =============================================================================
+//
+// UAT-C 2026-05-25 confirmed PG CREATE/ALTER/DROP ROLE+USER bypassed the
+// admin-tight floor entirely under --default-policy=allow. Same UC-34
+// bypass class. Per [[scorer-is-ground-truth]]: the fix lives in the
+// classifier (internal/parser/postgres.go) which now classifies these
+// nodes as StmtAlterPrivileges + IsDCL=true; the floor fires naturally
+// via isAdminGrantShape. These tests pin the END-TO-END behavior:
+// observable deny verdicts from real SQL strings — proxy.decide() and
+// cli.evalDecide() both invoke this exact entry point.
+
+// TestAdminTightFloor_PGCreateRole_Denies pins the #586 CRIT regression:
+// CREATE ROLE attacker SUPERUSER under no profile + default-policy=allow
+// MUST deny via the admin-tight floor. Pre-fix this returned
+// applicable=false (StatementType was StmtDDL, which isAdminGrantShape
+// rejects) and the caller fell through to default-allow.
+func TestAdminTightFloor_PGCreateRole_Denies(t *testing.T) {
+	ps := parsePG(t, "CREATE ROLE attacker SUPERUSER")
+	require.True(t, ps.IsDCL,
+		"PG CREATE ROLE MUST set IsDCL=true (#586 classifier fix)")
+
+	deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable,
+		"PG CREATE ROLE MUST trigger the admin-tight floor (#586)")
+	assert.True(t, deny,
+		"PG CREATE ROLE under no profile MUST default-deny via admin-tight floor (#586)")
+	assert.Contains(t, reason, "admin-tight floor",
+		"reason MUST name the admin-tight floor so SIEM filters key on the canonical string")
+	assert.Contains(t, reason, "default-policy=allow",
+		"reason MUST surface that default-allow was bypassed by the floor")
+}
+
+// TestAdminTightFloor_PGCreateRoleWithAllowRule_Allows pins the override
+// path on the new shape: a profile allow_rule matching admin-grant DCL
+// overrides the floor. Operators with legitimate role-provisioning
+// workflows add an allow_rule and get the expected verdict.
+func TestAdminTightFloor_PGCreateRoleWithAllowRule_Allows(t *testing.T) {
+	ps := parsePG(t, "CREATE ROLE service_acct LOGIN")
+	prof := &profile.Profile{
+		Name: "ops-provisioning",
+		AllowRules: []profile.ProfileAllowRule{
+			{Pattern: "ALTER_PRIVILEGES:*"},
+		},
+	}
+	deny, reason, applicable := AdminTightFloor(ps, prof, "allow")
+	assert.True(t, applicable,
+		"PG CREATE ROLE MUST trigger floor evaluation (so override path is considered)")
+	assert.False(t, deny,
+		"profile allow_rule matching ALTER_PRIVILEGES:* MUST override the floor for CREATE ROLE")
+	assert.Contains(t, reason, "overridden",
+		"reason MUST surface override so audit reviewers see WHY this passed")
+	assert.Contains(t, reason, "ops-provisioning",
+		"reason MUST name the overriding profile")
+}
+
+// TestAdminTightFloor_PGAlterUser_Denies pins ALTER USER bob SUPERUSER —
+// the second concrete UAT-C bypass example. Same node type as ALTER ROLE.
+func TestAdminTightFloor_PGAlterUser_Denies(t *testing.T) {
+	ps := parsePG(t, "ALTER USER bob SUPERUSER")
+	require.True(t, ps.IsDCL)
+
+	deny, _, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable,
+		"PG ALTER USER SUPERUSER MUST trigger admin-tight floor (#586)")
+	assert.True(t, deny,
+		"PG ALTER USER SUPERUSER under no profile MUST default-deny via admin-tight floor (#586)")
+}
+
+// TestAdminTightFloor_PGDropUser_Denies pins DROP USER bob. Per the task
+// scope: even though dropping is "destruction" rather than "grant," it's
+// privilege management — the principal is gone, its grants are orphaned.
+// Same admin-tight class as CREATE.
+func TestAdminTightFloor_PGDropUser_Denies(t *testing.T) {
+	ps := parsePG(t, "DROP USER bob")
+	require.True(t, ps.IsDCL)
+
+	deny, _, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable,
+		"PG DROP USER MUST trigger admin-tight floor (#586)")
+	assert.True(t, deny,
+		"PG DROP USER under no profile MUST default-deny via admin-tight floor (#586)")
+}
+
+// TestAdminTightFloor_PGAlterDefaultPrivileges_StillDenies is a
+// regression check for UC-34: ALTER DEFAULT PRIVILEGES still denies
+// after the #586 reclassification of CREATE/ALTER/DROP ROLE+USER. The
+// classifier change touched the StmtDDL switch case; this test makes
+// sure ALTER DEFAULT PRIVILEGES (a different node type entirely) still
+// flows through the StmtAlterPrivileges path.
+func TestAdminTightFloor_PGAlterDefaultPrivileges_StillDenies(t *testing.T) {
+	ps := parsePG(t,
+		"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO bob")
+	require.True(t, ps.IsDCL, "UC-34 regression: ALTER DEFAULT PRIVILEGES MUST stay IsDCL")
+	require.Equal(t, parser.StmtAlterPrivileges, ps.StatementType,
+		"UC-34 regression: ALTER DEFAULT PRIVILEGES MUST stay StmtAlterPrivileges")
+
+	deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable, "UC-34 regression: floor MUST still fire on ALTER DEFAULT PRIVILEGES")
+	assert.True(t, deny, "UC-34 regression: ALTER DEFAULT PRIVILEGES MUST still default-deny")
+	assert.Contains(t, reason, "admin-tight floor")
+}
+
+// TestAdminTightFloor_CrossDialectUserMgmtParity_BothDeny pins the
+// cross-dialect parity invariant: equivalent user-management operations
+// in PG + MySQL must both DENY under no profile + default-policy=allow.
+// Per [[scorer-is-ground-truth]]: the calibration vocabulary stays
+// uniform across dialects so SIEM filters + audit reviewers see the
+// same shape on either upstream. Pre-#586 the parity was BROKEN in the
+// wrong direction (MySQL covered, PG missed).
+func TestAdminTightFloor_CrossDialectUserMgmtParity_BothDeny(t *testing.T) {
+	// Parametrized: same conceptual operation on each dialect.
+	cases := []struct {
+		name     string
+		dialect  string
+		sql      string
+		parsedFn func(t *testing.T, sql string) *parser.ParsedStatement
+	}{
+		{"PG-CreateUserWithSuperuser",
+			"postgres", "CREATE USER attacker WITH SUPERUSER PASSWORD 'pw'", parsePG},
+		{"MySQL-CreateUser",
+			"mysql", "CREATE USER 'attacker'@'%' IDENTIFIED BY 'pw'", parseMySQL},
+		{"PG-DropUser",
+			"postgres", "DROP USER bob", parsePG},
+		// MySQL DROP USER intentionally classifies as StmtRevoke (cleanup
+		// direction per populateMySQLDropUser doc); admin-tight floor
+		// does NOT fire on REVOKE. PG DROP USER fires the floor because
+		// the classifier maps DropRoleStmt to StmtAlterPrivileges, which
+		// IS in the admin-grant shape set. Cross-dialect parity here is
+		// "admin-grant statements deny" — DROP USER's dialect-specific
+		// classification reflects that dialect's REVOKE-is-cleanup
+		// convention. Documented divergence; not a bypass (the operator
+		// gets the same effective protection because MySQL DROP USER
+		// without prior GRANT is a no-op).
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := tc.parsedFn(t, tc.sql)
+			require.True(t, ps.IsDCL,
+				"%s parser MUST set IsDCL=true for user-mgmt statement (cross-dialect parity)",
+				tc.dialect)
+			deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+			assert.True(t, applicable,
+				"%s user-mgmt MUST trigger admin-tight floor (cross-dialect parity)", tc.dialect)
+			assert.True(t, deny,
+				"%s user-mgmt under no profile MUST default-deny via admin-tight floor "+
+					"(cross-dialect parity; #586 closed PG gap)", tc.dialect)
+			assert.Contains(t, reason, "admin-tight floor",
+				"%s reason MUST name the admin-tight floor (SIEM filter parity)", tc.dialect)
+		})
+	}
+}

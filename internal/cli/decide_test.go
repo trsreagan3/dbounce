@@ -375,6 +375,155 @@ func TestEvalDecide_PostgresGrantWithGlobalAllowRule_Allows(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #586 — PG role/user management CLI parity.
+// ---------------------------------------------------------------------------
+//
+// UAT-C 2026-05-25 found PG CREATE/ALTER/DROP ROLE+USER bypassed the
+// admin-tight floor entirely under --default-policy=allow. The classifier
+// fix in internal/parser/postgres.go (CreateRoleStmt / AlterRoleStmt /
+// DropRoleStmt now classify as StmtAlterPrivileges + IsDCL=true) flows
+// through the shared AdminTightFloor. The CLI dry-run path consumes the
+// SAME helper as proxy.decide, so these tests pin that the dry-run
+// reports DENY on the same statements the proxy would deny.
+
+// TestEvalDecide_PGCreateRole_DeniesUnderDefaultAllow pins the #586
+// regression: CREATE ROLE attacker SUPERUSER under default-allow + no
+// rules MUST report deny via the admin-tight floor on the CLI dry-run
+// path (was silently ALLOW pre-#586).
+func TestEvalDecide_PGCreateRole_DeniesUnderDefaultAllow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"CREATE ROLE attacker SUPERUSER")
+	require.NoError(t, err)
+	assert.Equal(t, "deny", res.Verdict,
+		"PG CREATE ROLE SUPERUSER under default-allow MUST report DENY via admin-tight floor "+
+			"(was silently ALLOW pre-#586)")
+	assert.Equal(t, "default", res.DecisionSource,
+		"admin-tight floor tags SourceDefault (matches proxy.decide)")
+	assert.Contains(t, res.Reason, "admin-tight floor",
+		"CLI reason MUST name the floor (parity with proxy.decide)")
+	assert.Contains(t, res.Reason, "default-policy=allow",
+		"CLI reason MUST surface the default-policy the floor superseded")
+}
+
+// TestEvalDecide_PGAlterUser_DeniesUnderDefaultAllow pins ALTER USER
+// SUPERUSER via the CLI dry-run path.
+func TestEvalDecide_PGAlterUser_DeniesUnderDefaultAllow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"ALTER USER bob SUPERUSER")
+	require.NoError(t, err)
+	assert.Equal(t, "deny", res.Verdict,
+		"PG ALTER USER SUPERUSER under default-allow MUST report DENY (#586)")
+	assert.Contains(t, res.Reason, "admin-tight floor")
+}
+
+// TestEvalDecide_PGDropUser_DeniesUnderDefaultAllow pins DROP USER via
+// the CLI dry-run path.
+func TestEvalDecide_PGDropUser_DeniesUnderDefaultAllow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"DROP USER bob")
+	require.NoError(t, err)
+	assert.Equal(t, "deny", res.Verdict,
+		"PG DROP USER under default-allow MUST report DENY (#586)")
+	assert.Contains(t, res.Reason, "admin-tight floor")
+}
+
+// TestEvalDecide_PGCreateRoleWithAllowRule_Allows pins the override
+// path on the CLI side: a global allow_rule matching ALTER_PRIVILEGES
+// lets CREATE ROLE through. Parity with proxy.decide.
+func TestEvalDecide_PGCreateRoleWithAllowRule_Allows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	addGlobalAllowRuleForTest(t, st, "ALTER_PRIVILEGES:*")
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"CREATE ROLE service_acct LOGIN")
+	require.NoError(t, err)
+	assert.Equal(t, "allow", res.Verdict,
+		"explicit allow_rule MUST override admin-tight floor for CREATE ROLE (#586 parity)")
+	assert.Equal(t, "global.allow", res.DecisionSource)
+	assert.NotContains(t, res.Reason, "admin-tight floor",
+		"reason MUST name the matched allow rule, NOT the floor")
+}
+
+// ---------------------------------------------------------------------------
+// #587 — CLI dry-run multi-statement parity with proxy.decide().
+//
+// Per UAT-C 2026-05-25: dbounce evaluated only the FIRST statement in a
+// multi-statement batch. Adversarial DCL embedded at position 2+ was
+// completely invisible. The fix (decision.EvaluateMultiStatement) runs
+// the admin-tight floor on EVERY statement; both proxy.decide() +
+// cli.evalDecide() consume the same helper (no parity drift per #559).
+//
+// The test below is spec test #12 (task #587 Step 3): mirrors the
+// internal/decision/multi_statement_test.go TestMultiStmt_GrantInPosition2
+// shape but via the CLI dry-run path. Failing this test means the
+// CLI/proxy divergence has reappeared.
+// ---------------------------------------------------------------------------
+
+// TestCLIEvalDecide_MultiStmtWithGrant_Denies pins the #587 CRIT closure
+// via the CLI surface: `SELECT 1; GRANT ALL ON foo TO PUBLIC; SELECT 2`
+// MUST report DENY with a reason naming statement 2/3. Was silently
+// ALLOW before the fix.
+func TestCLIEvalDecide_MultiStmtWithGrant_Denies(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"SELECT 1; GRANT ALL ON foo TO PUBLIC; SELECT 2")
+	require.NoError(t, err)
+	assert.Equal(t, "deny", res.Verdict,
+		"#587 CRIT — embedded GRANT at position 2 MUST report DENY via the CLI dry-run path "+
+			"(was silently ALLOW pre-fix; bypass closed when this test passes)")
+	assert.Equal(t, "default", res.DecisionSource,
+		"multi-statement floor MUST tag SourceDefault (parity with proxy.decide)")
+	assert.Contains(t, res.Reason, "statement 2/3",
+		"reason MUST name the offending position so operators can debug")
+	assert.Contains(t, res.Reason, "admin-tight floor",
+		"reason MUST name the floor (SIEM filter contract)")
+	assert.Contains(t, res.Reason, "GRANT",
+		"reason MUST name the statement type that triggered the floor")
+}
+
+// TestCLIEvalDecide_MultiStmtAllAllow_PassesThrough pins the negative
+// counterpart: a multi-statement batch of all benign SELECTs MUST
+// report ALLOW under default-allow. #587 fix MUST NOT introduce false-
+// positive denies on non-DCL batches.
+func TestCLIEvalDecide_MultiStmtAllAllow_PassesThrough(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"SELECT 1; SELECT 2; SELECT 3")
+	require.NoError(t, err)
+	assert.Equal(t, "allow", res.Verdict,
+		"all-SELECT batch under default-allow MUST report ALLOW (no false-positive)")
+	assert.NotContains(t, res.Reason, "admin-tight floor",
+		"reason MUST NOT name the floor when no DCL is present")
+}
+
+// ---------------------------------------------------------------------------
 // #559 test helpers — keep the evalDecide-direct call shape small so
 // the BB tests above stay readable.
 // ---------------------------------------------------------------------------

@@ -259,13 +259,19 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 			fmt.Fprintln(w,
 				"WARNING: PostgreSQL handler enabled with no admin-grant rules in profile.")
 			fmt.Fprintln(w,
-				"  GRANT / ALTER DEFAULT PRIVILEGES statements will be DENIED by default")
+				"  GRANT / ALTER DEFAULT PRIVILEGES / CREATE ROLE / ALTER ROLE / DROP ROLE")
 			fmt.Fprintln(w,
-				"  (admin-tight per [[safety-mode-lean-permissive]]; UC-34 admin-grant floor).")
+				"  (incl. PG aliases CREATE USER / ALTER USER / DROP USER) statements will be")
+			fmt.Fprintln(w,
+				"  DENIED by default (admin-tight per [[safety-mode-lean-permissive]];")
+			fmt.Fprintln(w,
+				"  UC-34 admin-grant floor + #586 PG role/user management closure).")
 			fmt.Fprintln(w,
 				"  Add an explicit allow_rule for admin-grant operations if your workflow needs them:")
 			fmt.Fprintln(w,
 				"    dbounce rules add 'GRANT:*' --effect allow --note 'admin DCL allowed for migrations'")
+			fmt.Fprintln(w,
+				"    dbounce rules add 'ALTER_PRIVILEGES:*' --effect allow --note 'role provisioning'")
 			fmt.Fprintln(w,
 				"  REVOKE is unaffected (cleanup direction is always allowed).")
 		}

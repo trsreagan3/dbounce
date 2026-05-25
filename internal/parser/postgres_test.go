@@ -204,9 +204,21 @@ func TestParse_CreateTable(t *testing.T) {
 	assert.True(t, ps.IsDDL)
 }
 
+// TestParse_CreateRole pins the #586 reclassification: CREATE ROLE is
+// admin-grant DCL (not DDL), so the AdminTightFloor fires by default
+// under --default-policy=allow. Per [[scorer-is-ground-truth]]: this
+// statement IS privilege management; classifying it as DDL let
+// `CREATE ROLE attacker SUPERUSER` slip through default-allow on
+// PostgreSQL (UAT-C 2026-05-25). The MySQL classifier already covers
+// CREATE USER via populateMySQLCreateUser; #586 closes the PG parity gap.
 func TestParse_CreateRole(t *testing.T) {
 	ps := pgParse(`CREATE ROLE service_acct LOGIN`)
-	assert.Equal(t, StmtDDL, ps.StatementType)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"CREATE ROLE MUST classify as StmtAlterPrivileges so the admin-tight floor fires (#586)")
+	assert.True(t, ps.IsDCL,
+		"CREATE ROLE MUST set IsDCL=true so downstream policy can reason about privilege management (#586)")
+	assert.False(t, ps.IsDDL,
+		"CREATE ROLE MUST NOT be IsDDL — it's DCL, not DDL (#586 classifier correction)")
 }
 
 func TestParse_CreateExtension(t *testing.T) {
@@ -685,6 +697,117 @@ func TestParse_SchemaNormalization(t *testing.T) {
 func TestParse_FunctionLowercase(t *testing.T) {
 	ps := pgParse(`SELECT PG_SLEEP(60)`)
 	assert.Contains(t, ps.FunctionsCalled, "pg_sleep")
+}
+
+// =============================================================================
+// #586 — PG role/user management classifier tests.
+// =============================================================================
+//
+// UAT-C 2026-05-25 found that PostgreSQL user-management DDL bypassed the
+// admin-tight floor entirely under --default-policy=allow. Same UC-34
+// bypass class. Per [[scorer-is-ground-truth]]: fix the underlying
+// classifier (these statements ARE privilege management) — don't add
+// special-case handling downstream of the floor.
+//
+// Each test asserts observable state: StatementType + IsDCL + (not) IsDDL
+// so the admin-tight floor's isAdminGrantShape predicate evaluates true.
+// Per CONTRIBUTING.md: state assertions, not implementation internals.
+
+// TestClassifier_CreateRoleSuperuser_IsDCL pins the CREATE ROLE
+// admin-grant classification. SUPERUSER is the highest-privilege
+// attribute; missing the floor on this statement = catastrophic
+// privilege escalation under default-allow.
+func TestClassifier_CreateRoleSuperuser_IsDCL(t *testing.T) {
+	ps := pgParse(`CREATE ROLE attacker SUPERUSER`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"CREATE ROLE SUPERUSER MUST classify as admin-grant DCL (#586)")
+	assert.True(t, ps.IsDCL, "CREATE ROLE MUST set IsDCL=true")
+	assert.False(t, ps.IsDDL, "CREATE ROLE is DCL not DDL after #586")
+}
+
+// TestClassifier_AlterUserSuperuser_IsDCL pins the ALTER USER -> SUPERUSER
+// reclassification. PG aliases USER to ROLE; both keywords parse to
+// Node_AlterRoleStmt.
+func TestClassifier_AlterUserSuperuser_IsDCL(t *testing.T) {
+	ps := pgParse(`ALTER USER bob SUPERUSER`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"ALTER USER SUPERUSER MUST classify as admin-grant DCL (#586)")
+	assert.True(t, ps.IsDCL)
+	assert.False(t, ps.IsDDL)
+}
+
+// TestClassifier_AlterRoleCreatedb_IsDCL pins ALTER ROLE with CREATEDB
+// attribute — also a privilege expansion (lets the role create new
+// databases).
+func TestClassifier_AlterRoleCreatedb_IsDCL(t *testing.T) {
+	ps := pgParse(`ALTER ROLE bob WITH CREATEDB`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+}
+
+// TestClassifier_CreateUserWithPassword_IsDCL pins the CREATE USER
+// shape (PG's alias for CREATE ROLE ... LOGIN) with embedded password
+// + SUPERUSER. Same node type as CREATE ROLE.
+func TestClassifier_CreateUserWithPassword_IsDCL(t *testing.T) {
+	ps := pgParse(`CREATE USER attacker WITH SUPERUSER PASSWORD 'pw'`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"CREATE USER WITH SUPERUSER PASSWORD MUST classify as admin-grant DCL (#586)")
+	assert.True(t, ps.IsDCL)
+}
+
+// TestClassifier_DropRoleSingle_IsDCL pins DROP ROLE. Note: dropping a
+// role IS a privilege-management operation (removes the principal +
+// orphans its grants). Even though it's "destruction" rather than
+// "grant," it's the same admin-tight class as CREATE.
+func TestClassifier_DropRoleSingle_IsDCL(t *testing.T) {
+	ps := pgParse(`DROP ROLE bob`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"DROP ROLE MUST classify as admin-grant DCL (#586)")
+	assert.True(t, ps.IsDCL)
+}
+
+// TestClassifier_DropUserSingle_IsDCL pins DROP USER (PG alias for
+// DROP ROLE; same node type).
+func TestClassifier_DropUserSingle_IsDCL(t *testing.T) {
+	ps := pgParse(`DROP USER bob`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+}
+
+// TestClassifier_DropRoleMultiple_IsDCL pins multi-grantee DROP ROLE.
+// pg_query packs the role list inside one DropRoleStmt; the classifier
+// must still recognize the node type.
+func TestClassifier_DropRoleMultiple_IsDCL(t *testing.T) {
+	ps := pgParse(`DROP ROLE bob, eve, alice`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType,
+		"multi-grantee DROP ROLE MUST classify as admin-grant DCL (#586)")
+	assert.True(t, ps.IsDCL)
+}
+
+// TestClassifier_DropUserIfExists_IsDCL pins the IF EXISTS variant.
+// The conditional-existence clause does not change the node type or
+// the classification.
+func TestClassifier_DropUserIfExists_IsDCL(t *testing.T) {
+	ps := pgParse(`DROP USER IF EXISTS bob`)
+	assert.Equal(t, StmtAlterPrivileges, ps.StatementType)
+	assert.True(t, ps.IsDCL)
+}
+
+// TestClassifier_AlterRoleSet_NotAdminGrant pins the carve-out: ALTER
+// ROLE/USER SET <var> = <val> is SESSION-VAR configuration (search_path,
+// timezone, etc.), NOT a privilege-attribute change. PG parses it as
+// Node_AlterRoleSetStmt — a different node type than the privilege-
+// attribute AlterRoleStmt. Per [[safety-mode-lean-permissive]] (block
+// rarely): the admin-tight floor stays OUT of benign session config so
+// search_path / timezone tweaks don't get denied. Currently classifies
+// as StmtUnknown (pre-#586 behavior; whatever it is, it's NOT IsDCL).
+func TestClassifier_AlterRoleSet_NotAdminGrant(t *testing.T) {
+	ps := pgParse(`ALTER ROLE bob SET search_path = 'a'`)
+	assert.NotEqual(t, StmtAlterPrivileges, ps.StatementType,
+		"ALTER ROLE SET <var> is session-config (not privilege mgmt); "+
+			"MUST NOT trigger admin-tight floor per [[safety-mode-lean-permissive]] (#586 carve-out)")
+	assert.False(t, ps.IsDCL,
+		"AlterRoleSetStmt MUST NOT be IsDCL — admin-tight floor stays out of benign session config")
 }
 
 // pgParse is the postgres-test-only helper. Routes raw SQL through the

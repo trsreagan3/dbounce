@@ -166,7 +166,6 @@ func classifyTopLevel(n *pg_query.Node) string {
 		return StmtComment
 	case *pg_query.Node_CreateStmt,
 		*pg_query.Node_CreateSchemaStmt,
-		*pg_query.Node_CreateRoleStmt,
 		*pg_query.Node_CreateFunctionStmt,
 		*pg_query.Node_CreateExtensionStmt,
 		*pg_query.Node_CreateTableAsStmt,
@@ -174,16 +173,44 @@ func classifyTopLevel(n *pg_query.Node) string {
 		*pg_query.Node_CreateTrigStmt,
 		*pg_query.Node_CreatePolicyStmt,
 		*pg_query.Node_AlterTableStmt,
-		*pg_query.Node_AlterRoleStmt,
 		*pg_query.Node_AlterDatabaseStmt,
 		*pg_query.Node_AlterSeqStmt,
 		*pg_query.Node_AlterPolicyStmt,
 		*pg_query.Node_DropStmt,
-		*pg_query.Node_DropRoleStmt,
 		*pg_query.Node_DropdbStmt,
 		*pg_query.Node_RenameStmt,
 		*pg_query.Node_IndexStmt:
 		return StmtDDL
+	// Role/User management — per #586 UAT-C, these previously fell through
+	// to StmtDDL which does NOT trigger the admin-tight floor. The floor
+	// only fires on StmtGrant + StmtAlterPrivileges (see
+	// decision/admin_tight.go isAdminGrantShape). PostgreSQL aliases USER
+	// to ROLE in the grammar (CREATE USER == CREATE ROLE ... LOGIN), so
+	// the same node types cover both keywords:
+	//
+	//   - Node_CreateRoleStmt — CREATE ROLE / CREATE USER (incl. WITH
+	//     SUPERUSER / PASSWORD / CREATEDB / CREATEROLE attributes; PG does
+	//     NOT support IF NOT EXISTS on CREATE ROLE — that's MySQL only)
+	//   - Node_AlterRoleStmt  — ALTER ROLE / ALTER USER attribute changes
+	//     (WITH SUPERUSER / NOSUPERUSER / PASSWORD / CREATEDB / etc.)
+	//   - Node_DropRoleStmt   — DROP ROLE / DROP USER (incl. IF EXISTS
+	//     + multi-grantee `DROP ROLE a, b, c` — pg_query packs the role
+	//     list inside the single DropRoleStmt node)
+	//
+	// Classified as StmtAlterPrivileges so isAdminGrantShape recognizes
+	// them as admin-grant shapes + the AdminTightFloor fires by default
+	// under --default-policy=allow. Per [[scorer-is-ground-truth]]: we
+	// fix the CLASSIFIER (these statements ARE privilege management);
+	// no special-case patch downstream of the floor.
+	//
+	// Node_AlterRoleSetStmt (ALTER ROLE/USER SET <var> = <val> — session
+	// variable defaults, NOT attribute changes) intentionally stays
+	// StmtDDL: changing search_path defaults is benign session-config
+	// shape per [[safety-mode-lean-permissive]] (block rarely).
+	case *pg_query.Node_CreateRoleStmt,
+		*pg_query.Node_AlterRoleStmt,
+		*pg_query.Node_DropRoleStmt:
+		return StmtAlterPrivileges
 	// DCL — privilege management. Per task #302 / KNOWN-CAVEATS §A5:
 	// before this slice these classified as UNKNOWN and slipped past
 	// the safe-default profile (default-allow). The GrantStmt /
