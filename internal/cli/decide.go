@@ -387,6 +387,32 @@ func evalDecide(
 		HasMutatingNode: ps.HasMutatingNode,
 	}
 
+	// Step 0: multi-statement admin-tight floor (#587 UAT-C CRIT).
+	// Mirrors proxy.decide()'s Step 0 byte-for-byte. Fires BEFORE the
+	// profile gate so an embedded GRANT/ALTER_PRIVILEGES at position
+	// 2+ can't slip past a profile baseline that matched on the first
+	// statement's classification. The global rules table is threaded
+	// through so per-statement allow-rule matches preserve the
+	// existing override semantics. Per [[ibounce-honest-positioning]]
+	// + [[scorer-is-ground-truth]]: CLI dry-run + production hot path
+	// produce identical verdicts on identical multi-statement inputs.
+	// Single source of truth lives in
+	// internal/decision/multi_statement.go.
+	var step0Rules *dbrules.RuleSet
+	if st != nil {
+		if rs, rerr := st.LoadRuleSet(); rerr == nil {
+			step0Rules = rs
+		}
+	}
+	if mv := decision.EvaluateMultiStatement(
+		ps.Dialect, ps.Raw, activeProfile,
+		string(defaultPol), step0Rules); mv.Deny {
+		out.Verdict = "deny"
+		out.DecisionSource = "default"
+		out.Reason = mv.Reason
+		return out, nil
+	}
+
 	// Step 1: profile gates. Mirrors proxy.decide step 1+2.
 	if activeProfile != nil && activeProfile.Name != profile.FullUserProfileName {
 		profileView := &profile.ParsedStatement{
@@ -449,20 +475,12 @@ func evalDecide(
 		return out, nil
 	}
 
-	// #559: admin-tight floor (UC-34 + #556). Mirrors proxy.decide()
-	// Step 5.5 byte-for-byte via the shared decision.AdminTightFloor
-	// helper so the CLI dry-run verdict matches the production hot-
-	// path verdict on identical DCL inputs. Per
-	// [[ibounce-honest-positioning]]: CLI/proxy divergence is a
-	// calibration-drift bug class — single source of truth lives in
-	// internal/decision/admin_tight.go.
-	if deny, reason, applicable := decision.AdminTightFloor(
-		ps, activeProfile, string(defaultPol)); applicable && deny {
-		out.Verdict = "deny"
-		out.DecisionSource = "default"
-		out.Reason = reason
-		return out, nil
-	}
+	// #559 + #587: admin-tight floor moved to Step 0 above. Pre-#587
+	// the floor lived here; UAT-C 2026-05-25 surfaced that an embedded
+	// DCL at position 2+ slipped past the profile gate because the
+	// floor ran AFTER profile evaluation. Step 0 closes that bypass
+	// for both default-allow + profile-allow shapes. Single source of
+	// truth in internal/decision/multi_statement.go.
 
 	out.Verdict = string(defaultPol)
 	out.DecisionSource = "default"

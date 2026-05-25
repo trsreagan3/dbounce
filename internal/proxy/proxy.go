@@ -2073,6 +2073,53 @@ func (s *Server) evaluateAndAuditWithAgent(sql, source, sessionID string) {
 // update this comment + add a regression test that proves the new
 // order against the BB+WB scenarios in proxy_test.go.
 func (s *Server) decide(ps *parser.ParsedStatement) Decision {
+	// [[bulk-prompt-answer-ux]]: read the active profile through the
+	// RWMutex-guarded accessor so SwapProfile can swap it mid-flight
+	// without racing the decision loop. The pointer is taken once per
+	// decide() call; subsequent Evaluate calls below see a consistent
+	// snapshot even if the burst sweeper hot-swaps between iterations.
+	activeProfile, _ := s.loadActiveProfile()
+
+	// Step 0: multi-statement admin-tight floor (#587 UAT-C CRIT).
+	// Fires BEFORE the profile gate because UAT-C 2026-05-25 confirmed
+	// that an embedded GRANT/ALTER_PRIVILEGES at position 2+ slips past
+	// safe-default's `sql_read_only` baseline (the whole-batch
+	// ParsedStatement classifies as SELECT — the first statement type —
+	// so the profile happily ALLOWS the batch). Per UC-34 + UAT-C: the
+	// floor MUST fire on any admin-grant DCL anywhere in the batch, even
+	// when the whole-batch StatementType masks it.
+	//
+	// EvaluateMultiStatement splits the raw SQL at top-level `;`
+	// separators + parses each piece individually + applies
+	// AdminTightFloor to each. The global rules table is threaded
+	// through so a per-statement allow-rule match preserves the
+	// existing override semantics (an operator who wrote
+	// `dbounce rules add --pattern "GRANT:*" --effect allow` to permit
+	// admin-grant traffic still gets that override per-statement). DENY
+	// on any DENY; reason names the position so operators debugging
+	// the verdict see WHICH statement fired (per
+	// [[ibounce-honest-positioning]]). Single-statement inputs (no `;`)
+	// get Position=1 in the verdict so SIEM filters keying on
+	// "statement N/M" handle both shapes uniformly.
+	//
+	// proxy.decide + cli.evalDecide consume the same helper — no parity
+	// drift per the #559 lesson.
+	var step0Rules *dbrules.RuleSet
+	if s.store != nil {
+		if rs, rerr := s.store.LoadRuleSet(); rerr == nil {
+			step0Rules = rs
+		}
+	}
+	if mv := decision.EvaluateMultiStatement(
+		ps.Dialect, ps.Raw, activeProfile,
+		string(s.cfg.DefaultPolicy), step0Rules); mv.Deny {
+		return Decision{
+			Verdict: VerdictDeny,
+			Reason:  mv.Reason,
+			Source:  SourceDefault,
+		}
+	}
+
 	// Step 1+2: profile gates. D-Slice 7 wires the safe-default
 	// environment profile + its AST-walk Layer 2 backstop. The profile
 	// evaluator runs deny_keywords → deny_actions → allow_baseline +
@@ -2081,13 +2128,6 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 	// a profile allow short-circuits with Source=profile.allow so a
 	// permissive task scope can't lower the bar further. Abstain →
 	// fall through to the task / global rules below.
-	//
-	// [[bulk-prompt-answer-ux]]: read the active profile through the
-	// RWMutex-guarded accessor so SwapProfile can swap it mid-flight
-	// without racing the decision loop. The pointer is taken once per
-	// decide() call; subsequent Evaluate calls below see a consistent
-	// snapshot even if the burst sweeper hot-swaps between iterations.
-	activeProfile, _ := s.loadActiveProfile()
 	if activeProfile != nil && activeProfile.Name != profile.FullUserProfileName {
 		profileView := &profile.ParsedStatement{
 			StatementType:    ps.StatementType,
@@ -2233,40 +2273,16 @@ func (s *Server) decide(ps *parser.ParsedStatement) Decision {
 		}
 	}
 
-	// Step 5.5: admin-tight floor for DCL (GRANT / ALTER DEFAULT PRIVILEGES).
-	// Per UC-34 (MRR-1 audit, commit 7d69e68) + [[safety-mode-lean-
-	// permissive]]: admin/IAM operations are default-tight even when
-	// the surrounding default-policy is "allow." Without this floor a
-	// `GRANT ALL ... TO PUBLIC` slipped through any deployment running
-	// with --default-policy=allow + no profile + no explicit allow rule.
+	// Step 5.5 (admin-tight floor) now fires as Step 0 at the top of
+	// decide() per #587 UAT-C 2026-05-25. Pre-#587 the floor lived
+	// here; UAT-C surfaced that an embedded DCL at position 2+ slipped
+	// past the profile gate because the floor ran AFTER Step 1+2.
+	// Moving the floor to Step 0 closes the bypass for both
+	// default-allow + profile-allow shapes. The per-statement
+	// global-allow override is honored inside EvaluateMultiStatement
+	// (preserves the operator-configured `GRANT:*` allow-rule
+	// override).
 	//
-	// Per #559: the floor logic now lives in internal/decision/
-	// AdminTightFloor so the CLI dry-run path (cli/decide.go's
-	// evalDecide) consumes the SAME shape. Single source of truth per
-	// [[ibounce-honest-positioning]] — CLI dry-run + production hot
-	// path produce identical verdicts on identical DCL inputs.
-	//
-	// Override path: an operator who wants admin-grant traffic to flow
-	// adds an explicit allow rule via `dbounce rules add` (a global
-	// allow that matches GRANT) OR via a profile allow_rule. The global
-	// override is honored by the Step 5 short-circuit above; the
-	// profile override is honored upstream via Profile.Evaluate's
-	// Allowed=true short-circuit (Step 1+2) — and AdminTightFloor
-	// itself checks profile.MatchAllowRule as defense-in-depth.
-	//
-	// Source: SourceDefault tagged with the floor reason so audit
-	// reviewers see "this would have allowed under the surrounding
-	// default-policy but the admin-tight floor refused." Cross-product
-	// SIEM filters key on the reason string.
-	if deny, reason, applicable := decision.AdminTightFloor(
-		ps, activeProfile, string(s.cfg.DefaultPolicy)); applicable && deny {
-		return Decision{
-			Verdict: VerdictDeny,
-			Reason:  reason,
-			Source:  SourceDefault,
-		}
-	}
-
 	// Step 6: default-policy fall-through.
 	verdict := VerdictAllow
 	reason := "default policy: allow (no rule matched)"
