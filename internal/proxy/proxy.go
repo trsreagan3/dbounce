@@ -1156,8 +1156,17 @@ func (s *Server) Serve() error {
 	// then calls this endpoint on each Bounce product's mgmt port
 	// to confirm "rules are live." Same bearer-token auth model as
 	// /audit/events.
+	//
+	// #524 BB-3 — defense-in-depth middleware closes the residual gap
+	// when a future code path bypasses the CLI's bind-time
+	// --audit-events-token requirement (config-file loader, programmatic
+	// embed, test harness). Handler-internal bearer check ALSO fires
+	// (belt-and-suspenders); requireMgmtAuth adds the "external bind
+	// without token → 503" failure case the handler-internal check
+	// can't enforce because it has no view of the bind host.
 	mux.HandleFunc("/admin/dynamic-denies/reload",
-		s.dynamicDenyReloadHandler(s.cfg.AuditEventsToken))
+		requireMgmtAuth(s.dynamicDenyReloadHandler(s.cfg.AuditEventsToken),
+			s.cfg.AuditEventsToken, s.cfg.MgmtHost))
 	// #387 / §A25 Phase 2 — POST /admin/profile/reload mgmt endpoint.
 	// Re-reads profiles.yaml from disk + hot-swaps the active profile
 	// pointer so a `dbounce profile allow` mutation takes effect on
@@ -1165,7 +1174,8 @@ func (s *Server) Serve() error {
 	// model as /audit/events. Mirrors ibounce + kbouncer response
 	// shape per [[cross-product-agent-parity]].
 	mux.HandleFunc("/admin/profile/reload",
-		s.profileReloadHandler(s.cfg.AuditEventsToken, ""))
+		requireMgmtAuth(s.profileReloadHandler(s.cfg.AuditEventsToken, ""),
+			s.cfg.AuditEventsToken, s.cfg.MgmtHost))
 	s.mgmtSrv = &http.Server{
 		Addr:              mgmtAddr,
 		Handler:           mux,
