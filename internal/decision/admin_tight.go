@@ -96,19 +96,47 @@ func AdminTightFloor(
 	// Floor fires: no override matched + the statement is an admin-grant
 	// DCL. Reason mirrors proxy.decide Step 5.5 byte-for-byte (audit
 	// log scrapers + SIEM dashboards key on this string).
+	//
+	// #590: use the MutatingNodeType when it carries a more specific
+	// operation name than StatementType. MySQL DCL shapes like CREATE
+	// USER, DROP USER, RENAME USER, and SET PASSWORD all classify as
+	// StmtGrant / StmtAlterPrivileges for the admin-tight floor check,
+	// but their MutatingNodeType carries the exact verb (CREATE-USER,
+	// DROP-USER, etc.). The reason string MUST name the actual command
+	// so operators and SIEM dashboards see "CREATE USER requires..." not
+	// "GRANT requires..." for a CREATE USER statement.
+	opName := verbForReason(stmt)
 	if defaultPolicy == "" {
 		return true, fmt.Sprintf(
 			"admin-tight floor: %s requires an explicit allow_rule "+
 				"(profile or global) — DCL operations are default-deny "+
 				"per [[safety-mode-lean-permissive]]",
-			stmt.StatementType), true
+			opName), true
 	}
 	return true, fmt.Sprintf(
 		"admin-tight floor: %s requires an explicit allow_rule "+
 			"(profile or global) — DCL operations are default-deny "+
 			"per [[safety-mode-lean-permissive]]; default-policy=%s "+
 			"is bypassed for privilege management",
-		stmt.StatementType, defaultPolicy), true
+		opName, defaultPolicy), true
+}
+
+// verbForReason returns the most specific operation name for the deny
+// reason string. When MutatingNodeType carries a value (MySQL DCL shapes
+// use it to record the exact verb like CREATE-USER, DROP-USER, etc.) it
+// is preferred over StatementType because it is more informative to
+// operators ("CREATE USER requires..." vs "GRANT requires...").
+//
+// Per #590: before this helper the reason always used StatementType,
+// which for MySQL CREATE USER is StmtGrant = "GRANT" — misleading in
+// the admin-tight deny message. MutatingNodeType carries the actual
+// command verb for all MySQL DCL shapes (mysqlDCLOpCreateUser =
+// "CREATE-USER", mysqlDCLOpDropUser = "DROP-USER", etc.).
+func verbForReason(stmt *parser.ParsedStatement) string {
+	if stmt.MutatingNodeType != "" {
+		return stmt.MutatingNodeType
+	}
+	return stmt.StatementType
 }
 
 // isAdminGrantShape returns true when the parsed statement type is one

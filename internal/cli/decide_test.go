@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -581,6 +582,89 @@ func TestCLIEvalDecide_MultiStmtAllAllow_PassesThrough(t *testing.T) {
 		"all-SELECT batch under default-allow MUST report ALLOW (no false-positive)")
 	assert.NotContains(t, res.Reason, "admin-tight floor",
 		"reason MUST NOT name the floor when no DCL is present")
+}
+
+// ---------------------------------------------------------------------------
+// #589 — decideResult JSON includes indicators field with RiskIndicators.
+//
+// Per #589: operators using `dbounce decide --json` for incident response
+// need the WHY alongside the verdict. The indicators field surfaces the
+// parser's RiskIndicators so a SIEM/script can pivot on "why was this
+// GRANT denied" without re-parsing the SQL.
+// ---------------------------------------------------------------------------
+
+// TestDecideResult_IndicatorsInJSON pins that evalDecide populates the
+// indicators field for a MySQL GRANT that triggers multiple risk indicators.
+// The statement `GRANT ALL ON *.* TO 'attacker'@'%' WITH GRANT OPTION`
+// produces: all_privileges, wildcard_host, with_grant_option. These are
+// the parser's RiskIndicators, not a secret internal state — they're
+// the stable SIEM vocabulary documented in parser.go.
+func TestDecideResult_IndicatorsInJSON(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	// Use a GRANT that populates multiple indicators so the field is
+	// observably non-empty even under default-deny (the verdict is deny
+	// from admin-tight floor; indicators still surfaced).
+	res, err := evalDecideForTest(t, st, nil, "mysql", "allow",
+		"GRANT ALL ON *.* TO 'attacker'@'%' WITH GRANT OPTION")
+	require.NoError(t, err)
+	assert.Equal(t, "deny", res.Verdict,
+		"GRANT ALL to wildcard host MUST deny via admin-tight floor")
+	assert.NotEmpty(t, res.Indicators,
+		"#589: indicators field MUST be non-empty for DCL with risk flags — "+
+			"operator running --json for incident response needs the WHY")
+	assert.Contains(t, res.Indicators, "all_privileges",
+		"all_privileges indicator MUST surface (GRANT ALL shape)")
+	assert.Contains(t, res.Indicators, "wildcard_host",
+		"wildcard_host indicator MUST surface ('@'%'' host)")
+	assert.Contains(t, res.Indicators, "with_grant_option",
+		"with_grant_option indicator MUST surface (WITH GRANT OPTION)")
+}
+
+// TestDecideResult_IndicatorsEmptyForNonDCL pins that non-DCL
+// statements (SELECT, INSERT, etc.) produce an empty indicators field
+// so the JSON output is clean for the common case.
+func TestDecideResult_IndicatorsEmptyForNonDCL(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow",
+		"CREATE TABLE foo (id SERIAL PRIMARY KEY)")
+	require.NoError(t, err)
+	assert.Equal(t, "allow", res.Verdict)
+	assert.Empty(t, res.Indicators,
+		"#589: non-DCL statement MUST produce empty indicators field (no false noise)")
+}
+
+// TestDecideResult_IndicatorsInJSONEncoding pins that the JSON-encoded
+// decideResult includes the indicators key when populated. This is the
+// wire-shape test: shim code parsing `dbounce decide --json` output sees
+// the field. We use the evalDecide path directly to avoid the os.Exit(1)
+// deny branch; the JSON encoding is verified via json.Marshal on the result.
+func TestDecideResult_IndicatorsInJSONEncoding(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	res, err := evalDecideForTest(t, st, nil, "mysql", "allow",
+		"GRANT ALL ON *.* TO 'x'@'%'")
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Indicators,
+		"#589 pre-condition: indicators must be populated for this GRANT shape")
+
+	raw, merr := json.Marshal(res)
+	require.NoError(t, merr)
+	jsonStr := string(raw)
+	assert.Contains(t, jsonStr, `"indicators"`,
+		"#589 JSON encoding MUST include indicators key (shim wire-shape contract)")
+	assert.Contains(t, jsonStr, "all_privileges",
+		"#589 JSON encoding MUST include all_privileges indicator value")
 }
 
 // ---------------------------------------------------------------------------

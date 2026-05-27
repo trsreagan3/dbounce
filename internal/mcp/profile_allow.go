@@ -3,10 +3,12 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/trsreagan3/dbounce/internal/profileallow"
+	"github.com/trsreagan3/dbounce/internal/store"
 )
 
 func (s *Server) toolProfileAllow(args map[string]any) (map[string]any, error) {
@@ -44,6 +46,13 @@ func (s *Server) toolProfileAllow(args map[string]any) (map[string]any, error) {
 		ProfilesPath:  s.cfg.ProfilesPath,
 		Source:        profileallow.SourceMCP,
 		Actor:         s.cfg.Actor,
+		// #391: wire the OCSF admin-action audit event via the same
+		// cross-process pending_audit_events queue the CLI path uses.
+		// The HTTP /admin/profile/allow endpoint enqueues the event;
+		// the MCP path was the only surface missing the emit. Best-effort:
+		// a queue-write failure is silently dropped (matches the CLI
+		// enqueueAdminAction posture per [[creates-never-mutates]]).
+		EmitAudit: s.mcpProfileAllowAuditEmitter(),
 	})
 	if err != nil {
 		if perr, ok := err.(*profileallow.Error); ok {
@@ -74,6 +83,41 @@ func (s *Server) toolProfileAllow(args map[string]any) (map[string]any, error) {
 		out["pending_entry"] = res.PendingEntry
 	}
 	return out, nil
+}
+
+// mcpProfileAllowAuditEmitter returns a profileallow.EmitAuditFn that
+// enqueues an ADMIN_ACTION pending audit event via the dbounce
+// pending_audit_events SQLite queue. Best-effort: a nil store or a
+// queue-write failure is silently dropped — matches the existing
+// enqueueAdminAction posture in the CLI package (see
+// internal/cli/admin_action.go).
+//
+// Per #391 / §B v1.1: the HTTP /admin/profile/allow endpoint emits
+// the OCSF admin-action event; the MCP path (dbounce_profile_allow)
+// was the only surface missing the emit. This method closes that gap
+// so every dbounce_profile_allow MCP call produces an audit event
+// visible to the running `dbounce run` process's poller.
+func (s *Server) mcpProfileAllowAuditEmitter() profileallow.EmitAuditFn {
+	if s.cfg.Store == nil {
+		return nil
+	}
+	st := s.cfg.Store
+	return func(ev profileallow.AuditEvent) {
+		payload := map[string]any{
+			"action":        ev.Action,
+			"actor":         ev.Actor,
+			"resource_type": ev.EntityKind,
+			"resource_id":   ev.EntityName,
+			"result":        "success",
+			"details":       ev.Details,
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return // best-effort; don't surface marshal failure
+		}
+		_, _ = st.AddPendingAuditEvent(
+			store.PendingAuditEventAdminAction, string(b))
+	}
 }
 
 func (s *Server) toolDeniesRecent(args map[string]any) (map[string]any, error) {

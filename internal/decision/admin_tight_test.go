@@ -470,3 +470,114 @@ func TestAdminTightFloor_CrossDialectDropUser_BothDeny(t *testing.T) {
 		})
 	}
 }
+
+// =============================================================================
+// #590 — admin-tight deny reason names the ACTUAL command, not the generic
+// StmtType bucket.
+// =============================================================================
+//
+// UAT-C G5: when MySQL operator runs `CREATE USER ... GRANT PROXY`, the
+// deny reason string said "GRANT requires admin-tight..." because both
+// CREATE USER and GRANT PROXY map to StmtGrant for the floor-gate, and the
+// old reason string used StatementType ("GRANT") verbatim. Operators
+// debugging the deny reason need the ACTUAL command name ("CREATE USER" or
+// "GRANT PROXY"), not the generic bucket label.
+//
+// Fix: verbForReason() prefers MutatingNodeType (the exact verb the MySQL
+// DCL classifier set) over StatementType. PG statements with no
+// MutatingNodeType still use StatementType (no regression on PG).
+//
+// Per [[ibounce-honest-positioning]]: the reason must name what actually
+// fired, not an internal classification alias.
+
+// TestAdminTightFloor_MySQLCreateUser_ReasonNamesCreateUser pins the
+// #590 fix: MySQL `CREATE USER foo IDENTIFIED BY 'x'` MUST have a deny
+// reason that says "CREATE USER" (from MutatingNodeType), NOT "GRANT"
+// (from StatementType — both are "GRANT" at the type level, but the reason
+// should be operator-readable).
+func TestAdminTightFloor_MySQLCreateUser_ReasonNamesCreateUser(t *testing.T) {
+	ps := parseMySQL(t, "CREATE USER 'foo'@'%' IDENTIFIED BY 'x'")
+	require.True(t, ps.IsDCL,
+		"MySQL CREATE USER MUST set IsDCL=true")
+	require.Equal(t, parser.StmtGrant, ps.StatementType,
+		"MySQL CREATE USER MUST classify as StmtGrant (admin-tight class)")
+	require.Equal(t, "CREATE-USER", ps.MutatingNodeType,
+		"MySQL CREATE USER MUST set MutatingNodeType=CREATE-USER")
+
+	deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable)
+	assert.True(t, deny)
+	assert.Contains(t, reason, "CREATE-USER",
+		"#590: deny reason MUST name CREATE-USER (MutatingNodeType) not GRANT (StatementType) — "+
+			"operator running incident response sees what ACTUALLY fired the floor")
+	assert.NotContains(t, reason, "GRANT requires",
+		"#590: deny reason MUST NOT say 'GRANT requires...' for a CREATE USER statement "+
+			"(was the pre-fix symptom)")
+}
+
+// TestAdminTightFloor_MySQLRenameUser_ReasonNamesRenameUser pins the
+// #590 fix for RENAME USER: reason MUST say "RENAME-USER", not the
+// StmtAlterPrivileges bucket label.
+func TestAdminTightFloor_MySQLRenameUser_ReasonNamesRenameUser(t *testing.T) {
+	ps := parseMySQL(t, "RENAME USER 'old'@'%' TO 'new'@'%'")
+	require.True(t, ps.IsDCL)
+	require.Equal(t, parser.StmtAlterPrivileges, ps.StatementType)
+	require.Equal(t, "RENAME-USER", ps.MutatingNodeType)
+
+	deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable)
+	assert.True(t, deny)
+	assert.Contains(t, reason, "RENAME-USER",
+		"#590: deny reason MUST name RENAME-USER (MutatingNodeType)")
+}
+
+// TestAdminTightFloor_MySQLSetPassword_ReasonNamesSetPassword pins the
+// #590 fix for SET PASSWORD: reason MUST say "SET-PASSWORD" not
+// "ALTER_PRIVILEGES".
+func TestAdminTightFloor_MySQLSetPassword_ReasonNamesSetPassword(t *testing.T) {
+	ps := parseMySQL(t, "SET PASSWORD FOR 'bob'@'%' = 'newsecret'")
+	require.True(t, ps.IsDCL)
+	require.Equal(t, parser.StmtAlterPrivileges, ps.StatementType)
+	require.Equal(t, "SET-PASSWORD", ps.MutatingNodeType)
+
+	deny, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable)
+	assert.True(t, deny)
+	assert.Contains(t, reason, "SET-PASSWORD",
+		"#590: deny reason MUST name SET-PASSWORD (MutatingNodeType), not ALTER_PRIVILEGES")
+}
+
+// TestAdminTightFloor_MySQLDropUser_ReasonNamesDropUser pins the
+// #590 fix for DROP USER: reason MUST say "DROP-USER".
+func TestAdminTightFloor_MySQLDropUser_ReasonNameDropUser(t *testing.T) {
+	ps := parseMySQL(t, "DROP USER 'bob'@'%'")
+	require.True(t, ps.IsDCL)
+	require.Equal(t, parser.StmtAlterPrivileges, ps.StatementType)
+	require.Equal(t, "DROP-USER", ps.MutatingNodeType)
+
+	_, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable)
+	assert.Contains(t, reason, "DROP-USER",
+		"#590: deny reason MUST name DROP-USER (MutatingNodeType), not ALTER_PRIVILEGES")
+}
+
+// TestAdminTightFloor_PGGrant_ReasonStillNamesGrant pins the regression
+// guard: PG GRANT has an empty MutatingNodeType (the PG path doesn't set
+// it for DCL), so verbForReason falls back to StatementType = "GRANT".
+// Pre-existing SIEM filters keying on "GRANT requires..." for PG GRANT
+// must not break after the #590 fix.
+func TestAdminTightFloor_PGGrant_ReasonStillNamesGrant(t *testing.T) {
+	ps := parsePG(t, "GRANT ALL ON TABLE foo TO PUBLIC")
+	require.True(t, ps.IsDCL)
+	require.Equal(t, parser.StmtGrant, ps.StatementType)
+	// PG path does not set MutatingNodeType for DCL — the fix MUST fall
+	// back to StatementType when MutatingNodeType is empty.
+	require.Empty(t, ps.MutatingNodeType,
+		"PG GRANT MUST have empty MutatingNodeType (PG parser doesn't set it for DCL)")
+
+	_, reason, applicable := AdminTightFloor(ps, nil, "allow")
+	assert.True(t, applicable)
+	assert.Contains(t, reason, "GRANT",
+		"#590 regression guard: PG GRANT reason MUST still name GRANT "+
+			"(MutatingNodeType empty → falls back to StatementType)")
+}

@@ -63,8 +63,17 @@ type decideResult struct {
 	IsDML           bool     `json:"is_dml"`
 	IsDDL           bool     `json:"is_ddl"`
 	HasMutatingNode bool     `json:"has_mutating_node"`
-	AgentName       string   `json:"agent_name,omitempty"`
-	AgentSessionID  string   `json:"agent_session_id,omitempty"`
+	// Indicators surfaces the parser's RiskIndicators for operator debugging.
+	// Populated for any statement where the parser computed risk flags (DCL
+	// shapes: public_grant, all_privileges, with_grant_option, etc.). Empty
+	// for non-DCL statements. Per #589: operators using `dbounce decide --json`
+	// for incident response now see the WHY alongside the verdict.
+	Indicators []string `json:"indicators,omitempty"`
+	AgentName  string   `json:"agent_name,omitempty"`
+	// Kept for future use (e.g. sync-prompt correlation). Not currently
+	// populated by evalDecide but reserved in the schema so shim code
+	// that references the field by name doesn't break on the JSON decode.
+	AgentSessionID string `json:"agent_session_id,omitempty"`
 }
 
 func newDecideCmd() *cobra.Command {
@@ -385,6 +394,10 @@ func evalDecide(
 		IsDML:           ps.IsDML,
 		IsDDL:           ps.IsDDL,
 		HasMutatingNode: ps.HasMutatingNode,
+		// #589: surface RiskIndicators so operators running
+		// `dbounce decide --json` for incident response see the
+		// WHY alongside the verdict.
+		Indicators: append([]string(nil), ps.RiskIndicators...),
 	}
 
 	// Step 0: multi-statement admin-tight floor (#587 UAT-C CRIT).
