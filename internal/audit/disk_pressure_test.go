@@ -69,12 +69,12 @@ func TestDiskPressureMode_PauseRequestsRefuses503AtCritical(t *testing.T) {
 	if st.RefuseRequests() {
 		t.Fatal("RefuseRequests at 20%% used; want false")
 	}
-	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(98.5), time.Now())
 	if !st.RefuseRequests() {
-		t.Fatal("RefuseRequests at 96%% used in pause mode; want true")
+		t.Fatal("RefuseRequests at 98.5%% used in pause mode; want true")
 	}
 	if got := st.Status(); got != "critical" {
-		t.Fatalf("Status at 96%% = %q; want critical", got)
+		t.Fatalf("Status at 98.5%% = %q; want critical", got)
 	}
 	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(99.0), time.Now())
 	if got := st.Status(); got != "emergency" {
@@ -101,7 +101,7 @@ func TestDiskPressureMode_RotateAggressivelyDropsOldestAtCritical(t *testing.T) 
 		_ = os.Chtimes(p, mt, mt)
 	}
 	st := NewDiskPressureState(DiskPressureModeRotateAggressively, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(98.5), time.Now())
 	if st.RefuseRequests() {
 		t.Fatal("rotate-aggressively must NEVER refuse requests")
 	}
@@ -117,7 +117,7 @@ func TestDiskPressureMode_RotateAggressivelyDropsOldestAtCritical(t *testing.T) 
 func TestDiskPressureMode_ArchiveAndPurgeShipsToSinkAtCritical(t *testing.T) {
 	tmp := t.TempDir()
 	st := NewDiskPressureState(DiskPressureModeArchiveAndPurge, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), nil, "127.0.0.1:5433", fakeDiskStatDP(98.5), time.Now())
 	if st.RefuseRequests() {
 		t.Fatal("archive-and-purge must NEVER refuse requests")
 	}
@@ -138,7 +138,7 @@ func TestDiskPressureTransition_EmitsAdminActionOCSF(t *testing.T) {
 	if got := len(snap()); got != 0 {
 		t.Fatalf("emitted %d events on ok→ok; want 0", got)
 	}
-	st.EvaluateAndReact(context.Background(), emit, "127.0.0.1:5433", fakeDiskStatDP(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), emit, "127.0.0.1:5433", fakeDiskStatDP(98.5), time.Now())
 	events := snap()
 	if len(events) != 1 {
 		t.Fatalf("emitted %d events on ok→critical; want 1", len(events))
@@ -154,7 +154,7 @@ func TestDiskPressureTransition_EmitsAdminActionOCSF(t *testing.T) {
 	if !strings.Contains(body, AdminActionKindDiskPressureTransition) {
 		t.Fatalf("event body missing disk_pressure.transition action kind: %s", body)
 	}
-	st.EvaluateAndReact(context.Background(), emit, "127.0.0.1:5433", fakeDiskStatDP(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), emit, "127.0.0.1:5433", fakeDiskStatDP(98.5), time.Now())
 	if got := len(snap()); got != 1 {
 		t.Fatalf("emitted %d events on critical→critical; want 1", got)
 	}
@@ -176,8 +176,8 @@ func TestStopOnDiskCriticalAliasEquivalentToPauseMode(t *testing.T) {
 	longForm := NewDiskPressureState(DiskPressureModePauseRequests, tmp, 0, 0, 0)
 	aliased, _ := NormalizeDiskPressureMode("pause-requests")
 	aliasState := NewDiskPressureState(aliased, tmp, 0, 0, 0)
-	longForm.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(96.0), time.Now())
-	aliasState.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(96.0), time.Now())
+	longForm.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(98.5), time.Now())
+	aliasState.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(98.5), time.Now())
 	if longForm.RefuseRequests() != aliasState.RefuseRequests() {
 		t.Fatalf("alias RefuseRequests = %t; long form = %t",
 			aliasState.RefuseRequests(), longForm.RefuseRequests())
@@ -196,7 +196,7 @@ func TestNormalizeDiskPressureMode_RejectsUnknownValues(t *testing.T) {
 func TestSnapshotSerialization_HealthzBlockShape(t *testing.T) {
 	tmp := t.TempDir()
 	st := NewDiskPressureState(DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(98.5), time.Now())
 	snap := st.Snapshot()
 	b, err := json.Marshal(snap)
 	if err != nil {
@@ -211,6 +211,8 @@ func TestSnapshotSerialization_HealthzBlockShape(t *testing.T) {
 		`"current_archive_size_bytes":`,
 		`"transitions_count":1`,
 		`"disk_free_pct":`,
+		`"warn_threshold_bytes":`,
+		`"crit_threshold_bytes":`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("snapshot JSON missing %q\ngot: %s", want, body)
@@ -245,5 +247,103 @@ func TestResolveLogDir(t *testing.T) {
 	}
 	if got := ResolveLogDir("/var/log/dbounce/audit.jsonl"); got != "/var/log/dbounce" {
 		t.Fatalf("file path = %q; want /var/log/dbounce", got)
+	}
+}
+
+// ── Dual-threshold matrix tests ──────────────────────────────────────────────
+
+// TestThresholdMatrix_23GBFreeOn228GB is the primary regression for the
+// false-alarm that triggered this work: 89.86% used on a 228 GiB volume
+// with 23 GiB free must be "ok".
+func TestThresholdMatrix_23GBFreeOn228GB(t *testing.T) {
+	const (
+		totalGB  = 228
+		freeGB   = 23
+		totalB   = int64(totalGB) * 1024 * 1024 * 1024
+		freeB    = int64(freeGB) * 1024 * 1024 * 1024
+	)
+	usedPct := float64(totalB-freeB) / float64(totalB) * 100.0 // ≈89.9%
+	ds := ClassifyDiskStatusFullForTest(usedPct, freeB,
+		DefaultDiskWarnPercent, DefaultDiskCritPercent,
+		DefaultDiskWarnFreeBytes, DefaultDiskCritFreeBytes, "")
+	if ds.Status != "ok" {
+		t.Fatalf("23 GiB free on 228 GiB (%.1f%% used) = %q; want ok", usedPct, ds.Status)
+	}
+}
+
+// TestThresholdMatrix_500MBFree_Critical asserts that absolute-free-space
+// triggers critical even when percent-used is below the warn threshold.
+func TestThresholdMatrix_500MBFree_Critical(t *testing.T) {
+	// 500 MiB free on 228 GiB ≈ 0.21% used — well below any pct threshold,
+	// but below the 512 MiB crit-free floor.
+	freeB := int64(500) * 1024 * 1024
+	usedPct := 0.21
+	ds := ClassifyDiskStatusFullForTest(usedPct, freeB,
+		DefaultDiskWarnPercent, DefaultDiskCritPercent,
+		DefaultDiskWarnFreeBytes, DefaultDiskCritFreeBytes, "")
+	if ds.Status != "critical" {
+		t.Fatalf("500 MiB free (%.2f%% used) = %q; want critical", usedPct, ds.Status)
+	}
+}
+
+// TestThresholdMatrix_95PctUsed_12GBFree_OK asserts that 95% used with
+// 12 GiB free (above the 1 GiB warn floor) returns "ok".
+func TestThresholdMatrix_95PctUsed_12GBFree_OK(t *testing.T) {
+	freeB := int64(12) * 1024 * 1024 * 1024
+	usedPct := 95.0
+	ds := ClassifyDiskStatusFullForTest(usedPct, freeB,
+		DefaultDiskWarnPercent, DefaultDiskCritPercent,
+		DefaultDiskWarnFreeBytes, DefaultDiskCritFreeBytes, "")
+	if ds.Status != "ok" {
+		t.Fatalf("95%% used, 12 GiB free = %q; want ok", ds.Status)
+	}
+}
+
+// TestThresholdMatrix_97PctUsed_7GBFree_Warn asserts that 97% used (above
+// the 96% warn threshold) with 7 GiB free returns "degraded".
+func TestThresholdMatrix_97PctUsed_7GBFree_Warn(t *testing.T) {
+	freeB := int64(7) * 1024 * 1024 * 1024
+	usedPct := 97.0
+	ds := ClassifyDiskStatusFullForTest(usedPct, freeB,
+		DefaultDiskWarnPercent, DefaultDiskCritPercent,
+		DefaultDiskWarnFreeBytes, DefaultDiskCritFreeBytes, "")
+	if ds.Status != "degraded" {
+		t.Fatalf("97%% used, 7 GiB free = %q; want degraded", ds.Status)
+	}
+}
+
+// TestThresholdMatrix_98PctUsed_Critical asserts that 98% used (at the
+// default crit threshold) returns "critical".
+func TestThresholdMatrix_98PctUsed_Critical(t *testing.T) {
+	freeB := int64(5) * 1024 * 1024 * 1024
+	usedPct := 98.0
+	ds := ClassifyDiskStatusFullForTest(usedPct, freeB,
+		DefaultDiskWarnPercent, DefaultDiskCritPercent,
+		DefaultDiskWarnFreeBytes, DefaultDiskCritFreeBytes, "")
+	if ds.Status != "critical" {
+		t.Fatalf("98%% used = %q; want critical", ds.Status)
+	}
+}
+
+// TestThresholdMatrix_IgnoreDiskPressure asserts that the
+// --ignore-disk-pressure flag causes EvaluateAndReact to return "ignored"
+// regardless of disk state.
+func TestThresholdMatrix_IgnoreDiskPressure(t *testing.T) {
+	tmp := t.TempDir()
+	// Construct via NewDiskPressureStateFull with ignoreDiskPressure=true.
+	st := NewDiskPressureStateFull(DiskPressureModePauseRequests, tmp, 0, 0, 0, 0, 0, true)
+	// Drive ticks at various pressures — all must remain "ignored".
+	for _, pct := range []float64{0.0, 89.9, 96.0, 98.5, 99.5} {
+		st.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatDP(pct), time.Now())
+		if got := st.Status(); got != "ignored" {
+			t.Fatalf("Status at %.1f%% with ignore=true = %q; want ignored", pct, got)
+		}
+		if st.RefuseRequests() {
+			t.Fatalf("RefuseRequests at %.1f%% with ignore=true; want false", pct)
+		}
+	}
+	snap := st.Snapshot()
+	if !snap.IgnoreDiskPressure {
+		t.Fatal("snapshot.ignore_disk_pressure = false; want true")
 	}
 }

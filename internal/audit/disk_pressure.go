@@ -85,7 +85,7 @@ const DiskPressureCheckInterval = 60 * time.Second
 // DefaultDiskEmergencyPercent is the emergency tier ABOVE crit. ALL
 // modes treat emergency the same way: log + emit + signal in
 // /healthz; no mode is permitted to "ignore" emergency.
-const DefaultDiskEmergencyPercent = 98
+const DefaultDiskEmergencyPercent = 99
 
 // PauseRequestsRefusalReasonTemplate is the operator-friendly body
 // the proxy returns in pause-requests mode at critical / emergency.
@@ -133,46 +133,64 @@ type DiskPressureEmitFunc func(ctx context.Context, evt Event) error
 type DiskPressureState struct {
 	mu sync.RWMutex
 
-	mode             string
-	currentStatus    string
-	lastObserved     *DiskStatus
-	lastCheckUnix    int64
-	warnPct          int
-	critPct          int
-	emergencyPct     int
-	logDir           string
-	refuseRequests   bool
-	transitionsCount int64
-	lastActionTaken  string
-	archiveCount     int
-	archiveSizeBytes int64
+	mode               string
+	currentStatus      string
+	lastObserved       *DiskStatus
+	lastCheckUnix      int64
+	warnPct            int
+	critPct            int
+	emergencyPct       int
+	warnFreeBytes      int64
+	critFreeBytes      int64
+	logDir             string
+	refuseRequests     bool
+	transitionsCount   int64
+	lastActionTaken    string
+	archiveCount       int
+	archiveSizeBytes   int64
+	ignoreDiskPressure bool
 }
 
 // DiskPressureSnapshot is a point-in-time copy of state for /healthz
 // JSON encoding.
 type DiskPressureSnapshot struct {
-	Mode             string      `json:"disk_pressure_mode"`
-	Status           string      `json:"status"`
-	DiskFreePct      *float64    `json:"disk_free_pct"`
-	UsedPct          *float64    `json:"used_pct"`
-	WarnPct          int         `json:"warn_pct"`
-	CritPct          int         `json:"crit_pct"`
-	EmergencyPct     int         `json:"emergency_pct"`
-	Path             string      `json:"path"`
-	RefuseRequests   bool        `json:"refuse_requests"`
-	ArchiveCount     int         `json:"current_archive_count"`
-	ArchiveSizeBytes int64       `json:"current_archive_size_bytes"`
-	TransitionsCount int64       `json:"transitions_count"`
-	LastCheckUnix    *int64      `json:"last_check_unix"`
-	LastActionTaken  string      `json:"last_action_taken,omitempty"`
-	Reason           string      `json:"reason,omitempty"`
-	LastRotationAt   string      `json:"last_rotation_at,omitempty"`
-	LastObservedRaw  *DiskStatus `json:"-"`
+	Mode               string      `json:"disk_pressure_mode"`
+	Status             string      `json:"status"`
+	DiskFreePct        *float64    `json:"disk_free_pct"`
+	DiskFreeBytes      *int64      `json:"disk_free_bytes"`
+	UsedPct            *float64    `json:"used_pct"`
+	WarnPct            int         `json:"warn_pct"`
+	CritPct            int         `json:"crit_pct"`
+	EmergencyPct       int         `json:"emergency_pct"`
+	WarnThresholdBytes int64       `json:"warn_threshold_bytes"`
+	CritThresholdBytes int64       `json:"crit_threshold_bytes"`
+	Path               string      `json:"path"`
+	RefuseRequests     bool        `json:"refuse_requests"`
+	ArchiveCount       int         `json:"current_archive_count"`
+	ArchiveSizeBytes   int64       `json:"current_archive_size_bytes"`
+	TransitionsCount   int64       `json:"transitions_count"`
+	LastCheckUnix      *int64      `json:"last_check_unix"`
+	LastActionTaken    string      `json:"last_action_taken,omitempty"`
+	Reason             string      `json:"reason,omitempty"`
+	LastRotationAt     string      `json:"last_rotation_at,omitempty"`
+	LastObservedRaw    *DiskStatus `json:"-"`
+	IgnoreDiskPressure bool        `json:"ignore_disk_pressure,omitempty"`
 }
 
 // NewDiskPressureState constructs a state container with the
 // operator-declared mode + thresholds.
 func NewDiskPressureState(mode, logDir string, warnPct, critPct, emergencyPct int) *DiskPressureState {
+	return NewDiskPressureStateFull(mode, logDir, warnPct, critPct, emergencyPct, 0, 0, false)
+}
+
+// NewDiskPressureStateFull is the extended constructor with absolute-free-space
+// floors and ignore flag.
+func NewDiskPressureStateFull(
+	mode, logDir string,
+	warnPct, critPct, emergencyPct int,
+	warnFreeBytes, critFreeBytes int64,
+	ignoreDiskPressure bool,
+) *DiskPressureState {
 	if warnPct <= 0 {
 		warnPct = DefaultDiskWarnPercent
 	}
@@ -185,13 +203,22 @@ func NewDiskPressureState(mode, logDir string, warnPct, critPct, emergencyPct in
 	if mode == "" {
 		mode = DefaultDiskPressureMode
 	}
+	if warnFreeBytes <= 0 {
+		warnFreeBytes = DefaultDiskWarnFreeBytes
+	}
+	if critFreeBytes <= 0 {
+		critFreeBytes = DefaultDiskCritFreeBytes
+	}
 	return &DiskPressureState{
-		mode:          mode,
-		currentStatus: "ok",
-		warnPct:       warnPct,
-		critPct:       critPct,
-		emergencyPct:  emergencyPct,
-		logDir:        logDir,
+		mode:               mode,
+		currentStatus:      "ok",
+		warnPct:            warnPct,
+		critPct:            critPct,
+		emergencyPct:       emergencyPct,
+		warnFreeBytes:      warnFreeBytes,
+		critFreeBytes:      critFreeBytes,
+		logDir:             logDir,
+		ignoreDiskPressure: ignoreDiskPressure,
 	}
 }
 
@@ -238,17 +265,20 @@ func (s *DiskPressureState) Snapshot() DiskPressureSnapshot {
 
 func (s *DiskPressureState) snapshotLocked() DiskPressureSnapshot {
 	snap := DiskPressureSnapshot{
-		Mode:             s.mode,
-		Status:           s.currentStatus,
-		WarnPct:          s.warnPct,
-		CritPct:          s.critPct,
-		EmergencyPct:     s.emergencyPct,
-		Path:             s.logDir,
-		RefuseRequests:   s.refuseRequests,
-		ArchiveCount:     s.archiveCount,
-		ArchiveSizeBytes: s.archiveSizeBytes,
-		TransitionsCount: s.transitionsCount,
-		LastActionTaken:  s.lastActionTaken,
+		Mode:               s.mode,
+		Status:             s.currentStatus,
+		WarnPct:            s.warnPct,
+		CritPct:            s.critPct,
+		EmergencyPct:       s.emergencyPct,
+		WarnThresholdBytes: s.warnFreeBytes,
+		CritThresholdBytes: s.critFreeBytes,
+		Path:               s.logDir,
+		RefuseRequests:     s.refuseRequests,
+		ArchiveCount:       s.archiveCount,
+		ArchiveSizeBytes:   s.archiveSizeBytes,
+		TransitionsCount:   s.transitionsCount,
+		LastActionTaken:    s.lastActionTaken,
+		IgnoreDiskPressure: s.ignoreDiskPressure,
 	}
 	if s.lastObserved != nil {
 		freePct := 100.0 - s.lastObserved.UsedPct
@@ -260,6 +290,8 @@ func (s *DiskPressureState) snapshotLocked() DiskPressureSnapshot {
 			snap.Path = s.lastObserved.Path
 		}
 		snap.LastObservedRaw = s.lastObserved
+		fb := s.lastObserved.FreeBytes
+		snap.DiskFreeBytes = &fb
 	}
 	if s.lastCheckUnix != 0 {
 		t := s.lastCheckUnix
@@ -289,13 +321,20 @@ func (s *DiskPressureState) EvaluateAndReact(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastCheckUnix = now.Unix()
+	if s.ignoreDiskPressure {
+		s.currentStatus = "ignored"
+		s.refuseRequests = false
+		return s.snapshotLocked()
+	}
 	if s.logDir == "" {
 		s.currentStatus = "ok"
 		s.refuseRequests = false
 		return s.snapshotLocked()
 	}
 	if diskStatFn == nil {
-		diskStatFn = GetDiskStatus
+		diskStatFn = func(path string, warnPct, critPct int) (DiskStatus, error) {
+			return GetDiskStatusFull(path, warnPct, critPct, s.warnFreeBytes, s.critFreeBytes)
+		}
 	}
 	snap, _ := diskStatFn(s.logDir, s.warnPct, s.critPct)
 	s.lastObserved = &snap

@@ -533,11 +533,14 @@ func newRunCmd() *cobra.Command {
 		auditDBRetentionDays int
 		// #461 / §A63c — disk-pressure circuit breaker flags.
 		// dbounce defaults to pause-requests (compliance-heavy).
-		diskPressureMode     string
-		diskPressureWarnPct  int
-		diskPressureCritPct  int
-		diskPressureEmergPct int
-		stopOnDiskCritical   bool
+		diskPressureMode          string
+		diskPressureWarnPct       int
+		diskPressureCritPct       int
+		diskPressureEmergPct      int
+		stopOnDiskCritical        bool
+		ignoreDiskPressure        bool
+		diskPressureWarnFreeBytes int64
+		diskPressureCritFreeBytes int64
 		// auditWebhookURL + Token enable the Enterprise webhook
 		// transport. License-gated (placeholder until #235 lands the
 		// real license-file plumbing). batchSize defaults to 1 (one
@@ -987,12 +990,18 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			if dpErr != nil {
 				return fmt.Errorf("dbounce: --disk-pressure-mode: %w", dpErr)
 			}
-			diskPressureState := audit.NewDiskPressureState(
+			if ignoreDiskPressure {
+				fmt.Fprintf(os.Stderr, "⚠ Disk-pressure check DISABLED via --ignore-disk-pressure. Audit writes may fail if disk fills.\n")
+			}
+			diskPressureState := audit.NewDiskPressureStateFull(
 				normalizedDPMode,
 				audit.ResolveLogDir(auditLogPath),
 				diskPressureWarnPct,
 				diskPressureCritPct,
 				diskPressureEmergPct,
+				diskPressureWarnFreeBytes,
+				diskPressureCritFreeBytes,
+				ignoreDiskPressure,
 			)
 
 			cfg := proxy.Config{
@@ -1583,13 +1592,19 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"choice).")
 	cmd.Flags().IntVar(&diskPressureWarnPct, "disk-pressure-warn-pct", audit.DefaultDiskWarnPercent,
 		"#461 — disk-usage percent at which the audit_log status flips to "+
-			"degraded (informational; no behavior change). Default 85.")
+			"degraded (informational; no behavior change). Default 96. "+
+			"Used together with --disk-pressure-warn-free-bytes; either trigger is sufficient.")
 	cmd.Flags().IntVar(&diskPressureCritPct, "disk-pressure-crit-pct", audit.DefaultDiskCritPercent,
-		"#461 — disk-usage percent at which the operator-declared mode reacts. "+
-			"Default 95.")
+		"#461 — disk-usage percent at which the operator-declared mode reacts. Default 98.")
 	cmd.Flags().IntVar(&diskPressureEmergPct, "disk-pressure-emergency-pct", audit.DefaultDiskEmergencyPercent,
-		"#461 — disk-usage percent at which the bouncer surfaces an emergency "+
-			"status. Default 98.")
+		"#461 — disk-usage percent at which the bouncer surfaces an emergency status. Default 99.")
+	cmd.Flags().Int64Var(&diskPressureWarnFreeBytes, "disk-pressure-warn-free-bytes", audit.DefaultDiskWarnFreeBytes,
+		"#461 — absolute free-space floor (bytes) below which audit_log flips to degraded. Default 1073741824 (1 GiB).")
+	cmd.Flags().Int64Var(&diskPressureCritFreeBytes, "disk-pressure-crit-free-bytes", audit.DefaultDiskCritFreeBytes,
+		"#461 — absolute free-space floor (bytes) below which the mode reacts. Default 524288000 (512 MiB).")
+	cmd.Flags().BoolVar(&ignoreDiskPressure, "ignore-disk-pressure", false,
+		"#461 — disable the disk-pressure check entirely. /healthz shows 'ignored'. "+
+			"Emits a loud warning at startup.")
 	cmd.Flags().StringVar(&auditWebhookURL, "audit-webhook-url", "",
 		"HTTPS webhook URL to POST audit-export events to. v1.0 free + "+
 			"open-source release per project_oss_only_launch_decision.md "+
