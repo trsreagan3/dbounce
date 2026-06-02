@@ -90,6 +90,13 @@ type HeartbeatOptions struct {
 	// transport. Separately injectable for tests that want to assert
 	// the gap alert in isolation.
 	gapEmit func(ctx context.Context, evt Event) error
+
+	// gapNotify, when non-nil, receives a struct{} after every gap fires
+	// (after stderr + gapEmit have both returned). Tests set this to
+	// await the gap deterministically instead of sleeping a fixed interval
+	// and racing against the watchdog goroutine.
+	// Production callers leave it nil; it is never allocated in the hot path.
+	gapNotify chan struct{}
 }
 
 // Heartbeater emits OCSF HEARTBEAT events on a fixed cadence + fires a
@@ -145,6 +152,10 @@ type Heartbeater struct {
 	// running guards double-Start. Atomic CAS so a misuse doesn't
 	// spawn duplicate goroutines.
 	running atomic.Bool
+
+	// gapNotify mirrors opts.gapNotify; cached here so checkGap can
+	// signal tests without acquiring emitMu.
+	gapNotify chan struct{}
 }
 
 // NewHeartbeater constructs a Heartbeater. Always safe to call — even
@@ -163,10 +174,11 @@ func NewHeartbeater(opts HeartbeatOptions) *Heartbeater {
 		opts.GapThreshold = (opts.Interval * 5) / 2
 	}
 	return &Heartbeater{
-		opts:    opts,
-		emit:    opts.emit,
-		gapEmit: opts.gapEmit,
-		stop:    make(chan struct{}),
+		opts:      opts,
+		emit:      opts.emit,
+		gapEmit:   opts.gapEmit,
+		gapNotify: opts.gapNotify,
+		stop:      make(chan struct{}),
 	}
 }
 
@@ -383,11 +395,22 @@ func (h *Heartbeater) checkGap() {
 	h.emitMu.RLock()
 	gapEmit := h.gapEmit
 	h.emitMu.RUnlock()
-	if gapEmit == nil {
-		return
+	if gapEmit != nil {
+		evt := NewHeartbeatGapEvent(h.opts.Host, h.opts.Interval, h.opts.GapThreshold, gapDur)
+		_ = gapEmit(context.Background(), evt)
 	}
-	evt := NewHeartbeatGapEvent(h.opts.Host, h.opts.Interval, h.opts.GapThreshold, gapDur)
-	_ = gapEmit(context.Background(), evt)
+
+	// (3) Signal test observers. gapNotify is set only in tests (via
+	// HeartbeatOptions.gapNotify); production callers leave it nil so
+	// this branch is never taken in production. The send is non-blocking
+	// (select + default) so a test that isn't listening doesn't stall
+	// the watchdog goroutine.
+	if h.gapNotify != nil {
+		select {
+		case h.gapNotify <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // HeartbeatStats is the snapshot the dbounce_audit_export_status MCP
