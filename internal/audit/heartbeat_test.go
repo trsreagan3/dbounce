@@ -164,11 +164,19 @@ func TestHeartbeater_PeriodicEmit(t *testing.T) {
 // TestHeartbeater_GapFiresOnStallEmission triggers a synthetic gap by
 // freezing the lastTick timestamp + waiting for the watchdog to notice.
 // Per the spec: gap alert fires on stderr + as a SECURITY_ALERT event.
+//
+// Determinism: we pass a gapNotify channel via HeartbeatOptions. The
+// watchdog goroutine sends on it after ALL gap side-effects complete
+// (stderr write + gapEmit). The test awaits that signal instead of
+// sleeping a fixed interval and racing, eliminating the wall-clock flake
+// that reddened CI on unrelated PRs (issue #10).
 func TestHeartbeater_GapFiresOnStall(t *testing.T) {
+	gapCh := make(chan struct{}, 1) // buffered so the watchdog never blocks
 	hb, snapshot, stderr := newCaptureHB(HeartbeatOptions{
 		Interval:     200 * time.Millisecond,
 		GapThreshold: 100 * time.Millisecond,
 		Host:         "127.0.0.1:5433",
+		gapNotify:    gapCh,
 	})
 	hb.Start()
 	defer hb.Stop()
@@ -189,15 +197,15 @@ func TestHeartbeater_GapFiresOnStall(t *testing.T) {
 	staleAt := time.Now().Add(-1 * time.Second).UnixNano()
 	hb.lastTickUnixNano.Store(staleAt)
 
-	// Watchdog runs on min(Interval/4, 1s, 100ms) = 50ms here, so
-	// within a few hundred ms it MUST notice.
-	deadline = time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
-		if hb.IsDegraded() {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Block until the watchdog has fully fired (stderr written + gapEmit
+	// called), then assert. The 2s timeout is generous even on slow CI.
+	select {
+	case <-gapCh:
+		// gap fired; all side-effects are now complete
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not fire heartbeat_gap within 2s")
 	}
+
 	require.True(t, hb.IsDegraded(),
 		"watchdog MUST detect the synthetic stall + flip degraded")
 
