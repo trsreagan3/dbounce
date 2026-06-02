@@ -455,13 +455,14 @@ func (p *Profile) UnmarshalYAML(node *yaml.Node) error {
 	// First, decode into a type-alias of Profile so the standard
 	// yaml.v3 reflection-based decoder runs without recursing into
 	// our custom UnmarshalYAML. The Go pattern: alias the type so it
-	// loses the method set, decode, copy back.
+	// loses the method set, then decode directly into *p. Decoding into
+	// the pointer — rather than into a temp and copying it back — avoids
+	// copying the embedded compileOnce sync.Once, which go vet's
+	// copylocks check (correctly) rejects.
 	type rawProfile Profile
-	var canonical rawProfile
-	if err := node.Decode(&canonical); err != nil {
+	if err := node.Decode((*rawProfile)(p)); err != nil {
 		return err
 	}
-	*p = Profile(canonical)
 
 	// Then decode the same node into the generator shim. yaml.v3
 	// silently ignores fields the target struct doesn't declare, so

@@ -1,0 +1,45 @@
+name: validate
+
+# Runs go vet + go test on every push + PR. The same checks every
+# release pipeline depends on. Mirrors gbounce's validate.yml so the
+# whole Bounce suite has test-CI parity (see iam-jit memory
+# project_bouncer_ui_test_gap_2026_06_02: kbouncer + dbounce previously
+# had no test CI, which let a broken UI filter ship unguarded).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vet-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      # NOTE: -race is intentionally deferred. Enabling it surfaced a
+      # pre-existing CI-only flake (TestExportHealth_DegradedAlert_Fires…
+      # debouncer counter reads 0 instead of 1 under race instrumentation
+      # — see follow-up issue) that passes locally. Ship deterministic CI
+      # now; re-enable -race once that test is hardened, to reach full
+      # parity with gbounce's validate.yml.
+      - name: go test
+        run: go test ./... -count=1
