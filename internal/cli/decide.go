@@ -42,6 +42,37 @@ import (
 	"github.com/trsreagan3/dbounce/internal/store"
 )
 
+// decideSyncPromptStoredStatement redacts the SQL for the at-rest
+// sync-prompt decision row on the `dbounce decide` path.
+//
+// Why always-redact (not flag-gated like `dbounce run --redact-literals`):
+//
+//   - `decide` is a PRE-CHECK path, not execution. The raw SQL need not
+//     be stored verbatim — the audit reviewer needs the SQL SHAPE (type,
+//     tables, functions, flags), which the other row columns supply.
+//   - The sync-prompt row's purpose is to anchor the pending_prompts FK;
+//     it is not a replay artefact.
+//   - MED-D8-09 closed the `run` path's at-rest leak. Storing raw SQL
+//     on the `decide` path creates an inconsistency: the same statement
+//     evaluated through `decide --sync-prompt-on-deny` leaks literals
+//     that the equivalent `run` call would have redacted.
+//   - A `decide` invocation that pre-checks a secret-bearing statement
+//     (e.g. an INSERT with PII values) must NOT leave those secrets
+//     visible via `strings state.db` — consistent with the documented
+//     MED-D8-09 PII/credential goal.
+//
+// Coverage limits are the documented ones in parser.RedactLiterals:
+// single-quoted string literals are scrubbed; numeric/comment/
+// double-quoted-identifier forms are known gaps per
+// [[dbounce-sql-redaction-gaps]].
+//
+// Returns the stored statement + whether redaction changed it.
+func decideSyncPromptStoredStatement(sql string) (stored string, redacted bool) {
+	stored = parser.RedactLiterals(sql)
+	redacted = stored != sql
+	return stored, redacted
+}
+
 // decideResult is the shape `dbounce decide` writes to stdout. Mirrors
 // the dbounce_decide MCP tool's JSON shape so shim code can reuse the
 // same parsing across the CLI + JSON-RPC paths.
@@ -227,16 +258,25 @@ Exit code:
 				// valid. The decide path normally writes NOTHING; we
 				// make the explicit exception here because the sync
 				// prompt requires an FK-anchored pending_prompts row.
+				//
+				// PII-consistency: always redact the at-rest statement
+				// so this row is consistent with the `run` path's
+				// MED-D8-09 redaction. The decide path is a pre-check;
+				// the stored row anchors the FK — it is NOT a replay
+				// artefact. See decideSyncPromptStoredStatement for
+				// the full rationale.
+				storedStmt, stmtWasRedacted := decideSyncPromptStoredStatement(sql)
 				decisionID, recErr := st.RecordDecision(store.DecisionRow{
-					Dialect:         res.Dialect,
-					Statement:       sql,
-					StatementType:   res.StatementType,
-					TablesTouched:   res.Tables,
-					FunctionsCalled: res.Functions,
-					IsDML:           res.IsDML,
-					IsDDL:           res.IsDDL,
-					HasMutatingNode: res.HasMutatingNode,
-					DecisionVerdict: "DENY",
+					Dialect:           res.Dialect,
+					Statement:         storedStmt,
+					StatementRedacted: stmtWasRedacted,
+					StatementType:     res.StatementType,
+					TablesTouched:     res.Tables,
+					FunctionsCalled:   res.Functions,
+					IsDML:             res.IsDML,
+					IsDDL:             res.IsDDL,
+					HasMutatingNode:   res.HasMutatingNode,
+					DecisionVerdict:   "DENY",
 					DecisionReason: fmt.Sprintf(
 						"decide-path sync-prompt block (reason: %s)",
 						res.Reason),
