@@ -83,11 +83,10 @@ var licensedForAuditWebhook = func() error {
 }
 
 // loopbackHosts mirrors kbounce + ibounce's CRIT-32-02 closure:
-// dbounce will hold inbound client SCRAM challenges + bearer tokens
-// once D-Slice 2 lands; binding externally exposes that surface to
-// anyone on the network. Refuse non-loopback bindings unless the
-// operator passed --i-know-this-binds-externally to acknowledge they
-// read the threat model.
+// dbounce holds inbound client SCRAM challenges + bearer tokens while
+// forwarding; binding externally exposes that surface to anyone on the
+// network. Refuse non-loopback bindings unless the operator passed
+// --i-know-this-binds-externally to acknowledge they read the threat model.
 var loopbackHosts = map[string]struct{}{
 	"127.0.0.1":     {},
 	"::1":           {},
@@ -1456,8 +1455,8 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false,
 		"Required acknowledgement when --host is anything other than 127.0.0.1 "+
 			"/ ::1 / localhost. Binding externally exposes dbounce's "+
-			"credential-handling surface (once D-Slice 2 lands SCRAM "+
-			"pass-through). Don't pass without a specific reason.")
+			"credential-handling surface (SCRAM pass-through). "+
+			"Don't pass without a specific reason.")
 	cmd.Flags().BoolVar(&forceExternalMgmtBind, "i-know-mgmt-binds-externally", false,
 		"Required acknowledgement when --mgmt-host is anything other than "+
 			"127.0.0.1 / ::1 / localhost. /healthz exposes operator-configured "+

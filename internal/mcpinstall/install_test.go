@@ -119,8 +119,11 @@ func TestInstallDevin_PrintsCloudRecipe(t *testing.T) {
 	// install-devin is a cloud-agent recipe: no local config file is
 	// written, and the recipe MUST steer the operator to a HOST address
 	// (NOT 127.0.0.1) because Devin's sandbox can't see local loopback.
+	// PATH A = MCP server (matching ibounce/gbounce/kbounce ordering).
+	// PATH B = SQL connect mode (dbounce-specific).
 	out := &bytes.Buffer{}
-	res, err := InstallDevin(Options{Out: out})
+	errOut := &bytes.Buffer{}
+	res, err := InstallDevin(Options{Out: out, Stderr: errOut})
 	require.NoError(t, err)
 
 	assert.True(t, res.Manual, "Devin install is a manual recipe, not a file write")
@@ -136,13 +139,64 @@ func TestInstallDevin_PrintsCloudRecipe(t *testing.T) {
 	assert.Contains(t, body, ":5433")
 	// Routable bind requires the external-bind acknowledgement flag.
 	assert.Contains(t, body, "--i-know-this-binds-externally")
-	// PATH B points at the canonical show-config snippet.
+	// PATH A = MCP show-config first (cross-product ordering parity).
+	assert.Contains(t, body, "PATH A")
 	assert.Contains(t, body, "dbounce mcp show-config")
+	// PATH B = SQL connect mode.
+	assert.Contains(t, body, "PATH B")
+	pathAIdx := strings.Index(body, "PATH A")
+	pathBIdx := strings.Index(body, "PATH B")
+	assert.True(t, pathAIdx < pathBIdx, "PATH A (MCP) must appear before PATH B (SQL) — cross-product ordering parity")
+
+	// Substitute note goes to stderr when no host supplied.
+	assert.Contains(t, errOut.String(), "--devin-host",
+		"stderr must hint at --devin-host when placeholder is used")
 
 	// Same load-bearing pieces live on the returned snippet so callers
 	// (and the cli) can surface them without re-running the writer.
 	assert.Contains(t, res.Snippet, "<bouncer-host>")
 	assert.Contains(t, res.Snippet, ":5433")
+}
+
+// TestInstallDevin_HonorsDevinHost — --devin-host bakes a concrete
+// reachable address into the printed DATABASE_URL + suppresses the
+// substitute note. Mirrors gbounce's TestInstallDevin_HonorsDevinHost.
+func TestInstallDevin_HonorsDevinHost(t *testing.T) {
+	out := &bytes.Buffer{}
+	errOut := &bytes.Buffer{}
+	res, err := InstallDevin(Options{DevinHost: "10.0.1.42", Out: out, Stderr: errOut})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	body := out.String()
+	assert.Contains(t, body, "10.0.1.42:5433",
+		"concrete host must appear in DATABASE_URL line")
+	assert.NotContains(t, body, "<bouncer-host>",
+		"placeholder must not appear when a concrete host is given")
+	assert.NotContains(t, errOut.String(), "--devin-host",
+		"no substitute note when a concrete host is given")
+}
+
+// TestAgentNameForClient_DevinCase locks the "devin" → "devin" mapping
+// added for cross-product parity with kbounce. Mirrors
+// kbounce's TestAgentNameForClient_KnownClients.
+func TestAgentNameForClient_DevinCase(t *testing.T) {
+	cases := []struct {
+		client string
+		want   string
+	}{
+		{"claude-code", "claude-code"},
+		{"cursor", "cursor"},
+		{"codex", "openai-codex"},
+		{"devin", "devin"},
+		{"unknown-client", DefaultAgentName},
+		{"", DefaultAgentName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.client, func(t *testing.T) {
+			assert.Equal(t, tc.want, agentNameForClient(tc.client))
+		})
+	}
 }
 
 func TestShowConfig_JSON(t *testing.T) {
