@@ -1,0 +1,138 @@
+name: release
+
+# Builds pre-compiled binaries + .deb + .rpm packages and attaches them to
+# the GitHub Release when a v* tag is pushed.
+#
+# Formats produced (per [[automatic-bootstrap-must-just-work-everywhere]]):
+#   - .tar.gz / .zip  → linux/darwin/windows, amd64/arm64
+#   - .deb            → linux amd64 + arm64  (dpkg install)
+#   - .rpm            → linux x86_64 + aarch64  (rpm install)
+#
+# NOTE: artifacts are attached to GitHub Releases; they are NOT published
+# to a public APT/RPM repo (that is follow-up post-v1.0 work).
+# Per [[vendor-integration-claim-qualifier]]: "built + smoke-tested in CI;
+# NOT published to public deb/rpm registry."
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write   # needed to create + upload to GitHub Release
+  packages: read
+
+jobs:
+  goreleaser:
+    name: goreleaser — build deb/rpm/tar/zip + upload to release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # TAP_GITHUB_TOKEN: PAT with `contents: write` on homebrew-tap.
+          # Store as repo secret TAP_GITHUB_TOKEN. Required for goreleaser
+          # to open a bump-dbounce-vX.Y.Z PR in trsreagan3/homebrew-tap.
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+  smoke-test-deb:
+    name: smoke-test .deb on ubuntu:22.04
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download .deb artifact (amd64)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag,
+            });
+            const asset = release.data.assets.find(a => a.name.includes('linux_amd64') && a.name.endsWith('.deb'));
+            if (!asset) throw new Error('amd64 .deb not found in release assets');
+            const fs = require('fs');
+            const response = await github.rest.repos.getReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              asset_id: asset.id,
+              headers: { Accept: 'application/octet-stream' },
+            });
+            fs.writeFileSync('dbounce.deb', Buffer.from(response.data));
+            console.log('Downloaded:', asset.name);
+
+      - name: Install + verify in ubuntu:22.04 container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/dbounce.deb:/tmp/dbounce.deb" \
+            ubuntu:22.04 \
+            bash -c "
+              set -e
+              apt-get update -qq
+              dpkg -i /tmp/dbounce.deb
+              dbounce --version
+              dbounce --help | grep -i dbounce
+              echo 'deb smoke-test PASSED'
+            "
+
+  smoke-test-rpm:
+    name: smoke-test .rpm on fedora:40
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download .rpm artifact (x86_64)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag,
+            });
+            const asset = release.data.assets.find(a => a.name.includes('linux_amd64') && a.name.endsWith('.rpm'));
+            if (!asset) throw new Error('amd64 .rpm not found in release assets');
+            const fs = require('fs');
+            const response = await github.rest.repos.getReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              asset_id: asset.id,
+              headers: { Accept: 'application/octet-stream' },
+            });
+            fs.writeFileSync('dbounce.rpm', Buffer.from(response.data));
+            console.log('Downloaded:', asset.name);
+
+      - name: Install + verify in fedora:40 container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/dbounce.rpm:/tmp/dbounce.rpm" \
+            fedora:40 \
+            bash -c "
+              set -e
+              rpm -i /tmp/dbounce.rpm
+              dbounce --version
+              dbounce --help | grep -i dbounce
+              echo 'rpm smoke-test PASSED'
+            "
