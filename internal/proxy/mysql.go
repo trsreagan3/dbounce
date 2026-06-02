@@ -67,17 +67,17 @@ const (
 	mysqlPacketHeaderLen = 4
 
 	// Command bytes (see MySQL docs §"Command Phase").
-	mysqlComSleep           byte = 0x00
-	mysqlComQuit            byte = 0x01
-	mysqlComInitDB          byte = 0x02
-	mysqlComQuery           byte = 0x03
-	mysqlComFieldList       byte = 0x04
-	mysqlComPing            byte = 0x0e
-	mysqlComStmtPrepare     byte = 0x16
-	mysqlComStmtExecute     byte = 0x17
-	mysqlComStmtClose       byte = 0x19
-	mysqlComStmtReset       byte = 0x1a
-	mysqlComSetOption       byte = 0x1b
+	mysqlComSleep       byte = 0x00
+	mysqlComQuit        byte = 0x01
+	mysqlComInitDB      byte = 0x02
+	mysqlComQuery       byte = 0x03
+	mysqlComFieldList   byte = 0x04
+	mysqlComPing        byte = 0x0e
+	mysqlComStmtPrepare byte = 0x16
+	mysqlComStmtExecute byte = 0x17
+	mysqlComStmtClose   byte = 0x19
+	mysqlComStmtReset   byte = 0x1a
+	mysqlComSetOption   byte = 0x1b
 
 	// Response-packet leading bytes.
 	mysqlOKPacketByte  byte = 0x00
@@ -197,11 +197,11 @@ func mysqlObservationHandshake(conn net.Conn) ([]byte, error) {
 	// capability_flags_lower (2 bytes): CLIENT_PROTOCOL_41 (0x0200)
 	// CLIENT_SECURE_CONNECTION (0x8000) + CLIENT_PLUGIN_AUTH (0x80000)
 	// in upper. Use the basic set the client expects.
-	pkt = append(pkt, 0x0d, 0xa2) // 0xa20d — long flag + connect with db + protocol 41 + transactions + secure conn
-	pkt = append(pkt, 0x21)       // utf8 charset
-	pkt = append(pkt, 0x02, 0x00) // status flags
-	pkt = append(pkt, 0x00, 0x80) // capability_flags_upper: plugin auth (0x0008 << 16)
-	pkt = append(pkt, 21)         // auth_plugin_data_len
+	pkt = append(pkt, 0x0d, 0xa2)          // 0xa20d — long flag + connect with db + protocol 41 + transactions + secure conn
+	pkt = append(pkt, 0x21)                // utf8 charset
+	pkt = append(pkt, 0x02, 0x00)          // status flags
+	pkt = append(pkt, 0x00, 0x80)          // capability_flags_upper: plugin auth (0x0008 << 16)
+	pkt = append(pkt, 21)                  // auth_plugin_data_len
 	pkt = append(pkt, make([]byte, 10)...) // reserved (10 bytes of 0x00)
 	// auth_plugin_data_part_2 (12 bytes + 1 NUL = 13)
 	pkt = append(pkt, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '1', '2', 0x00)
@@ -670,28 +670,41 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 	ps := parser.Parse(string(f.srv.cfg.Dialect), sql)
 	dec := f.srv.decide(ps)
 
+	// MED-D8-09 closure on the MySQL FORWARDING path (mirrors forward.go's
+	// PG path). Redact ONCE here using the canonical parser.RedactLiterals
+	// so --redact-literals is not a NO-OP under a real --upstream. The
+	// redaction touches ONLY the persisted audit Statement; the bytes
+	// forwarded upstream are `payload` (the original COM_QUERY), untouched.
+	storedStatement := sql
+	statementRedacted := false
+	if f.srv.cfg.RedactLiterals {
+		storedStatement = parser.RedactLiterals(sql)
+		statementRedacted = storedStatement != sql
+	}
+
 	row := store.DecisionRow{
-		At:               time.Now().UTC(),
-		Dialect:          ps.Dialect,
-		Statement:        sql,
-		StatementType:    ps.StatementType,
-		TablesTouched:    ps.TablesTouched,
-		FunctionsCalled:  ps.FunctionsCalled,
-		IsDML:            ps.IsDML,
-		IsDDL:            ps.IsDDL,
-		HasMutatingNode:  ps.HasMutatingNode,
-		MutatingNodeType: ps.MutatingNodeType,
-		IsExplain:        ps.IsExplain,
-		IsExplainAnalyze: ps.IsExplainAnalyze,
-		ImpersonatedRole: ps.ImpersonatedRole,
-		ParseErrors:      ps.ParseErrors,
-		DecisionVerdict:  string(dec.Verdict),
-		DecisionReason:   dec.Reason,
-		ModeAtDecision:   string(f.srv.cfg.Mode),
-		ProfileName:      f.srv.cfg.ActiveProfileName,
-		DecisionSource:   dec.Source,
-		MatchedRuleID:    dec.MatchedRuleID,
-		TaskID:           dec.TaskID,
+		At:                time.Now().UTC(),
+		Dialect:           ps.Dialect,
+		Statement:         storedStatement,
+		StatementRedacted: statementRedacted,
+		StatementType:     ps.StatementType,
+		TablesTouched:     ps.TablesTouched,
+		FunctionsCalled:   ps.FunctionsCalled,
+		IsDML:             ps.IsDML,
+		IsDDL:             ps.IsDDL,
+		HasMutatingNode:   ps.HasMutatingNode,
+		MutatingNodeType:  ps.MutatingNodeType,
+		IsExplain:         ps.IsExplain,
+		IsExplainAnalyze:  ps.IsExplainAnalyze,
+		ImpersonatedRole:  ps.ImpersonatedRole,
+		ParseErrors:       ps.ParseErrors,
+		DecisionVerdict:   string(dec.Verdict),
+		DecisionReason:    dec.Reason,
+		ModeAtDecision:    string(f.srv.cfg.Mode),
+		ProfileName:       f.srv.cfg.ActiveProfileName,
+		DecisionSource:    dec.Source,
+		MatchedRuleID:     dec.MatchedRuleID,
+		TaskID:            dec.TaskID,
 	}
 
 	// #59 — Phase H PRE-DECISION anomaly enforcement (MySQL path; mirrors
@@ -820,10 +833,10 @@ func (f *mysqlForwarder) recordMySQLDecision(row store.DecisionRow) {
 // that terminates the result set (OK, ERR, or EOF).
 //
 // Simplified vs the PG drain: MySQL result sets are either
-// - OK packet (no rows: INSERT/UPDATE/DELETE response)
-// - ERR packet (failure)
-// - column-count length-encoded int, then ColumnDefinition packets,
-//   EOF, then DataRow packets, EOF (or OK with CLIENT_DEPRECATE_EOF)
+//   - OK packet (no rows: INSERT/UPDATE/DELETE response)
+//   - ERR packet (failure)
+//   - column-count length-encoded int, then ColumnDefinition packets,
+//     EOF, then DataRow packets, EOF (or OK with CLIENT_DEPRECATE_EOF)
 //
 // We don't need to parse the contents — we just forward packets until
 // the terminator. Counting DataRow packets between EOFs gives us a
@@ -898,10 +911,20 @@ func (f *mysqlForwarder) drainUpstreamUntilReady() error {
 // rejected at the proxy boundary so reviewers can see "client tried
 // a prepared statement, dbounce blocked it."
 func (f *mysqlForwarder) recordPreparedReject(sql, source string) {
+	// MED-D8-09: redact the persisted statement on the reject path too so
+	// a credential-bearing prepared statement that dbounce blocks doesn't
+	// leak its literals into the audit log when --redact-literals is set.
+	storedStatement := sql
+	statementRedacted := false
+	if f.srv.cfg.RedactLiterals {
+		storedStatement = parser.RedactLiterals(sql)
+		statementRedacted = storedStatement != sql
+	}
 	row := store.DecisionRow{
 		At:                      time.Now().UTC(),
 		Dialect:                 string(parser.DialectMySQL),
-		Statement:               sql,
+		Statement:               storedStatement,
+		StatementRedacted:       statementRedacted,
 		StatementType:           parser.StmtExecute,
 		DecisionVerdict:         string(VerdictDeny),
 		DecisionReason:          "prepared statements not yet supported in v1.0",

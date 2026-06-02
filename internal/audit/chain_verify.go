@@ -60,6 +60,37 @@ func VerifyChain(logDir string, stateFileMissing bool) (VerifyResult, error) {
 	if err != nil {
 		return res, err
 	}
+	return verifyChainFiles(files, res), nil
+}
+
+// VerifyChainFile verifies the hash-chain of a SINGLE file named by
+// filePath (resolved to an absolute path). It does NOT glob siblings —
+// only the exact file is inspected. This is the correct call site for
+// `logs verify-chain --audit-log <file>`: pointing at passA-audit.jsonl
+// must not drag in unrelated *.jsonl siblings from the same directory
+// (the dir-glob bug fixed in gbounce #13 + this change). stateFileMissing
+// is recorded in the result but is not consulted to select files.
+func VerifyChainFile(filePath string, stateFileMissing bool) (VerifyResult, error) {
+	res := VerifyResult{StateFileMissingAtStart: stateFileMissing}
+	abs, err := filepath.Abs(filePath)
+	if err != nil {
+		return res, fmt.Errorf("verify-chain: resolve path %q: %w", filePath, err)
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return res, fmt.Errorf("verify-chain: stat %q: %w", abs, err)
+	}
+	if fi.IsDir() {
+		// Caller passed a directory — fall back to the dir-wide scan so
+		// the API is forgiving (same semantics as VerifyChain).
+		return VerifyChain(abs, stateFileMissing)
+	}
+	return verifyChainFiles([]string{abs}, res), nil
+}
+
+// verifyChainFiles is the shared core: walks a pre-built ordered slice
+// of file paths and validates the chain across them in sequence.
+func verifyChainFiles(files []string, res VerifyResult) VerifyResult {
 	var prevHash *string
 	var expectedSeq int64
 	for _, path := range files {
@@ -149,7 +180,7 @@ func VerifyChain(logDir string, stateFileMissing bool) (VerifyResult, error) {
 		}
 		closeFn()
 	}
-	return res, nil
+	return res
 }
 
 // ManifestCheck is the result of verifying one signed manifest +

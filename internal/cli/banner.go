@@ -109,7 +109,7 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 	fmt.Fprintf(w, "audit db              : %s\n", opts.StoredAuditDBPath)
 	if opts.ResolvedUpstream != nil {
 		fmt.Fprintf(w,
-			"upstream              : %s (D-Slice 2 forwarding ACTIVE; TLS=%s)\n",
+			"upstream              : %s (forwarding ACTIVE; TLS=%s)\n",
 			opts.UpstreamURL, opts.ResolvedUpstream.TLSMode)
 		if opts.UpstreamCACert != "" {
 			fmt.Fprintf(w,

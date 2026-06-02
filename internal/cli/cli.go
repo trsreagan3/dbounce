@@ -440,28 +440,40 @@ func (a *profileWriterAdapter) ExistingProfileNames() (map[string]struct{}, erro
 
 const rootLongHelp = `dbounce is a local proxy that sits between a SQL client (psql /
 a coding agent / an analytics tool / a CI job) and the real database.
-It parses every statement, records the decision in an audit log, and
-(in later slices, transparent mode) can deny statements that don't
-match its rule set.
+It parses every statement, matches it against its rule engine, records
+the decision in an audit log, and — in transparent mode — denies
+statements that don't pass.
 
 Two operating modes (mirroring kbounce + ibounce):
 
-  cooperative   parse + log every statement (D-Slice 1 default).
-                D-Slice 1 NEVER forwards or blocks — observation only.
-  transparent   DENY verdicts return a SQL error to the client.
-                Real upstream forwarding lands in D-Slice 2.
+  cooperative   parse + log every statement, then forward it to the
+                upstream. DENY verdicts are advisory: the row records
+                decision_verdict=DENY + forwarded=true so reviewers see
+                "transparent mode would have blocked this."
+  transparent   DENY verdicts return a SQL error to the client and the
+                upstream is NEVER contacted for the denied statement;
+                ALLOW verdicts forward to the upstream + stream the
+                real result back.
 
-D-Slice 1 ships:
-  - PostgreSQL wire-protocol listener (observation-only)
-  - AST-aware statement parser (pg_query_go v6)
-  - Decision audit log (~/.dbounce/state.db)
-  - dbounce run, dbounce audit tail, dbounce --version, /healthz
+With no --upstream, dbounce runs observation-only (parse + log, no
+forward, no block) so you can point a client at it with no real DB
+behind it.
 
-Read-vs-write framing: D-Slice 1 records statement_type (SELECT vs
-INSERT/UPDATE/DELETE/MERGE/DDL/CALL/DO/EXECUTE/WITH-WRITE) for every
-row + flags HasMutatingNode so the D-Slice 7 safe-default profile
-can default to "reads are fine; writes get layered checks" out of
-the gate.`
+What ships:
+  - PostgreSQL + MySQL wire-protocol proxy with real upstream forwarding
+  - AST-aware statement parser (pg_query_go v6 / xwb1989 for MySQL)
+  - Rule engine + environment profiles + dynamic/structured deny
+  - Block-mode anomaly enforcement (pre-decision tighten)
+  - Decision audit log (~/.dbounce/state.db) + JSONL + webhook export
+  - Optional --redact-literals: scrubs single-quoted SQL string
+    literals from the persisted statement (numeric / comment /
+    quoted-identifier forms are NOT scrubbed — known coverage limits)
+  - dbounce run, audit tail, logs verify-chain, prompts, --version, /healthz
+
+Read-vs-write framing: every row records statement_type (SELECT vs
+INSERT/UPDATE/DELETE/MERGE/DDL/CALL/DO/EXECUTE/WITH-WRITE) + flags
+HasMutatingNode so the safe-default profile can default to "reads are
+fine; writes get layered checks" out of the gate.`
 
 func newRunCmd() *cobra.Command {
 	var (
@@ -1413,11 +1425,11 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 		"TCP port for the management HTTP listener (/healthz). Distinct from "+
 			"kbounce's 8766 and ibounce's 8767 so all three products coexist.")
 	cmd.Flags().StringVar(&modeStr, "mode", "cooperative",
-		"cooperative | transparent. cooperative = parse + log + advisory. "+
-			"transparent = DENY verdicts return a SQL error (D-Slice 2+).")
+		"cooperative | transparent. cooperative = parse + log + forward "+
+			"(DENY is advisory). transparent = DENY verdicts return a SQL "+
+			"error and the upstream is not contacted for the denied statement.")
 	cmd.Flags().StringVar(&defaultPolStr, "default-policy", "deny",
-		"allow | deny. What transparent mode does when no rule matches. "+
-			"Scaffolding for D-Slice 3 (no rule engine yet).")
+		"allow | deny. What transparent mode does when no rule matches.")
 	cmd.Flags().StringVar(&dialectStr, "dialect", "postgres",
 		"SQL wire-protocol dialect: postgres (default) | mysql | snowflake | bigquery. "+
 			"postgres + mysql ship native wire-protocol proxies; snowflake + "+

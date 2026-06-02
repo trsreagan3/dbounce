@@ -71,11 +71,10 @@ func newLogsVerifyChainCmd() *cobra.Command {
 		Short: "Verify the tamper-evident hash-chain + signed manifests",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			dir := defaultLogDir(auditLog)
-			return runVerifyChain(cmd, dir, withManifest, publicKeyB64, asJSON)
+			return runVerifyChain(cmd, auditLog, withManifest, publicKeyB64, asJSON)
 		},
 	}
-	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Path to the active audit.jsonl.")
+	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Path to the active audit.jsonl (file-scoped: only that file is verified; siblings are ignored).")
 	cmd.Flags().BoolVar(&withManifest, "manifest", false, "Also verify Ed25519-signed manifests + cross-check the chain head (tail-truncation detection).")
 	cmd.Flags().StringVar(&publicKeyB64, "public-key", "", "Pin an out-of-band base64url Ed25519 public key instead of trusting the manifest's embedded key (only with --manifest).")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit JSON.")
@@ -85,12 +84,64 @@ func newLogsVerifyChainCmd() *cobra.Command {
 // runVerifyChain is the shared verify-chain implementation. Kept in
 // logs.go (per-repo CLI) but byte-for-byte identical logic across the
 // bouncers; only the package's product wiring differs.
-func runVerifyChain(cmd *cobra.Command, dir string, withManifest bool, publicKeyB64 string, asJSON bool) error {
+//
+// auditLog is the raw --audit-log flag value (may be empty). When it
+// names a specific FILE, only that file is verified (VerifyChainFile).
+// When empty or a directory, the full dir-scan path runs (VerifyChain).
+// This closes the sibling-glob bug (gbounce #13): pointing at
+// passA-audit.jsonl MUST NOT drag in unrelated *.jsonl siblings from
+// the same directory and report a false "TAMPER DETECTED".
+func runVerifyChain(cmd *cobra.Command, auditLog string, withManifest bool, publicKeyB64 string, asJSON bool) error {
 	out := cmd.OutOrStdout()
+
+	// Resolve whether the caller gave a specific file or a directory.
+	// fileScoped is true when auditLog names an existing regular file.
+	fileScoped := false
+	var resolvedFile string
+	var dir string
+	if auditLog != "" {
+		abs, absErr := filepath.Abs(auditLog)
+		if absErr == nil {
+			if fi, statErr := os.Stat(abs); statErr == nil && !fi.IsDir() {
+				fileScoped = true
+				resolvedFile = abs
+				dir = filepath.Dir(abs)
+			}
+		}
+	}
+	if !fileScoped {
+		dir = defaultLogDir(auditLog)
+	}
+
 	if withManifest {
-		res, err := audit.VerifyChainAndManifests(dir, publicKeyB64)
-		if err != nil {
-			return err
+		// Manifest verification is always dir-scoped (the manifests/
+		// subdirectory lives beside the JSONL file). Chain-only portion
+		// uses the file-scoped verifier when applicable.
+		var res audit.FullVerifyResult
+		var err error
+		if fileScoped {
+			stateMissing := false
+			if _, statErr := os.Stat(audit.StatePath(dir)); statErr != nil {
+				stateMissing = true
+			}
+			chainRes, cerr := audit.VerifyChainFile(resolvedFile, stateMissing)
+			if cerr != nil {
+				return cerr
+			}
+			res.Chain = chainRes
+			// Still load + verify manifests from the parent directory so
+			// tail-truncation detection works even in file-scoped mode.
+			res2, merr := audit.VerifyChainAndManifests(dir, publicKeyB64)
+			if merr != nil {
+				return merr
+			}
+			res.Manifests = res2.Manifests
+			res.ManifestsFound = res2.ManifestsFound
+		} else {
+			res, err = audit.VerifyChainAndManifests(dir, publicKeyB64)
+			if err != nil {
+				return err
+			}
 		}
 		if asJSON {
 			if encErr := json.NewEncoder(out).Encode(res); encErr != nil {
@@ -113,7 +164,13 @@ func runVerifyChain(cmd *cobra.Command, dir string, withManifest bool, publicKey
 	if _, statErr := os.Stat(audit.StatePath(dir)); statErr != nil {
 		stateMissing = true
 	}
-	res, err := audit.VerifyChain(dir, stateMissing)
+	var res audit.VerifyResult
+	var err error
+	if fileScoped {
+		res, err = audit.VerifyChainFile(resolvedFile, stateMissing)
+	} else {
+		res, err = audit.VerifyChain(dir, stateMissing)
+	}
 	if err != nil {
 		return err
 	}

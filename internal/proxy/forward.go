@@ -660,17 +660,17 @@ func writePGScopeRefusalErrorResponse(conn net.Conn, denyReason, msg string) err
 // subsequent AuthenticationOk / ParameterStatus / ReadyForQuery messages
 // never reach the client → connection hangs forever during initial auth.
 const (
-	authOK                   uint32 = 0  // AuthenticationOk             — no client response
-	authKerberosV5           uint32 = 2  // AuthenticationKerberosV5     — no client response (obsolete)
-	authCleartextPassword    uint32 = 3  // AuthenticationCleartextPassword — client → PasswordMessage
-	authMD5Password          uint32 = 5  // AuthenticationMD5Password    — client → PasswordMessage
-	authSCMCredential        uint32 = 6  // AuthenticationSCMCredential  — no client response (Unix-socket only)
-	authGSS                  uint32 = 7  // AuthenticationGSS            — client → GSSResponse
-	authGSSContinue          uint32 = 8  // AuthenticationGSSContinue    — client → GSSResponse
-	authSSPI                 uint32 = 9  // AuthenticationSSPI           — client → GSSResponse
-	authSASL                 uint32 = 10 // AuthenticationSASL           — client → SASLInitialResponse
-	authSASLContinue         uint32 = 11 // AuthenticationSASLContinue   — client → SASLResponse
-	authSASLFinal            uint32 = 12 // AuthenticationSASLFinal      — NO client response; AuthenticationOk follows
+	authOK                uint32 = 0  // AuthenticationOk             — no client response
+	authKerberosV5        uint32 = 2  // AuthenticationKerberosV5     — no client response (obsolete)
+	authCleartextPassword uint32 = 3  // AuthenticationCleartextPassword — client → PasswordMessage
+	authMD5Password       uint32 = 5  // AuthenticationMD5Password    — client → PasswordMessage
+	authSCMCredential     uint32 = 6  // AuthenticationSCMCredential  — no client response (Unix-socket only)
+	authGSS               uint32 = 7  // AuthenticationGSS            — client → GSSResponse
+	authGSSContinue       uint32 = 8  // AuthenticationGSSContinue    — client → GSSResponse
+	authSSPI              uint32 = 9  // AuthenticationSSPI           — client → GSSResponse
+	authSASL              uint32 = 10 // AuthenticationSASL           — client → SASLInitialResponse
+	authSASLContinue      uint32 = 11 // AuthenticationSASLContinue   — client → SASLResponse
+	authSASLFinal         uint32 = 12 // AuthenticationSASLFinal      — NO client response; AuthenticationOk follows
 )
 
 // authRequestExpectsClientResponse reports whether an AuthenticationRequest
@@ -805,28 +805,51 @@ func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload
 	ps := parser.Parse(string(f.srv.cfg.Dialect), sql)
 	dec := f.srv.decide(ps)
 
+	// MED-D8-09 closure on the FORWARDING path. The observation-only
+	// path (evaluateAndAuditWithAgent) already redacts the persisted
+	// Statement when --redact-literals is set, but the forwarding path
+	// historically persisted the raw SQL verbatim — so with a real
+	// --upstream the redaction flag was a NO-OP and string literals
+	// (PII / credentials) landed in the clear in both SQLite + JSONL.
+	//
+	// Redact ONCE here, BEFORE the row is built, using the SAME
+	// canonical redactor as the observation path (do NOT fork a second
+	// implementation). The redaction applies ONLY to the audit record:
+	// the bytes actually forwarded upstream are `payload` (the original
+	// wire message), which is untouched — the real query still executes
+	// with its literals intact. Coverage limits are the documented ones
+	// in parser.RedactLiterals (single-quoted string literals scrubbed;
+	// numeric/comment/quoted-identifier forms are known gaps).
+	storedStatement := sql
+	statementRedacted := false
+	if f.srv.cfg.RedactLiterals {
+		storedStatement = parser.RedactLiterals(sql)
+		statementRedacted = storedStatement != sql
+	}
+
 	row := store.DecisionRow{
-		At:               time.Now().UTC(),
-		Dialect:          ps.Dialect,
-		Statement:        sql,
-		StatementType:    ps.StatementType,
-		TablesTouched:    ps.TablesTouched,
-		FunctionsCalled:  ps.FunctionsCalled,
-		IsDML:            ps.IsDML,
-		IsDDL:            ps.IsDDL,
-		HasMutatingNode:  ps.HasMutatingNode,
-		MutatingNodeType: ps.MutatingNodeType,
-		IsExplain:        ps.IsExplain,
-		IsExplainAnalyze: ps.IsExplainAnalyze,
-		ImpersonatedRole: ps.ImpersonatedRole,
-		ParseErrors:      ps.ParseErrors,
-		DecisionVerdict:  string(dec.Verdict),
-		DecisionReason:   dec.Reason,
-		ModeAtDecision:   string(f.srv.cfg.Mode),
-		ProfileName:      f.srv.cfg.ActiveProfileName,
-		DecisionSource:   dec.Source,
-		MatchedRuleID:    dec.MatchedRuleID,
-		TaskID:           dec.TaskID,
+		At:                time.Now().UTC(),
+		Dialect:           ps.Dialect,
+		Statement:         storedStatement,
+		StatementRedacted: statementRedacted,
+		StatementType:     ps.StatementType,
+		TablesTouched:     ps.TablesTouched,
+		FunctionsCalled:   ps.FunctionsCalled,
+		IsDML:             ps.IsDML,
+		IsDDL:             ps.IsDDL,
+		HasMutatingNode:   ps.HasMutatingNode,
+		MutatingNodeType:  ps.MutatingNodeType,
+		IsExplain:         ps.IsExplain,
+		IsExplainAnalyze:  ps.IsExplainAnalyze,
+		ImpersonatedRole:  ps.ImpersonatedRole,
+		ParseErrors:       ps.ParseErrors,
+		DecisionVerdict:   string(dec.Verdict),
+		DecisionReason:    dec.Reason,
+		ModeAtDecision:    string(f.srv.cfg.Mode),
+		ProfileName:       f.srv.cfg.ActiveProfileName,
+		DecisionSource:    dec.Source,
+		MatchedRuleID:     dec.MatchedRuleID,
+		TaskID:            dec.TaskID,
 	}
 
 	// #59 — Phase H PRE-DECISION anomaly enforcement. On a non-deny floor
