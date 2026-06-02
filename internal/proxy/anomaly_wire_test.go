@@ -61,9 +61,14 @@ func TestAnomalyHealthzUnwired(t *testing.T) {
 	}
 }
 
-// TestObserveAnomalyEmitsAfterBaseline asserts the detector surfaces a
-// neutral event on a spike but never changes the decision in alert mode.
-func TestObserveAnomalyEmitsAfterBaseline(t *testing.T) {
+// TestObserveAnomalyEmitsThroughWire is the GENUINE wire test (#718
+// finding LOW): it drives a volume-spike burst entirely THROUGH
+// observeAnomaly (never d.Run directly) and asserts a neutral event is
+// emitted. This FAILS against the old sentinel wire (ObservedHour=-1,
+// ObservedActionCount=-1 meant no deviation dimension ever contributed,
+// so behavioral detection was dead) and PASSES once observeAnomaly
+// feeds the real hour-of-day + recent-window rate.
+func TestObserveAnomalyEmitsThroughWire(t *testing.T) {
 	cfg := anomaly.DefaultConfig()
 	cfg.Enabled = true
 	cfg.Mode = "alert"
@@ -72,29 +77,67 @@ func TestObserveAnomalyEmitsAfterBaseline(t *testing.T) {
 	d := s.NewAnomalyDetector(cfg)
 	s.SetAnomalyDetector(d)
 
-	row := store.DecisionRow{StatementType: "SELECT", TablesTouched: []string{"prod_orders"}, DecisionVerdict: "ALLOW"}
-	for i := 0; i < 40; i++ {
+	// A sharp burst for one (agent, statement, table): the recent-window
+	// rate climbs far above the learned per-hour baseline mean, so the
+	// action_frequency dimension trips — all THROUGH observeAnomaly.
+	row := store.DecisionRow{StatementType: "SELECT", Statement: "SELECT 1", TablesTouched: []string{"prod_orders"}, DecisionVerdict: "ALLOW"}
+	for i := 0; i < 200; i++ {
 		s.observeAnomaly("agent-d", row)
 	}
-	before := d.Status()["alerts_emitted"].(int64)
-	out := d.Run(anomaly.RunInput{
-		Action:              "SELECT",
-		AgentIdentity:       "agent-d",
-		Resource:            "prod_orders",
-		ObservedHour:        -1,
-		ObservedActionCount: 100000,
-		FloorDecision:       "allow",
-		RecordObservation:   true,
-	})
-	if out.Decision != "allow" {
-		t.Fatalf("alert mode must not block; got %q", out.Decision)
+	if got := d.Status()["alerts_emitted"].(int64); got < 1 {
+		t.Fatalf("expected the wire to flag the volume spike (alerts_emitted=%d); "+
+			"behavioral detection is dead if this is 0", got)
 	}
-	after := d.Status()["alerts_emitted"].(int64)
-	if after <= before {
-		t.Fatalf("expected an alert emitted on the spike (before=%d after=%d)", before, after)
+	if scored := d.Status()["events_scored"].(int64); scored < 1 {
+		t.Fatalf("expected the wire to score events through observeAnomaly; got %d", scored)
 	}
 	h := s.anomalyHealthz()
 	if h["enabled"].(bool) != true {
 		t.Fatalf("healthz should report enabled detector")
+	}
+	if h["recent_count"].(int) < 1 {
+		t.Fatalf("expected recent ring to hold the emitted event")
+	}
+}
+
+// TestObserveAnomalyDropReachesBackstopThroughWire asserts the #718
+// finding MEDIUM fix: a DROP statement (bucketed StatementType="DDL")
+// reaches the cold-start adversarial backstop and is flagged THROUGH
+// observeAnomaly even with no baseline. Before the fix the wire passed
+// only StatementType="DDL", which the backstop catalog could never
+// match, so destructive DROP/TRUNCATE went unseen on cold start.
+func TestObserveAnomalyDropReachesBackstopThroughWire(t *testing.T) {
+	cfg := anomaly.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = "alert"
+	cfg.MinActionsForBaseline = 50 // force cold-start so only the backstop can fire
+	s := &Server{}
+	d := s.NewAnomalyDetector(cfg)
+	s.SetAnomalyDetector(d)
+
+	// DROP TABLE as the parser produces it on the PostgreSQL path:
+	// StatementType="DDL" (the blind bucket) + empty MutatingNodeType.
+	// The leading-verb derivation must surface "DROP" so the backstop
+	// catalog ("drop ") fires.
+	row := store.DecisionRow{
+		StatementType:   "DDL",
+		Statement:       "DROP TABLE prod_orders",
+		IsDDL:           true,
+		TablesTouched:   nil,
+		Dialect:         "postgres",
+		DecisionVerdict: "ALLOW",
+	}
+	s.observeAnomaly("agent-drop", row)
+
+	if got := d.Status()["alerts_emitted"].(int64); got < 1 {
+		t.Fatalf("expected DROP to reach the cold-start backstop + flag (alerts_emitted=%d)", got)
+	}
+
+	// Sanity: a benign cold-start SELECT must NOT flag (no false alarm).
+	benign := store.DecisionRow{StatementType: "SELECT", Statement: "SELECT 1", TablesTouched: []string{"prod_orders"}, DecisionVerdict: "ALLOW"}
+	before := d.Status()["alerts_emitted"].(int64)
+	s.observeAnomaly("agent-benign", benign)
+	if d.Status()["alerts_emitted"].(int64) != before {
+		t.Fatalf("a benign cold-start SELECT must not be flagged")
 	}
 }

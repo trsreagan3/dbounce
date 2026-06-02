@@ -58,12 +58,12 @@ type Explanation struct {
 // like detector.py Explanation.to_dict).
 func (e Explanation) ToMap() map[string]any {
 	return map[string]any{
-		"dimension":      e.Dimension,
-		"baseline_mean":  round(e.BaselineMean, 4),
+		"dimension":       e.Dimension,
+		"baseline_mean":   round(e.BaselineMean, 4),
 		"baseline_stddev": round(e.BaselineStd, 4),
-		"observed":       round(e.Observed, 4),
-		"sigma_distance": round(e.SigmaDistance, 3),
-		"contributing":   e.Contributing,
+		"observed":        round(e.Observed, 4),
+		"sigma_distance":  round(e.SigmaDistance, 3),
+		"contributing":    e.Contributing,
 	}
 }
 

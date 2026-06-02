@@ -141,7 +141,11 @@ type BaselineStore struct {
 	clock          func() time.Time
 
 	rolling map[aggKey][]observation
-	dropped int64
+	// lastSeen records the most recent observation time (store-clock
+	// unix seconds) per key, for least-recently-observed eviction once
+	// the distinct-key cap is hit.
+	lastSeen map[aggKey]int64
+	dropped  int64
 }
 
 // Default tuning mirrors baseline.py defaults.
@@ -149,6 +153,23 @@ const (
 	defaultWindowSeconds   = 14 * 24 * 3600 // 14 days
 	defaultDecayPeriodSecs = 24 * 3600      // one decay step per day
 )
+
+// maxDistinctKeys caps the number of distinct (agent, action,
+// resource_pattern) baselines held in memory. SECURITY: the agent
+// identity is attacker-influenceable (e.g. a forged X-Agent-Name on
+// every request), so without a cap an adversary could mint unbounded
+// distinct keys and OOM the process. When the cap is reached the
+// least-recently-observed key is evicted and the dropped counter is
+// incremented (surfaced honestly via Status). 10k keys * a bounded
+// rolling slice is a few MB — well within a security tool's budget.
+const maxDistinctKeys = 10_000
+
+// recentRateWindowSecs is the short trailing window used to compute the
+// CURRENT observed action rate (events/hour) the detector scores
+// against the learned per-hour baseline mean. A burst of requests for
+// one (agent, action, resource) key spikes this rate above the
+// baseline and trips the action_frequency dimension.
+const recentRateWindowSecs = 3600
 
 // NewBaselineStore builds an in-memory store. windowSeconds<=0 uses the
 // 14d default; decayRate<=0 or >1 uses 0.96.
@@ -167,6 +188,7 @@ func NewBaselineStore(windowSeconds int, decayRate float64) *BaselineStore {
 		decayPeriodSec: defaultDecayPeriodSecs,
 		clock:          time.Now,
 		rolling:        map[aggKey][]observation{},
+		lastSeen:       map[aggKey]int64{},
 	}
 }
 
@@ -202,6 +224,14 @@ func (s *BaselineStore) Observe(agentIdentity, action, resource string, observed
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := aggKey{agent: ai, action: action, resource: pat}
+	if _, exists := s.rolling[key]; !exists {
+		// SECURITY: bound the number of distinct keys. A new key that
+		// would exceed the cap evicts the least-recently-observed key
+		// first and counts it as dropped (surfaced via Status). This
+		// stops an attacker minting unbounded keys (e.g. a forged
+		// per-request agent identity) from OOMing the process.
+		s.evictForCapLocked()
+	}
 	obs := s.rolling[key]
 	obs = append(obs, observation{observedAt: ts, hourOfDay: hr})
 	// Prune rows past the window so memory stays bounded.
@@ -213,6 +243,66 @@ func (s *BaselineStore) Observe(agentIdentity, action, resource string, observed
 		}
 	}
 	s.rolling[key] = pruned
+	if ts > s.lastSeen[key] {
+		s.lastSeen[key] = ts
+	}
+}
+
+// evictForCapLocked evicts least-recently-observed keys until there is
+// room for one more distinct key. Caller holds s.mu. Each eviction
+// increments dropped.
+func (s *BaselineStore) evictForCapLocked() {
+	for len(s.rolling) >= maxDistinctKeys {
+		var oldestKey aggKey
+		var oldestAt int64 = math.MaxInt64
+		found := false
+		for k := range s.rolling {
+			seen := s.lastSeen[k]
+			if !found || seen < oldestAt {
+				oldestKey = k
+				oldestAt = seen
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(s.rolling, oldestKey)
+		delete(s.lastSeen, oldestKey)
+		s.dropped++
+	}
+}
+
+// RecentRate returns the CURRENT observed action rate (events/hour) for
+// the (agent, action, resource_pattern) key over the trailing
+// recentRateWindowSecs window. The caller passes this as the detector's
+// ObservedActionCount so a burst spikes the action_frequency dimension
+// above the learned per-hour baseline mean. nowUnix<=0 uses the store
+// clock. Privacy-safe: only counts structural observations.
+func (s *BaselineStore) RecentRate(agentIdentity, action, resource string, nowUnix int64) float64 {
+	pat := canonicalResourcePattern(resource)
+	ai := strings.TrimSpace(agentIdentity)
+	if ai == "" {
+		ai = "anonymous"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if nowUnix <= 0 {
+		nowUnix = s.nowUnixLocked()
+	}
+	key := aggKey{agent: ai, action: action, resource: pat}
+	cutoff := nowUnix - recentRateWindowSecs
+	count := 0
+	for _, o := range s.rolling[key] {
+		if o.observedAt >= cutoff {
+			count++
+		}
+	}
+	windowHours := float64(recentRateWindowSecs) / 3600.0
+	if windowHours < 1e-9 {
+		windowHours = 1.0
+	}
+	return float64(count) / windowHours
 }
 
 // nowUnixLocked is nowUnix for callers already holding s.mu.

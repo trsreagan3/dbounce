@@ -64,7 +64,7 @@ func TestLoadConfigRejectsBadDecay(t *testing.T) {
 func TestCanonicalResourcePatternPrivacy(t *testing.T) {
 	cases := map[string]string{
 		"arn:aws:s3:us-east-1:123456789012:prod-bucket/key": "arn:aws:s3::prod",
-		"production/web-pod-7":                               "k8s:prod",
+		"production/web-pod-7":                              "k8s:prod",
 		"analytics.events":                                  "sql:other",
 		"*":                                                 "*",
 		"":                                                  "-",

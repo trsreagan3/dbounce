@@ -129,8 +129,13 @@ func parseDurationToSeconds(raw any, field string) (int, error) {
 // AnomalyDetectionConfig. Zero value is the disabled default, matching
 // the Python dataclass defaults.
 type Config struct {
-	Enabled               bool
-	Mode                  string // "alert" | "block"
+	Enabled bool
+	// Mode is "alert" | "block". NOTE: block is NOT enforcing in this
+	// release — the behavioral tap is post-decision, so mode=block
+	// behaves as alert+flag (anomaly flagged + a high-severity event
+	// emitted for operator action) and does NOT deny the request.
+	// Pre-decision block enforcement is tracked in iam-jit#59.
+	Mode                  string
 	Sensitivity           string // "low" | "medium" | "high"
 	BaselineWindowSeconds int
 	BaselineDecayRate     float64

@@ -87,7 +87,7 @@ func TestNormalTrafficDoesNotFire(t *testing.T) {
 	summary := store.SummaryFor("agent-b", "GET", "arn:aws:s3:::prod-bucket/obj", base)
 
 	in := NewScoreInput("GET", "agent-b", "arn:aws:s3:::prod-bucket/obj")
-	in.ObservedHour = baseHour                  // same hour as baseline
+	in.ObservedHour = baseHour                                           // same hour as baseline
 	in.ObservedActionCount = summary.Dimensions["action_frequency"].Mean // on the mean
 	res := ScoreAnomaly(in, summary, cfg)
 	if res.Verdict == VerdictAnomalous {
@@ -158,13 +158,17 @@ func TestDefaultModeAlertsNotBlocks(t *testing.T) {
 	}
 }
 
-// TestBlockModeDenies asserts opt-in block mode flips the decision to
-// deny on an anomalous verdict (strictly more restrictive than the
-// floor, never less).
-func TestBlockModeDenies(t *testing.T) {
+// TestBlockModeIsNotEnforcing asserts the HONEST block behavior for
+// this release (#718 finding HIGH-1 + iam-jit#59): the behavioral tap
+// is post-decision, so mode=block does NOT deny — it passes the floor
+// decision through and behaves as alert+flag (the anomaly is flagged +
+// a high-severity OCSF event is emitted for operator action). Block
+// must NOT be advertised as enforcing until pre-decision wiring lands.
+func TestBlockModeIsNotEnforcing(t *testing.T) {
 	cfg := mediumEnabledConfig()
 	cfg.Mode = "block"
-	d := NewDetector(cfg, func(map[string]any) {}, false)
+	var captured map[string]any
+	d := NewDetector(cfg, func(ev map[string]any) { captured = ev }, false)
 	d.Store().withClock(fixedClock(1_700_000_000))
 	for i := 0; i < 40; i++ {
 		d.Store().Observe("agent-f", "GET", "arn:aws:s3:::prod-bucket/obj", 1_700_000_000-int64(i*60))
@@ -178,8 +182,19 @@ func TestBlockModeDenies(t *testing.T) {
 		FloorDecision:       "allow",
 		RecordObservation:   true,
 	})
-	if out.Decision != "deny" {
-		t.Fatalf("block mode must flip an anomalous allow to deny; got %q", out.Decision)
+	// Block is NOT enforcing: the floor decision passes through unchanged.
+	if out.Decision != "allow" {
+		t.Fatalf("block mode must NOT deny in this release (post-decision tap); got %q", out.Decision)
+	}
+	// ...but the anomaly is still flagged + a high-severity event emitted.
+	if !out.EmittedAlert || captured == nil {
+		t.Fatalf("block mode must still flag + emit a high-severity event for operator action")
+	}
+	if out.Anomaly == nil || out.Anomaly.Verdict != VerdictAnomalous {
+		t.Fatalf("expected an anomalous verdict; got %+v", out.Anomaly)
+	}
+	if sev, _ := captured["severity_id"].(int); sev != 4 {
+		t.Fatalf("expected High (4) severity on the emitted event; got %v", captured["severity_id"])
 	}
 }
 

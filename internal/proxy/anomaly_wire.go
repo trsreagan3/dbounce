@@ -8,14 +8,15 @@
 // adaptation + healthz surface) differs per product. For dbounce the
 // protocol signals are:
 //
-//   - action        = the SQL statement type (SELECT / INSERT /
-//                     DELETE / DROP / ...) — the privacy-safe verb shape,
-//                     never the raw statement text.
+//   - action        = a privacy-safe composite of the SQL statement
+//     type + mutating-node type + leading verb keyword
+//     (SELECT / "DDL DROP" / TRUNCATE / ...) — verb SHAPES
+//     only, never literals/values or the raw statement.
 //   - resource      = the first table touched (or the dialect when no
-//                     table parsed) — canonicalised by the core into a
-//                     privacy-safe sql:<env> bucket.
+//     table parsed) — canonicalised by the core into a
+//     privacy-safe sql:<env> bucket.
 //   - agentIdentity = the resolved agent name from the session
-//                     registry (or "anonymous").
+//     registry (or "anonymous").
 //
 // PRIVACY: we deliberately pass only the statement TYPE + table NAME
 // to the core — never the statement text or any literal values — so
@@ -28,6 +29,8 @@ package proxy
 import (
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/trsreagan3/dbounce/internal/anomaly"
 	"github.com/trsreagan3/dbounce/internal/store"
@@ -54,13 +57,37 @@ func sqlAnomalyAgent(s *Server, sessionID string) string {
 }
 
 // sqlAnomalySignals extracts (action, resource) for the anomaly core
-// from a decision row. action = statement type; resource = first table
-// touched (or dialect when none parsed).
+// from a decision row. resource = first table touched (or dialect when
+// none parsed).
+//
+// action is a privacy-safe COMPOSITE of structural verb shapes so the
+// cold-start adversarial backstop ("drop ", "truncate", "delete from",
+// "grant all", ...) can actually fire (#718 finding MEDIUM). dbounce's
+// parser buckets CREATE / ALTER / DROP under StatementType="DDL" (a
+// bucket the backstop catalog cannot match on), with the concrete verb
+// living in MutatingNodeType ("DROP" / "TRUNCATE" / "GRANT" / ...) on
+// the MySQL/Snowflake/BigQuery paths — but EMPTY for a PostgreSQL bare
+// DROP (its walker only flags DML nodes). So we fold in BOTH the
+// MutatingNodeType AND the leading SQL keyword token (verb only — never
+// literals/values/identifiers, preserving the
+// [[dbounce-sql-redaction-gaps]] privacy invariant) so DROP / TRUNCATE /
+// DELETE / DROP DATABASE reach the backstop on every dialect.
 func sqlAnomalySignals(row store.DecisionRow) (string, string) {
-	action := row.StatementType
+	parts := make([]string, 0, 3)
+	if st := strings.TrimSpace(row.StatementType); st != "" {
+		parts = append(parts, st)
+	}
+	if mn := strings.TrimSpace(row.MutatingNodeType); mn != "" {
+		parts = append(parts, mn)
+	}
+	if verb := leadingSQLVerb(row.Statement); verb != "" {
+		parts = append(parts, verb)
+	}
+	action := strings.Join(parts, " ")
 	if action == "" {
 		action = "STATEMENT"
 	}
+
 	resource := ""
 	if len(row.TablesTouched) > 0 {
 		resource = row.TablesTouched[0]
@@ -68,6 +95,34 @@ func sqlAnomalySignals(row store.DecisionRow) (string, string) {
 		resource = row.Dialect
 	}
 	return action, resource
+}
+
+// leadingSQLVerb returns the leading SQL keyword token of a statement,
+// uppercased — and ONLY when it is one of a small allowlist of
+// structural operation verbs. Returning a keyword from the allowlist
+// (never an arbitrary token, literal, identifier, or value) keeps the
+// signal privacy-safe: it is the operation SHAPE, not the data. Empty
+// when the statement is blank or the leading token is not an allowlisted
+// verb.
+func leadingSQLVerb(statement string) string {
+	s := strings.TrimSpace(statement)
+	if s == "" {
+		return ""
+	}
+	// First whitespace/paren-delimited token.
+	idx := strings.IndexFunc(s, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '(' || r == ';'
+	})
+	tok := s
+	if idx >= 0 {
+		tok = s[:idx]
+	}
+	tok = strings.ToUpper(tok)
+	switch tok {
+	case "DROP", "TRUNCATE", "DELETE", "GRANT", "REVOKE", "CREATE", "ALTER", "RENAME":
+		return tok
+	}
+	return ""
 }
 
 // observeAnomaly observes one decision into the behavioral baseline +
@@ -81,12 +136,21 @@ func (s *Server) observeAnomaly(agentIdentity string, row store.DecisionRow) {
 	if row.DecisionVerdict == "DENY" || row.DecisionVerdict == "deny" {
 		floor = "deny"
 	}
+	// FEED THE REAL DEVIATION SIGNALS (#718 finding HIGH): derive the
+	// current hour-of-day from the clock and the recent-window observed
+	// action rate for this (agent, action, resource_pattern) from the
+	// baseline store, so the hour_of_day + action_frequency dimensions
+	// actually contribute. Computed BEFORE Run records this event so the
+	// rate reflects the burst arriving so far; Run adds the current one.
+	// Privacy preserved: we pass only structural shapes + counts.
+	observedHour := time.Now().UTC().Hour()
+	observedRate := s.anomalyDetector.Store().RecentRate(agentIdentity, action, resource, 0)
 	s.anomalyDetector.Run(anomaly.RunInput{
 		Action:              action,
 		AgentIdentity:       agentIdentity,
 		Resource:            resource,
-		ObservedHour:        -1,
-		ObservedActionCount: -1,
+		ObservedHour:        observedHour,
+		ObservedActionCount: observedRate,
 		FloorDecision:       floor,
 		RecordObservation:   true,
 	})

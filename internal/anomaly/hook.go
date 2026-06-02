@@ -5,8 +5,16 @@
 // DEFAULT = ALERT, NOT BLOCK per [[safety-mode-lean-permissive]]: a
 // fresh Detector with the default config (or an explicit mode=alert)
 // lets the request through + surfaces an anomaly event; it never
-// blocks. Block mode is opt-in (mode=block) and even then is strictly
-// more restrictive than the floor, never less.
+// blocks.
+//
+// BLOCK MODE IS NOT ENFORCING IN THIS RELEASE. The behavioral tap runs
+// POST-decision (the proxy has already let the request proceed by the
+// time the anomaly is scored), so mode=block cannot actually deny the
+// request here. Pre-decision wiring is tracked in iam-jit#59. Until
+// then mode=block behaves as alert+flag: the anomaly is flagged and a
+// high-severity OCSF event is emitted for operator action, and we log a
+// one-time WARNING so the operator is never misled into thinking block
+// is enforcing. Do NOT advertise mode=block as denying.
 //
 // Per [[ibounce-honest-positioning]] every operator-facing string uses
 // NEUTRAL language — "your bouncer noticed something unusual", never
@@ -19,6 +27,7 @@
 package anomaly
 
 import (
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,8 +58,12 @@ func productName() string {
 
 // HookResult is the per-request outcome. Ports hook.py HookResult.
 type HookResult struct {
-	// Decision is the floor verdict passed through ("allow"/"deny") OR
-	// "deny" when block mode chose to deny on an anomalous verdict.
+	// Decision is the floor verdict passed through ("allow"/"deny").
+	// NOTE: the anomaly tap does NOT override the floor decision in this
+	// release — even under mode=block it returns the floor verdict
+	// (block enforcement is post-decision and not wired; see iam-jit#59
+	// and the package doc). An anomalous verdict surfaces a flag + event
+	// for operator action; it does not deny.
 	Decision string
 	// Anomaly is the full scoring result; nil when the detector is
 	// disabled.
@@ -86,6 +99,11 @@ type Detector struct {
 	scored  atomic.Int64
 	flagged atomic.Int64
 	emitted atomic.Int64
+
+	// blockWarnOnce logs a single honest WARNING the first time a
+	// block-configured detector runs, so an operator is never misled
+	// into thinking mode=block enforces a deny in this release.
+	blockWarnOnce sync.Once
 }
 
 // NewDetector builds a Detector. A disabled config yields a no-op
@@ -128,8 +146,8 @@ type RunInput struct {
 	// FloorDecision is the deterministic scorer's decision: "allow" or
 	// "deny". When the floor already denied we short-circuit (don't
 	// double-count) per [[scorer-is-ground-truth]].
-	FloorDecision    string
-	FloorDenyReason  string
+	FloorDecision     string
+	FloorDenyReason   string
 	RecordObservation bool
 }
 
@@ -190,12 +208,22 @@ func (d *Detector) Run(in RunInput) HookResult {
 		d.emitted.Add(1)
 	}
 
-	decision := floor
+	// HONEST BLOCK: the behavioral tap is post-decision, so it cannot
+	// actually deny here (the request already proceeded). mode=block is
+	// therefore NOT enforcing in this release — it behaves as alert+flag
+	// with a high-severity event for operator action. We pass the floor
+	// decision through unchanged and warn ONCE so the operator is never
+	// misled. Pre-decision enforcement is tracked in iam-jit#59.
 	if mode == "block" && !d.detectionOnly {
-		decision = "deny"
+		d.blockWarnOnce.Do(func() {
+			log.Printf("[anomaly] WARNING: anomaly_detection.mode=block is NOT enforcing in this release: " +
+				"the behavioral tap runs after the decision, so anomalies are flagged + a high-severity " +
+				"event is emitted for operator action, but the request is NOT denied (behaves as alert+flag). " +
+				"Pre-decision block enforcement is tracked in iam-jit#59.")
+		})
 	}
 	return HookResult{
-		Decision:        decision,
+		Decision:        floor,
 		Anomaly:         &res,
 		EmittedAlert:    emitted,
 		Event:           event,
@@ -211,15 +239,15 @@ func (d *Detector) Status() map[string]any {
 		return map[string]any{"enabled": false}
 	}
 	st := map[string]any{
-		"enabled":         d.cfg.Enabled,
-		"mode":            d.effectiveMode(),
-		"detection_only":  d.detectionOnly,
-		"sensitivity":     d.cfg.Sensitivity,
-		"sigma_threshold": d.cfg.SigmaThreshold(),
-		"events_scored":   d.scored.Load(),
+		"enabled":           d.cfg.Enabled,
+		"mode":              d.effectiveMode(),
+		"detection_only":    d.detectionOnly,
+		"sensitivity":       d.cfg.Sensitivity,
+		"sigma_threshold":   d.cfg.SigmaThreshold(),
+		"events_scored":     d.scored.Load(),
 		"anomalies_flagged": d.flagged.Load(),
-		"alerts_emitted":  d.emitted.Load(),
-		"baseline":        d.store.Status(),
+		"alerts_emitted":    d.emitted.Load(),
+		"baseline":          d.store.Status(),
 	}
 	return st
 }
@@ -292,10 +320,10 @@ func buildOCSFAnomalyEvent(action, resource, agentIdentity string, res AnomalyRe
 // hook.py _friendly_summary. Leads with "noticed something unusual",
 // never accusatory.
 func friendlySummary(action string, res AnomalyResult, mode string) string {
+	// NOTE: even under mode=block the head stays "noticed", never
+	// "blocked" — block is NOT enforcing in this release (post-decision
+	// tap; see iam-jit#59), so claiming a block would be dishonest.
 	head := "Your bouncer noticed something unusual"
-	if mode == "block" {
-		head = "Your bouncer blocked an unusual action"
-	}
 	var contributing []string
 	for _, e := range res.Explanations {
 		if e.Contributing {
