@@ -46,12 +46,63 @@ import (
 // bouncerNameDbounce is the product name baked into the served HTML.
 const bouncerNameDbounce = "dbounce"
 
+// auditFilterMatchJS is the single source of truth for the live
+// client-side row filter. It is injected into the page (replacing the
+// {{FILTER_JS}} token) AND executed verbatim by events_filter_test.go
+// under a JS engine, so the filter grammar can never silently rot
+// again. Grammar:
+//
+//	""            -> matches everything
+//	field=value   -> case-insensitive substring on that column
+//	field~regex   -> case-insensitive regex on that column
+//	anything else -> case-insensitive substring across all columns
+//
+// Recognised fields: time, severity, type (event_type/et), actor,
+// op (operation), verdict (v). An unknown field name falls back to a
+// whole-string substring match so a typo never hides every row.
+const auditFilterMatchJS = `
+  function auditFilterFieldList(f) {
+    return [f.time, f.severity, f.type, f.actor, f.op, f.verdict];
+  }
+  function auditFilterMatch(f, query) {
+    f = f || {};
+    var q = (query == null ? "" : String(query)).trim();
+    if (!q) { return true; }
+    var m = /^([A-Za-z_]+)\s*([=~])\s*([\s\S]*)$/.exec(q);
+    if (m) {
+      var aliases = {
+        time: "time", severity: "severity", sev: "severity",
+        type: "type", event_type: "type", et: "type",
+        actor: "actor", op: "op", operation: "op",
+        verdict: "verdict", v: "verdict"
+      };
+      var key = aliases[m[1].toLowerCase()];
+      if (key) {
+        var hay = String(f[key] == null ? "" : f[key]);
+        var val = m[3];
+        if (m[2] === "=") {
+          return hay.toLowerCase().indexOf(val.trim().toLowerCase()) !== -1;
+        }
+        try { return new RegExp(val, "i").test(hay); }
+        catch (e) { return false; }
+      }
+    }
+    var all = auditFilterFieldList(f).map(function (v) {
+      return v == null ? "" : String(v);
+    }).join(" ␟ ").toLowerCase();
+    return all.indexOf(q.toLowerCase()) !== -1;
+  }
+`
+
 // renderAuditEventsUI returns the rendered HTML page for GET /. The
 // bouncerName is HTML-escaped before substitution so an exotic
-// product label can never inject script via the page title.
+// product label can never inject script via the page title. The
+// trusted FILTER_JS block is injected first so an escaped product
+// name can never smuggle a {{FILTER_JS}} token of its own.
 func renderAuditEventsUI(bouncerName string) string {
+	out := strings.ReplaceAll(auditEventsUITemplate, "{{FILTER_JS}}", auditFilterMatchJS)
 	safe := html.EscapeString(bouncerName)
-	return strings.ReplaceAll(auditEventsUITemplate, "{{BOUNCER_NAME}}", safe)
+	return strings.ReplaceAll(out, "{{BOUNCER_NAME}}", safe)
 }
 
 // auditEventsUIHandler builds the http.HandlerFunc for GET /. The
@@ -163,6 +214,8 @@ header input[type="text"] {
   padding: 5px 8px; font: inherit; width: 240px;
 }
 header input[type="text"]::placeholder { color: var(--muted); }
+header input[type="text"].active { border-color: var(--accent); color: var(--accent); }
+header .filter-hint { color: var(--muted); font-size: 11px; align-self: center; min-width: 0; }
 header button {
   background: var(--bg); color: var(--text);
   border: 1px solid var(--line); border-radius: 4px;
@@ -227,7 +280,8 @@ footer {
     <span>heartbeat <b id="count-heartbeat">0</b></span>
   </div>
   <div class="controls">
-    <input type="text" id="filter" placeholder="filter: field=value or field~regex">
+    <input type="text" id="filter" placeholder="filter (live): text, field=value, field~regex">
+    <span class="filter-hint" id="filter-hint"></span>
     <button type="button" id="pause-btn">pause</button>
     <button type="button" id="clear-btn">clear</button>
   </div>
@@ -254,6 +308,7 @@ footer {
 <script>
 "use strict";
 (function () {
+{{FILTER_JS}}
   var POLL_MS = 2000;
   var MAX_ROWS = 500;
   var token = null;
@@ -264,6 +319,7 @@ footer {
 
   var elBody = document.getElementById("events-body");
   var elFilter = document.getElementById("filter");
+  var elFilterHint = document.getElementById("filter-hint");
   var elPause = document.getElementById("pause-btn");
   var elClear = document.getElementById("clear-btn");
   var elErr = document.getElementById("err-banner");
@@ -390,7 +446,40 @@ footer {
     span.textContent = v.label;
     tdv.appendChild(span);
     tr.appendChild(tdv);
+    // Stash the visible field values so the live filter can match
+    // without re-parsing the rendered DOM.
+    tr._fields = {
+      time: cells[0], severity: cells[1], type: cells[2],
+      actor: cells[3], op: cells[4], verdict: v.label
+    };
     return tr;
+  }
+
+  // applyFilter shows/hides already-rendered rows against the current
+  // filter string, live. Filtering is purely client-side over the
+  // rendered set — it never depends on the poll cursor, so typing a
+  // filter narrows the visible table immediately (the bug this fixes:
+  // the old code only passed the filter to the next /audit/events
+  // fetch, leaving stale rows on screen).
+  function applyFilter() {
+    var q = (elFilter.value || "").trim();
+    var shown = 0, hidden = 0;
+    var rows = elBody.children;
+    for (var i = 0; i < rows.length; i++) {
+      var tr = rows[i];
+      if (!tr._fields) { continue; } // empty/cleared placeholder row
+      if (auditFilterMatch(tr._fields, q)) {
+        tr.style.display = "";
+        shown += 1;
+      } else {
+        tr.style.display = "none";
+        hidden += 1;
+      }
+    }
+    elFilter.classList.toggle("active", q.length > 0);
+    elFilterHint.textContent = (q && hidden > 0)
+      ? (shown + " shown / " + hidden + " hidden")
+      : "";
   }
 
   function appendEvents(events) {
@@ -410,6 +499,7 @@ footer {
     while (elBody.children.length > MAX_ROWS) {
       elBody.removeChild(elBody.firstChild);
     }
+    applyFilter();
     window.scrollTo(0, document.body.scrollHeight);
   }
 
@@ -431,8 +521,9 @@ footer {
     if (lastTimeMs) {
       qs.push("since=" + encodeURIComponent(new Date(lastTimeMs + 1).toISOString()));
     }
-    var f = (elFilter.value || "").trim();
-    if (f) qs.push("filter=" + encodeURIComponent(f));
+    // NOTE: the filter is applied client-side (see applyFilter) so the
+    // poll always fetches the full recent stream; never narrow the
+    // fetch by the UI filter or stale rows go unfiltered on screen.
     return "/audit/events?" + qs.join("&");
   }
 
@@ -497,8 +588,9 @@ footer {
     td.textContent = "cleared - waiting for events…";
     tr.appendChild(td);
     elBody.appendChild(tr);
+    elFilterHint.textContent = "";
   });
-  elFilter.addEventListener("change", function () { poll(); });
+  elFilter.addEventListener("input", applyFilter);
 
   poll();
 })();
