@@ -64,11 +64,11 @@ func TestHealthzIncludesAuditLogBlock(t *testing.T) {
 }
 
 // TestHealthz503AtCriticalInPauseMode asserts /healthz returns 503
-// when refuse_requests=true.
+// when refuse_requests=true (98.5% crosses default crit=98%).
 func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 	tmp := t.TempDir()
 	st := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatFn(96.0), time.Now())
+	st.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatFn(98.5), time.Now())
 	srv := NewServer(Config{DiskPressure: st}.Normalize(), freshStoreForDP(t))
 
 	rec := httptest.NewRecorder()
@@ -85,14 +85,13 @@ func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 
 // TestStopOnDiskCriticalAliasEquivalentToPauseMode asserts the alias
 // produces identical RefuseRequests behavior at the state level.
-// (The CLI-side aliasing lives in cli.go; this test pins the state
-// machine's contract for both forms.)
 func TestStopOnDiskCriticalAliasEquivalentToPauseMode(t *testing.T) {
 	tmp := t.TempDir()
 	longForm := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
 	aliasState := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	longForm.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatFn(96.0), time.Now())
-	aliasState.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatFn(96.0), time.Now())
+	// 98.5% crosses the crit threshold (default 98%).
+	longForm.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatFn(98.5), time.Now())
+	aliasState.EvaluateAndReact(context.Background(), nil, "", fakeDiskStatFn(98.5), time.Now())
 	if longForm.RefuseRequests() != aliasState.RefuseRequests() {
 		t.Fatalf("alias RefuseRequests = %t; long form = %t",
 			aliasState.RefuseRequests(), longForm.RefuseRequests())
