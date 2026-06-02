@@ -145,14 +145,48 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 		fmt.Fprintln(w,
 			"                          pass --profile safe-default OR export "+envProfileVar+"=safe-default.")
 	}
-	fmt.Fprintln(w,
-		"mode                  : cooperative — every statement is parsed + audit-logged.")
-	fmt.Fprintln(w,
-		"                        D-Slice 1 is OBSERVATION-ONLY: nothing actually executes")
-	fmt.Fprintln(w,
-		"                        against the upstream. To opt into the (D-Slice 2+) transparent")
-	fmt.Fprintln(w,
-		"                        block path once it ships, pass --mode transparent.")
+	// Honest mode banner. Forwarding + transparent-mode enforcement are
+	// SHIPPED: with an --upstream configured, ALLOW verdicts forward
+	// verbatim to the DB and stream the real reply back; in transparent
+	// mode, out-of-profile statements are denied with SQLSTATE 42501 and
+	// the upstream is never contacted. The "nothing executes" framing
+	// only holds when NO --upstream is set (observation-only).
+	forwardingActive := opts.ResolvedUpstream != nil
+	if cfg.Mode == proxy.ModeTransparent {
+		fmt.Fprintln(w,
+			"mode                  : transparent — every statement is parsed + audit-logged;")
+		if forwardingActive {
+			fmt.Fprintln(w,
+				"                        ALLOW verdicts forward verbatim to the upstream + stream")
+			fmt.Fprintln(w,
+				"                        the real reply back; DENY verdicts return SQLSTATE 42501")
+			fmt.Fprintln(w,
+				"                        to the client WITHOUT contacting the upstream (enforcing).")
+		} else {
+			fmt.Fprintln(w,
+				"                        DENY verdicts are surfaced as errors. No --upstream set,")
+			fmt.Fprintln(w,
+				"                        so nothing is forwarded (observation-only). Add --upstream")
+			fmt.Fprintln(w,
+				"                        to forward ALLOWs + actually block DENYs at the DB.")
+		}
+	} else {
+		fmt.Fprintln(w,
+			"mode                  : cooperative — every statement is parsed + audit-logged;")
+		if forwardingActive {
+			fmt.Fprintln(w,
+				"                        verdicts are ADVISORY: ALLOWs and DENYs alike forward to")
+			fmt.Fprintln(w,
+				"                        the upstream (the audit row records what transparent mode")
+			fmt.Fprintln(w,
+				"                        would have blocked). Pass --mode transparent to enforce.")
+		} else {
+			fmt.Fprintln(w,
+				"                        no --upstream set, so nothing is forwarded (observation-")
+			fmt.Fprintln(w,
+				"                        only). Add --upstream to forward; --mode transparent to enforce.")
+		}
+	}
 	fmt.Fprintln(w,
 		"read vs write         : reads (SELECT) and writes (INSERT/UPDATE/DELETE/MERGE/DDL/")
 	fmt.Fprintln(w,

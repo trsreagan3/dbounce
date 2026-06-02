@@ -1,10 +1,11 @@
 # dbounce
 
-**Local SQL gating proxy.** Sits between a SQL client (psql / a coding
+**SQL gating proxy.** Sits between a SQL client (psql / a coding
 agent / an analytics tool / a CI job) and a real database, parses every
-statement, records the decision in a SQLite audit log, and (in later
-slices, transparent mode) can deny statements that don't match its rule
-set.
+statement, **forwards allowed statements verbatim to the upstream and
+streams the real reply back**, records every decision in a SQLite audit
+log, and — in transparent mode — **denies statements that don't match
+its rule set with a real SQL error, never touching the upstream**.
 
 `dbounce` is the third product in the Bounce suite — the SQL-shaped
 sibling of `kbounce` (Kubernetes API gating) and `ibounce` (HTTP/AWS-SDK
@@ -14,34 +15,51 @@ the others.
 
 ---
 
-## D-Slice 1 scope (this release)
+## What ships today
 
-D-Slice 1 ships the observation-only foundation:
+dbounce is a real wire-protocol proxy with enforcement and an MCP
+server. The following are shipped and working:
 
-- TCP listener that speaks PostgreSQL wire protocol
-- AST-aware parser for every inbound statement
+- **Real upstream forwarding.** With `--upstream` set, dbounce dials the
+  real database, forwards the StartupMessage + auth flow verbatim
+  (SCRAM-SHA-256 / MD5 / cleartext pass-through — dbounce never reads or
+  stores the password), forwards ALLOW verdicts, and streams the
+  upstream's real reply back to the client. (`internal/proxy/forward.go`.)
+- **Transparent-mode enforcement.** In `--mode transparent`, an
+  out-of-profile statement is denied with a PG `ErrorResponse`
+  (SQLSTATE `42501`) + a structured-deny payload, and the upstream is
+  **never contacted**. Cooperative mode forwards the same statements but
+  records the verdict as advisory ("transparent mode would have blocked
+  this").
+- **AST-aware parser** for every inbound statement
   (`github.com/pganalyze/pg_query_go/v6`, pinned to libpg_query that
-  tracks PostgreSQL 16)
-- Decision audit log at `~/.dbounce/state.db` (SQLite, pure Go)
-- `dbounce run` / `dbounce audit tail` / `dbounce --version` CLI
-- `/healthz` liveness probe on a separate management HTTP port
+  tracks PostgreSQL 16). Classifies reads vs. writes, DML/DDL, CTE-wrapped
+  mutations, role/DCL operations, etc.
+- **Profiles + rule engine + tasks.** `safe-default` (pure-SELECT
+  baseline + AST-walk mutation backstop + DCL-to-PUBLIC floor),
+  `full-user`, custom profiles in `~/.dbounce/profiles.yaml`, global
+  rules, and per-task scopes.
+- **MCP server.** `dbounce mcp serve` exposes the `dbounce_*` tool
+  family (decide / posture / active-mode / active-profile / tail /
+  profile-allow / …) over JSON-RPC stdio, plus
+  `dbounce mcp install-{claude-code,cursor,codex,devin}` install
+  helpers. See [Add to your agent](#add-to-your-agent).
+- **Decision audit log** at `~/.dbounce/state.db` (SQLite, pure Go) with
+  `dbounce audit tail` (snapshot / follow / summary / export) + OCSF
+  event-stream fan-out + `/healthz` liveness probe on a separate
+  management HTTP port.
+- **Dynamic deny rules**, **connection-scope enforcement** (per-profile
+  OnlyHosts / OnlyDatabases), **sync deny-prompts**, **deployment
+  presets**, and **pause windows**.
 
-**dbounce in D-Slice 1 does NOT forward statements upstream.** The
-proxy parses + logs + returns a synthetic `ReadyForQuery` to the
-client. This is "watch what your client wants to do; nothing actually
-executes." D-Slice 2 adds real upstream forwarding.
+### Status by dialect surface
 
-Features explicitly deferred to later D-Slices:
-
-| Slice | Feature |
+| Surface | Status |
 | --- | --- |
-| D-Slice 2 | Real upstream forwarding + SCRAM-SHA-256 auth pass-through |
-| D-Slice 3 | Rule engine + tasks (`dbounce rules` / `dbounce tasks`) |
-| D-Slice 4 | TLS on the inbound listener + management port |
-| D-Slice 5 | MySQL wire protocol |
-| D-Slice 6 | Snowflake + BigQuery (JDBC-driver-shim) |
-| D-Slice 7 | Profile YAML, `safe-default` profile, MCP server |
-| D-Slice 8 | Pause, prompts, presets, recommender |
+| PostgreSQL native wire-protocol proxy (forward + enforce) | Shipped; full calibration |
+| MySQL native wire-protocol proxy (forward + enforce) | Shipped; provisional calibration |
+| Snowflake / BigQuery (JDBC-driver-shim, `dbounce decide` / `dbounce_decide`) | Shipped; experimental calibration |
+| Inbound listener TLS + management-port TLS | Shipped |
 
 ## Supported dialects
 
@@ -69,28 +87,148 @@ wire-protocol path.
 
 ## Install
 
-```sh
-# Canonical install — builds the binary fresh from source into $GOPATH/bin
-# (or $HOME/go/bin if GOPATH is unset).
-go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
+No Go toolchain required for the paths below — they install a
+prebuilt, signed-by-release binary. `dbounce --version` should print a
+version after any of them.
 
-# Verify the binary is on your PATH:
+### Homebrew (macOS / Linux)
+
+```sh
+brew install trsreagan3/tap/dbounce
+```
+
+### Prebuilt binary (any OS)
+
+Each [GitHub Release](https://github.com/trsreagan3/dbounce/releases)
+attaches `dbounce_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) for
+`linux`/`darwin`/`windows` × `amd64`/`arm64`. Download, extract, and
+put `dbounce` on your `PATH`:
+
+```sh
+# Example: macOS arm64. Swap in the os/arch + version for your machine.
+curl -fsSL -o dbounce.tar.gz \
+  https://github.com/trsreagan3/dbounce/releases/latest/download/dbounce_<version>_Darwin_arm64.tar.gz
+tar -xzf dbounce.tar.gz dbounce
+sudo install dbounce /usr/local/bin/dbounce
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add trsreagan3 https://github.com/trsreagan3/scoop-bucket
+scoop install dbounce
+```
+
+### APT / RPM (Debian/Ubuntu, RHEL/Fedora)
+
+Releases attach `.deb` + `.rpm` packages. They are **not** published to
+a public APT/RPM registry yet — download the package from the release
+and install it directly (installs the binary to `/usr/local/bin`):
+
+```sh
+# Debian / Ubuntu
+curl -fsSL -o dbounce.deb \
+  https://github.com/trsreagan3/dbounce/releases/latest/download/dbounce_<version>_linux_amd64.deb
+sudo dpkg -i dbounce.deb
+
+# RHEL / Fedora / Amazon Linux
+curl -fsSL -o dbounce.rpm \
+  https://github.com/trsreagan3/dbounce/releases/latest/download/dbounce_<version>_linux_amd64.rpm
+sudo rpm -i dbounce.rpm
+```
+
+See [docs/INSTALL-APT.md](docs/INSTALL-APT.md) /
+[docs/INSTALL-RPM.md](docs/INSTALL-RPM.md) if present for the full
+package runbooks.
+
+### Docker
+
+See [Docker](#docker) below for the published `ghcr.io/trsreagan3/dbounce`
+image.
+
+### From source (Go toolchain required)
+
+```sh
+go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
 dbounce --version
 
 # If you get "command not found": $(go env GOPATH)/bin is not on PATH.
 # Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by
-# default. Fix once per shell:
+# default. Fix once per shell, then persist in your shell rc:
 export PATH="$PATH:$(go env GOPATH)/bin"
-
-# Persist across sessions (pick the right rc for your shell):
 echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc   # bash
 echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc    # zsh
 ```
 
-Closes #549 from UAT L1 2026-05-24 — the unmodified `go install` succeeds
-silently with the binary at `~/go/bin/dbounce` while the operator's shell
-reports "command not found", which reads as "install broken" on a fresh
-machine.
+> The `go install` PATH note closes #549 (UAT L1 2026-05-24): the
+> unmodified `go install` succeeds silently with the binary at
+> `~/go/bin/dbounce` while the shell reports "command not found", which
+> reads as "install broken" on a fresh machine.
+
+## Add to your agent
+
+dbounce wires into any MCP-compatible coding agent two ways. Pick
+whichever fits your setup; they compose.
+
+### MCP mode — the agent introspects + self-scopes via `dbounce_*` tools
+
+One command per client merges a `dbounce` entry into the agent's MCP
+config (idempotent; other MCP servers are preserved):
+
+```sh
+dbounce mcp install-claude-code   # Claude Code / Claude Desktop
+dbounce mcp install-cursor        # Cursor
+dbounce mcp install-codex         # Codex (prints a TOML snippet to paste)
+dbounce mcp install-devin         # Devin (cloud-agent recipe; see below)
+```
+
+The agent then spawns `dbounce mcp serve` and can call `dbounce_decide`
+(dry-run a query's verdict), `dbounce_posture`, `dbounce_active_mode`,
+`dbounce_tail_decisions`, `dbounce_profile_allow`, etc. Verify with
+`dbounce mcp list-tools` (the same list the agent sees). For any other
+MCP client, `dbounce mcp show-config` prints a vendor-neutral JSON/YAML
+snippet.
+
+The MCP server reads the **same** on-disk state the running proxy uses
+(`--db` + `--profiles-path`); it does **not** start a proxy listener of
+its own — run `dbounce run` separately for the gating + forwarding
+layer.
+
+### Connect mode — point the agent's DB client through dbounce
+
+Run the proxy, then point your agent's (or any tool's) database
+connection string at dbounce instead of the real DB:
+
+```sh
+# Proxy on 127.0.0.1:5433, forwarding to the real PG on :5432.
+dbounce run \
+  --dialect postgres \
+  --upstream postgres://user:pass@db-host:5432/mydb \
+  --mode transparent --profile safe-default
+```
+
+```
+# Then in the agent / tool:
+DATABASE_URL=postgres://user:pass@127.0.0.1:5433/mydb
+```
+
+Every statement the agent runs now traverses dbounce: parsed,
+audit-logged, ALLOWs forwarded to the real DB, and (transparent mode)
+out-of-profile writes denied with SQLSTATE `42501` before they reach
+the database.
+
+### Cloud agents (Devin) + Claude-in-container
+
+`dbounce mcp install-devin` prints a recipe rather than editing a local
+config: Devin runs in a cloud sandbox that cannot see your local
+`127.0.0.1`, so the bouncer must run on a host the sandbox can reach
+(`--host 0.0.0.0 --i-know-this-binds-externally`) and the agent's DB
+client points at `<bouncer-host>:5433`. This is an honest limitation,
+not a bug — dbounce never requires root or a transparent OS-level proxy.
+
+For running an agent (e.g. Claude Code) inside Docker alongside the
+bouncer, see the cross-product
+[Claude-in-Docker integration guide](../iam-roles/docs/DOCKER-CLAUDE-INTEGRATION.md).
 
 ## Quickstart
 
@@ -173,10 +311,13 @@ above shows it inline so the local-PG case never trips silently.
 
 | Mode | Behavior | Use case |
 | --- | --- | --- |
-| `cooperative` (default) | Parse + log every statement. Always returns a synthetic `ReadyForQuery` to the client without forwarding (D-Slice 1) — D-Slice 2 will swap this for a real forward. Verdicts are advisory. | Solo dev iterating fast; previewing what transparent mode would block. |
-| `transparent` | DENY verdicts return a SQL error to the client. (D-Slice 2 forwards ALLOWs to the upstream; D-Slice 1 ships only the parse + audit half.) | Locked-down environments; lower-trust agents; compliance deploys. |
+| `cooperative` (default) | Parse + log every statement, then forward it to the upstream and stream the real reply back — **including statements a profile would DENY**. The verdict is recorded as advisory (the audit row shows what transparent mode would have blocked). | Solo dev iterating fast; previewing what transparent mode would block without breaking the workflow. |
+| `transparent` | ALLOW verdicts forward to the upstream and stream the real reply back. DENY verdicts return a PG `ErrorResponse` (SQLSTATE `42501`) to the client and the **upstream is never contacted** — the statement does not execute. | Locked-down environments; lower-trust agents; compliance deploys. |
 
-Switch with `--mode cooperative` or `--mode transparent`.
+Switch with `--mode cooperative` or `--mode transparent`. (With no
+`--upstream` set, dbounce runs observation-only in either mode: it
+parses + audit-logs + returns a synthetic `ReadyForQuery`, and nothing
+executes.)
 
 ---
 
@@ -190,18 +331,24 @@ Start the wire-protocol listener.
 - `--host 127.0.0.1` — interface to bind. Binding to anything else
   requires `--i-know-this-binds-externally` to acknowledge the
   credential-handling threat surface.
-- `--mgmt-port 8768` — management HTTP port (`/healthz` only in
-  D-Slice 1).
+- `--mgmt-port 8768` — management HTTP port (`/healthz` +
+  `/admin/dynamic-denies/reload`).
 - `--mode cooperative|transparent` — see "Operating modes".
 - `--default-policy allow|deny` — what transparent mode does when no
-  rule matches. D-Slice 1 has no rules; this flag is scaffolding for
-  D-Slice 3.
-- `--upstream postgres://...` — upstream PG URL. Captured + audit-
-  logged in D-Slice 1; forwarding is wired in D-Slice 2.
+  profile/rule matches a statement.
+- `--upstream postgres://...` — upstream DB URL. When set, dbounce
+  forwards ALLOW verdicts here and streams the real reply back; in
+  transparent mode DENY verdicts are blocked before this is contacted.
+  With no `--upstream`, dbounce runs observation-only.
+- `--allow-internal-upstream` — opt-in to a loopback / RFC1918 /
+  `.local` upstream (refused by default to prevent SSRF when the
+  upstream URL comes from untrusted config). Use for local-PG dev.
 - `--db PATH` — SQLite audit DB path (default
   `~/.dbounce/state.db`, override with `DBOUNCE_DB`).
-- `--dialect postgres` — wire-protocol dialect. Only `postgres`
-  recognized in D-Slice 1.
+- `--dialect postgres|mysql|snowflake|bigquery` — wire-protocol
+  dialect. `postgres` + `mysql` run as native wire-protocol proxies;
+  `snowflake` + `bigquery` use the JDBC-driver-shim (`dbounce run`
+  fails fast for those with a pointer to docs/SHIM-INTEGRATION.md).
 - `--preset security-observe` — single-flag shortcut for the
   canonical security-team observation deployment shape (transparent
   mode + JSONL audit + 30s heartbeat + 30s audit-export health
@@ -432,8 +579,11 @@ cd dbounce
 go build ./... && go vet ./... && go test ./...
 ```
 
-All tests are pure-Go and use a temp-directory SQLite DB per test — no
-real PostgreSQL needed for D-Slice 1.
+Tests are pure-Go and use a temp-directory SQLite DB per test, so the
+default suite needs no real database. Forwarding/enforcement is covered
+by `internal/proxy/forwarding_integration_test.go` against an in-process
+mock upstream; see `compose.test.yaml` for the optional real-PostgreSQL
+integration harness.
 
 ---
 
@@ -442,12 +592,14 @@ real PostgreSQL needed for D-Slice 1.
 ```
 dbounce/
   cmd/dbounce/                 # canonical binary (calls internal/cli.Main)
-  community-profiles/          # opt-in profiles installed via `dbounce profile install` (D-Slice 7)
-  internal/cli/                # cobra command tree
-  internal/parser/             # PG wire-protocol message parser
-  internal/profile/            # environment profiles (D-Slice 7)
-  internal/proxy/              # TCP listener + decision pipeline
-  internal/rules/              # global rule table (D-Slice 3)
+  community-profiles/          # opt-in profiles installed via `dbounce profile install`
+  internal/cli/                # cobra command tree (run / audit / mcp / profile / rules / …)
+  internal/mcp/                # MCP-over-stdio server (dbounce_* tool family)
+  internal/mcpinstall/         # `dbounce mcp install-*` + show-config / list-tools
+  internal/parser/             # SQL wire-protocol message parser (AST-aware)
+  internal/profile/            # environment profiles + safe-default
+  internal/proxy/              # wire-protocol listener + forwarding + enforcement
+  internal/rules/              # global rule table
   internal/store/              # SQLite audit + rules + tasks + pauses + prompts
   go.mod
   README.md

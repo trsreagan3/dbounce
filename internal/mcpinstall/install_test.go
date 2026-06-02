@@ -115,6 +115,36 @@ func TestInstallCodex_JSONPathInstalls(t *testing.T) {
 	assert.NotNil(t, parsed["mcpServers"].(map[string]any)["dbounce"])
 }
 
+func TestInstallDevin_PrintsCloudRecipe(t *testing.T) {
+	// install-devin is a cloud-agent recipe: no local config file is
+	// written, and the recipe MUST steer the operator to a HOST address
+	// (NOT 127.0.0.1) because Devin's sandbox can't see local loopback.
+	out := &bytes.Buffer{}
+	res, err := InstallDevin(Options{Out: out})
+	require.NoError(t, err)
+
+	assert.True(t, res.Manual, "Devin install is a manual recipe, not a file write")
+	assert.Empty(t, res.Path, "install-devin must NOT target a local config file")
+
+	body := out.String()
+	// Honest cloud-sandbox limitation surfaced.
+	assert.Contains(t, body, "cloud")
+	// HOST-not-loopback guidance is load-bearing for cloud agents.
+	assert.Contains(t, body, "<bouncer-host>")
+	assert.Contains(t, body, "NOT 127.0.0.1")
+	// SQL connect-mode shape: dbounce on :5433.
+	assert.Contains(t, body, ":5433")
+	// Routable bind requires the external-bind acknowledgement flag.
+	assert.Contains(t, body, "--i-know-this-binds-externally")
+	// PATH B points at the canonical show-config snippet.
+	assert.Contains(t, body, "dbounce mcp show-config")
+
+	// Same load-bearing pieces live on the returned snippet so callers
+	// (and the cli) can surface them without re-running the writer.
+	assert.Contains(t, res.Snippet, "<bouncer-host>")
+	assert.Contains(t, res.Snippet, ":5433")
+}
+
 func TestShowConfig_JSON(t *testing.T) {
 	out := &bytes.Buffer{}
 	require.NoError(t, ShowConfig(out, ShapeJSON))

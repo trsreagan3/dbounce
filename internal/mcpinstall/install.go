@@ -302,6 +302,85 @@ func InstallCodex(opts Options) (*InstallResult, error) {
 	return res, nil
 }
 
+// InstallDevin prints the Devin cloud-agent recipe. Devin runs in
+// Cognition's cloud sandbox: there is NO local config file dbounce can
+// write into, and a bouncer on 127.0.0.1 is NOT reachable from the
+// sandbox. Per [[ibounce-honest-positioning]] the installer surfaces
+// this limitation plainly + prints a recipe instead of pretending it
+// can wire a loopback config.
+//
+// The SQL analog of ibounce's AWS_ENDPOINT_URL / HTTP(S)_PROXY env
+// vars is the database connection string: the agent's DB client must
+// point at dbounce on a HOST address Devin's sandbox can reach
+// (`postgres://...@<bouncer-host>:5433/<db>`), NOT `127.0.0.1`.
+//
+// Mirrors ibounce mcp install-devin: returns a Manual result carrying
+// the recipe text so the caller (cli) + tests can inspect it.
+func InstallDevin(opts Options) (*InstallResult, error) {
+	opts.defaults()
+
+	recipe := devinRecipe()
+	res := &InstallResult{
+		Manual:  true,
+		Snippet: recipe,
+		Reason: "Devin is a cloud-hosted agent (Cognition's sandbox) — there is " +
+			"no local MCP config file dbounce can write into, and a bouncer on " +
+			"127.0.0.1 is NOT visible to the sandbox. Run dbounce on a host Devin " +
+			"can reach and point the agent's DB client at <bouncer-host>:5433.",
+	}
+	fmt.Fprintln(opts.Out, "dbounce mcp install-devin: cloud-agent recipe (no local config file)")
+	fmt.Fprintln(opts.Out, res.Reason)
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprint(opts.Out, recipe)
+	return res, nil
+}
+
+// devinRecipe renders the two-path Devin recipe text. Kept separate so
+// the test can assert on the load-bearing pieces (HOST-not-loopback
+// guidance, the :5433 connect string shape, the MCP show-config
+// pointer) without re-running the whole installer.
+func devinRecipe() string {
+	var b strings.Builder
+	b.WriteString("PATH A — connect mode (today's supported path for SQL):\n")
+	b.WriteString("  1. On a host Devin's sandbox can reach (NOT 127.0.0.1 — Devin\n")
+	b.WriteString("     runs in a cloud sandbox and cannot see your local loopback),\n")
+	b.WriteString("     start dbounce bound to a routable interface:\n")
+	b.WriteString("\n")
+	b.WriteString("       dbounce run \\\n")
+	b.WriteString("         --dialect postgres \\\n")
+	b.WriteString("         --upstream postgres://user:pass@db-host:5432/mydb \\\n")
+	b.WriteString("         --host 0.0.0.0 --port 5433 \\\n")
+	b.WriteString("         --i-know-this-binds-externally \\\n")
+	b.WriteString("         --mode transparent --profile safe-default\n")
+	b.WriteString("\n")
+	b.WriteString("  2. In the Devin UI (task env vars / repo config), point the\n")
+	b.WriteString("     agent's DB client at dbounce on the routable host:\n")
+	b.WriteString("\n")
+	b.WriteString("       DATABASE_URL=postgres://user:pass@<bouncer-host>:5433/mydb\n")
+	b.WriteString("\n")
+	b.WriteString("     Every statement Devin runs now traverses dbounce: parsed,\n")
+	b.WriteString("     audit-logged, and (transparent mode) out-of-profile writes\n")
+	b.WriteString("     are denied with SQLSTATE 42501 before they reach the DB.\n")
+	b.WriteString("\n")
+	b.WriteString("PATH B — MCP server (when Devin supports MCP):\n")
+	b.WriteString("  Devin's MCP config is set via the Devin UI (Settings > MCP\n")
+	b.WriteString("  Servers or equivalent). Add the snippet from:\n")
+	b.WriteString("\n")
+	b.WriteString("       dbounce mcp show-config\n")
+	b.WriteString("\n")
+	b.WriteString("  pointed at a `dbounce mcp serve` running on the same routable\n")
+	b.WriteString("  host as the proxy (same --db + --profiles-path).\n")
+	b.WriteString("\n")
+	b.WriteString("Networking limitation (honest, not a bug): dbounce never requires\n")
+	b.WriteString("root or a transparent OS-level proxy. For a cloud agent, the\n")
+	b.WriteString("operator-set DB connection string is the correct injection point —\n")
+	b.WriteString("the bouncer MUST live on a host the sandbox can route to.\n")
+	b.WriteString("\n")
+	b.WriteString("Verify: after a Devin DB call, check the bouncer host:\n")
+	b.WriteString("       dbounce audit tail --limit 20\n")
+	return b.String()
+}
+
 // ---------------------------------------------------------------------
 // Shared JSON-merge install.
 // ---------------------------------------------------------------------
@@ -522,6 +601,7 @@ func ShowConfig(w io.Writer, shape Shape) error {
 		"#   dbounce mcp install-claude-code\n" +
 		"#   dbounce mcp install-cursor\n" +
 		"#   dbounce mcp install-codex\n" +
+		"#   dbounce mcp install-devin   (cloud-agent recipe)\n" +
 		"#\n" +
 		"# Agent attribution (#366 / §A35): the " + AgentNameEnvVar + " +\n" +
 		"# " + AgentSessionIDEnvVar + " env vars wire the agent's\n" +
