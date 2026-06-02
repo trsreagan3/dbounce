@@ -9,6 +9,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,7 +45,145 @@ func newLogsCmd() *cobra.Command {
 	cmd.AddCommand(newLogsPurgeCmd())
 	cmd.AddCommand(newLogsArchiveCmd())
 	cmd.AddCommand(newLogsVerifyCmd())
+	cmd.AddCommand(newLogsVerifyChainCmd())
 	return cmd
+}
+
+// newLogsVerifyChainCmd wires the tamper-evident hash-chain + signed
+// Ed25519 manifest verifier (ADOPT-10/#734) into the operator CLI. The
+// per-file `logs verify` only checks gzip/JSONL well-formedness; THIS
+// command re-hashes the chain end-to-end (catching in-place edits,
+// reordering, mid-chain deletion) and, with --manifest, verifies every
+// signed manifest + cross-checks the chain head against the latest
+// manifest (catching TAIL TRUNCATION the chain alone can't). Non-zero
+// exit on any inconsistency so an incident-response runbook / CI can
+// gate on it. Per [[ibounce-honest-positioning]] it surfaces EVERY
+// finding rather than stopping at the first.
+func newLogsVerifyChainCmd() *cobra.Command {
+	var (
+		auditLog     string
+		withManifest bool
+		publicKeyB64 string
+		asJSON       bool
+	)
+	cmd := &cobra.Command{
+		Use:   "verify-chain",
+		Short: "Verify the tamper-evident hash-chain + signed manifests",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			dir := defaultLogDir(auditLog)
+			return runVerifyChain(cmd, dir, withManifest, publicKeyB64, asJSON)
+		},
+	}
+	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Path to the active audit.jsonl.")
+	cmd.Flags().BoolVar(&withManifest, "manifest", false, "Also verify Ed25519-signed manifests + cross-check the chain head (tail-truncation detection).")
+	cmd.Flags().StringVar(&publicKeyB64, "public-key", "", "Pin an out-of-band base64url Ed25519 public key instead of trusting the manifest's embedded key (only with --manifest).")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit JSON.")
+	return cmd
+}
+
+// runVerifyChain is the shared verify-chain implementation. Kept in
+// logs.go (per-repo CLI) but byte-for-byte identical logic across the
+// bouncers; only the package's product wiring differs.
+func runVerifyChain(cmd *cobra.Command, dir string, withManifest bool, publicKeyB64 string, asJSON bool) error {
+	out := cmd.OutOrStdout()
+	if withManifest {
+		res, err := audit.VerifyChainAndManifests(dir, publicKeyB64)
+		if err != nil {
+			return err
+		}
+		if asJSON {
+			if encErr := json.NewEncoder(out).Encode(res); encErr != nil {
+				return encErr
+			}
+			if !res.OK() {
+				return fmt.Errorf("verify-chain: tamper detected")
+			}
+			return nil
+		}
+		printChainResult(out, dir, res.Chain)
+		printManifestResults(out, res)
+		if !res.OK() {
+			return fmt.Errorf("verify-chain: tamper detected (see findings above)")
+		}
+		return nil
+	}
+	// Chain-only.
+	stateMissing := false
+	if _, statErr := os.Stat(audit.StatePath(dir)); statErr != nil {
+		stateMissing = true
+	}
+	res, err := audit.VerifyChain(dir, stateMissing)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		if encErr := json.NewEncoder(out).Encode(res); encErr != nil {
+			return encErr
+		}
+		if !res.OK() {
+			return fmt.Errorf("verify-chain: tamper detected")
+		}
+		return nil
+	}
+	printChainResult(out, dir, res)
+	if !res.OK() {
+		return fmt.Errorf("verify-chain: tamper detected (see findings above)")
+	}
+	return nil
+}
+
+func printChainResult(out io.Writer, dir string, res audit.VerifyResult) {
+	if res.OK() {
+		head := chainHeadString(res)
+		fmt.Fprintf(out, "chain OK: %d event(s) across %d file(s) in %s%s\n",
+			res.EventsChecked, res.FilesChecked, dir, head)
+		if res.StateFileMissingAtStart {
+			fmt.Fprintln(out, "note: chain-state file was absent at start (a fresh / re-anchored chain — verified clean from genesis).")
+		}
+		return
+	}
+	fmt.Fprintf(out, "TAMPER DETECTED: %d inconsistenc(ies) in %s (checked %d event(s) across %d file(s))%s\n",
+		len(res.Inconsistencies), dir, res.EventsChecked, res.FilesChecked, chainHeadString(res))
+	for _, inc := range res.Inconsistencies {
+		seq := "?"
+		if inc.Seq != nil {
+			seq = fmt.Sprintf("%d", *inc.Seq)
+		}
+		fmt.Fprintf(out, "  seq=%s %s:%d — %s\n", seq, inc.Source, inc.LineNumber, inc.Reason)
+	}
+}
+
+func chainHeadString(res audit.VerifyResult) string {
+	if res.HeadSeq == nil || res.HeadHash == nil {
+		return ""
+	}
+	return fmt.Sprintf(" (head seq=%d hash=%s)", *res.HeadSeq, *res.HeadHash)
+}
+
+func printManifestResults(out io.Writer, res audit.FullVerifyResult) {
+	if res.ManifestsFound == 0 {
+		fmt.Fprintln(out, "manifests: none found (no signed checkpoints yet — tail-truncation detection is unavailable until the first manifest is emitted).")
+		return
+	}
+	fmt.Fprintf(out, "manifests: %d found\n", res.ManifestsFound)
+	for _, m := range res.Manifests {
+		sig := "OK"
+		if !m.SignatureOK {
+			sig = "FAIL"
+		}
+		fmt.Fprintf(out, "  %s [seq %d..%d] signature: %s\n", m.Path, m.SeqStart, m.SeqEnd, sig)
+		if !m.SignatureOK && m.SignatureFail != "" {
+			fmt.Fprintf(out, "    signature failure: %s\n", m.SignatureFail)
+		}
+		if m.CrossChecked {
+			if m.CrossCheckOK {
+				fmt.Fprintf(out, "    chain-head cross-check: OK (manifest pins the current chain head)\n")
+			} else {
+				fmt.Fprintf(out, "    chain-head cross-check: FAIL — %s\n", m.CrossCheckFail)
+			}
+		}
+	}
 }
 
 func newLogsPurgeCmd() *cobra.Command {

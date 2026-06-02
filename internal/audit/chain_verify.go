@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -149,6 +150,145 @@ func VerifyChain(logDir string, stateFileMissing bool) (VerifyResult, error) {
 		closeFn()
 	}
 	return res, nil
+}
+
+// ManifestCheck is the result of verifying one signed manifest +
+// cross-checking it against the chain head computed by VerifyChain.
+type ManifestCheck struct {
+	Path          string `json:"path"`
+	SeqStart      int64  `json:"seq_start"`
+	SeqEnd        int64  `json:"seq_end"`
+	HeadHash      string `json:"head_hash"`
+	SignatureOK   bool   `json:"signature_ok"`
+	SignatureFail string `json:"signature_fail,omitempty"`
+	// CrossCheck is the manifest-vs-chain-head reconciliation. It is
+	// only meaningful for the LATEST manifest (seq_end == chain head
+	// seq): a signed manifest pins the chain head's (seq, hash), so a
+	// mismatch there is tail-truncation / fork evidence. Manifests for
+	// earlier checkpoints (seq_end < head) are not cross-checked
+	// against the head (their covered head hash is mid-chain, not the
+	// current head) — only their signature is asserted.
+	CrossChecked   bool   `json:"cross_checked"`
+	CrossCheckOK   bool   `json:"cross_check_ok"`
+	CrossCheckFail string `json:"cross_check_fail,omitempty"`
+}
+
+// OK reports whether this manifest's signature verified AND (when
+// cross-checked) its pinned head matched the chain head.
+func (m ManifestCheck) OK() bool {
+	if !m.SignatureOK {
+		return false
+	}
+	if m.CrossChecked && !m.CrossCheckOK {
+		return false
+	}
+	return true
+}
+
+// FullVerifyResult aggregates a VerifyChain run with the verification +
+// chain-head cross-check of every signed manifest found under logDir.
+// This is what the operator-facing `logs verify-chain` command reports.
+type FullVerifyResult struct {
+	Chain          VerifyResult    `json:"chain"`
+	Manifests      []ManifestCheck `json:"manifests"`
+	ManifestsFound int             `json:"manifests_found"`
+}
+
+// OK reports whether the chain verified clean AND every manifest
+// verified + cross-checked clean.
+func (r FullVerifyResult) OK() bool {
+	if !r.Chain.OK() {
+		return false
+	}
+	for _, m := range r.Manifests {
+		if !m.OK() {
+			return false
+		}
+	}
+	return true
+}
+
+// VerifyChainAndManifests runs VerifyChain over logDir, then loads +
+// verifies every signed manifest under logDir/manifests/ and
+// cross-checks the LATEST manifest (the one whose seq_end equals the
+// chain head seq) against the chain head's (seq, hash). The hash chain
+// catches in-place edits / reordering / mid-chain deletion; the signed
+// manifest catches TAIL TRUNCATION (rows lopped off the end) that the
+// chain alone cannot, because a truncated chain is still internally
+// consistent. publicKeyOverrideB64 (optional) pins an out-of-band key
+// instead of trusting the manifest's embedded key.
+//
+// This is the operator entrypoint for an incident-response runbook:
+// one call surfaces EVERY inconsistency per [[ibounce-honest-positioning]].
+func VerifyChainAndManifests(logDir string, publicKeyOverrideB64 string) (FullVerifyResult, error) {
+	stateMissing := false
+	if _, err := os.Stat(StatePath(logDir)); err != nil {
+		stateMissing = true
+	}
+	chainRes, err := VerifyChain(logDir, stateMissing)
+	if err != nil {
+		return FullVerifyResult{}, err
+	}
+	full := FullVerifyResult{Chain: chainRes}
+
+	paths := ListManifests(logDir)
+	full.ManifestsFound = len(paths)
+	for _, p := range paths {
+		m, lerr := LoadManifestFile(p)
+		if lerr != nil {
+			full.Manifests = append(full.Manifests, ManifestCheck{
+				Path:          p,
+				SignatureOK:   false,
+				SignatureFail: lerr.Error(),
+			})
+			continue
+		}
+		mc := ManifestCheck{
+			Path:     p,
+			SeqStart: m.SeqStart,
+			SeqEnd:   m.SeqEnd,
+			HeadHash: m.HeadHash,
+		}
+		ok, reason := VerifyManifest(m, publicKeyOverrideB64)
+		mc.SignatureOK = ok
+		if !ok {
+			mc.SignatureFail = reason
+		}
+		// Cross-check ONLY the manifest that pins the current chain
+		// head. A manifest whose seq_end matches the chain head seq
+		// MUST agree on the head hash, or the chain has been truncated
+		// / forked since that manifest was signed.
+		if chainRes.HeadSeq != nil && m.SeqEnd == *chainRes.HeadSeq {
+			mc.CrossChecked = true
+			if chainRes.HeadHash != nil && m.HeadHash == *chainRes.HeadHash {
+				mc.CrossCheckOK = true
+			} else {
+				headHash := "<nil>"
+				if chainRes.HeadHash != nil {
+					headHash = *chainRes.HeadHash
+				}
+				mc.CrossCheckFail = fmt.Sprintf(
+					"manifest pins head seq=%d hash=%s but the chain head hash is %s — "+
+						"the log was truncated or forked after this manifest was signed",
+					m.SeqEnd, m.HeadHash, headHash)
+			}
+		} else if chainRes.HeadSeq != nil && m.SeqEnd > *chainRes.HeadSeq {
+			// The manifest covers a seq BEYOND the chain head: the log
+			// is missing rows the signed manifest proves once existed —
+			// unambiguous tail truncation.
+			mc.CrossChecked = true
+			head := int64(-1)
+			if chainRes.HeadSeq != nil {
+				head = *chainRes.HeadSeq
+			}
+			mc.CrossCheckFail = fmt.Sprintf(
+				"manifest pins head seq=%d but the chain only reaches seq=%d — "+
+					"%d row(s) were truncated from the tail of the log",
+				m.SeqEnd, head, m.SeqEnd-head)
+		}
+		full.Manifests = append(full.Manifests, mc)
+	}
+	return full, nil
 }
 
 // chainSourceFiles returns rotated archives (audit-*.jsonl.gz, sorted)

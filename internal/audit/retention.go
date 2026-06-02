@@ -90,7 +90,20 @@ var defaultPIIPatterns = []piiPattern{
 	{"bearer_token", regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._\-]+`)},
 	{"jwt", regexp.MustCompile(`eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}`)},
 	{"email", regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)},
+	// AWS secret access key: a 40-char base64-ish blob. Python uses
+	// \b[A-Za-z0-9/+]{40}\b; RE2 has no \b, so awsSecretKeyRedact()
+	// approximates the word boundary with explicit (^|[^...])/($|[^...])
+	// guards + a capture group so only the 40-char run is replaced (not
+	// the surrounding boundary chars). Kept LAST so the more specific
+	// AKIA/ASIA + JWT patterns claim their text first. See
+	// awsSecretKeyRedact for why this needs bespoke handling.
+	{kind: "aws_secret_access_key", re: regexp.MustCompile(`(^|[^A-Za-z0-9/+])([A-Za-z0-9/+]{40})($|[^A-Za-z0-9/+])`)},
 }
+
+// awsSecretKeyKind is the redaction kind for the bespoke secret-key
+// pattern, matched here so redactString can route it to the
+// boundary-preserving replacer.
+const awsSecretKeyKind = "aws_secret_access_key"
 
 func redactionPlaceholder(kind string) string {
 	return "[REDACTED:" + kind + "]"
@@ -181,6 +194,14 @@ func RedactEventPII(event map[string]any, policy RetentionPolicy) map[string]any
 
 func redactString(s string, patterns []piiPattern) string {
 	for _, p := range patterns {
+		if p.kind == awsSecretKeyKind {
+			// Boundary-preserving replace: the regex captures the
+			// non-secret guard chars in groups 1 + 3 (RE2 has no \b), so
+			// emit them verbatim and replace only the 40-char run
+			// (group 2). $1/$3 may be empty at string start/end.
+			s = p.re.ReplaceAllString(s, "$1"+redactionPlaceholder(p.kind)+"$3")
+			continue
+		}
 		s = p.re.ReplaceAllString(s, redactionPlaceholder(p.kind))
 	}
 	return s

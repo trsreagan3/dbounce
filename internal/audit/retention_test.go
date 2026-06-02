@@ -5,15 +5,16 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestRetention_FrameworkDefaultsMatchPython(t *testing.T) {
 	cases := []struct {
-		fw                       string
-		hot, warm, cold, purge   int
-		gdpr                     bool
+		fw                     string
+		hot, warm, cold, purge int
+		gdpr                   bool
 	}{
 		{FrameworkPCI, 30, 120, 365, -1, false},
 		{FrameworkHIPAA, 30, 210, 2190, 2190, false},
@@ -158,5 +159,53 @@ func TestRetention_GDPRPIIScrub(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(s), []byte("[REDACTED:email]")) {
 		t.Fatalf("expected redaction placeholder, got: %s", s)
+	}
+}
+
+// TestRetention_AWSSecretKeyRedacted pins HIGH-1: the 40-char AWS
+// secret-access-key pattern (Python's \b[A-Za-z0-9/+]{40}\b) MUST be
+// redacted under a GDPR policy. RE2 has no \b, so the Go port uses a
+// boundary-preserving capture-group form; this test proves a real
+// 40-char secret IS scrubbed while ordinary prose is NOT over-redacted.
+func TestRetention_AWSSecretKeyRedacted(t *testing.T) {
+	p, _ := PolicyForFramework(FrameworkGDPR, nil, nil, nil, nil, nil)
+
+	// A canonical AWS secret access key is exactly 40 base64-ish chars.
+	const secret40 = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKE1" // 40 chars
+	if len(secret40) != 40 {
+		t.Fatalf("test fixture must be exactly 40 chars; got %d", len(secret40))
+	}
+
+	ev := map[string]any{
+		"unmapped": map[string]any{"iam_jit": map[string]any{
+			"creds": "aws_secret_access_key=" + secret40,
+		}},
+	}
+	RedactEventPII(ev, p)
+	got := ev["unmapped"].(map[string]any)["iam_jit"].(map[string]any)["creds"].(string)
+	if strings.Contains(got, secret40) {
+		t.Fatalf("40-char AWS secret key was NOT redacted: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED:aws_secret_access_key]") {
+		t.Fatalf("expected [REDACTED:aws_secret_access_key] placeholder; got: %q", got)
+	}
+	// The '=' boundary char preceding the secret must be preserved (the
+	// capture-group replacement only swaps the 40-char run).
+	if !strings.Contains(got, "aws_secret_access_key=") {
+		t.Fatalf("boundary context was clobbered; got: %q", got)
+	}
+
+	// False-positive guard: realistic prose with short words + a long
+	// sentence (but no single 40-char [A-Za-z0-9/+] run) must NOT be
+	// redacted. Spaces break the run, so this is safe.
+	ev2 := map[string]any{
+		"unmapped": map[string]any{"iam_jit": map[string]any{
+			"note": "The quick brown fox jumps over the lazy sleeping dog today",
+		}},
+	}
+	RedactEventPII(ev2, p)
+	note := ev2["unmapped"].(map[string]any)["iam_jit"].(map[string]any)["note"].(string)
+	if strings.Contains(note, "[REDACTED") {
+		t.Fatalf("ordinary prose was over-redacted: %q", note)
 	}
 }
