@@ -1,0 +1,25 @@
+# Dockerfile.goreleaser — minimal runtime image for goreleaser Docker builds.
+#
+# goreleaser builds the binary externally (cross-compiled for the target
+# platform) and then runs this Dockerfile with the binary already copied
+# into the build context. We use distroless/static (same base as the
+# multi-stage Dockerfile) so the runtime surface is identical.
+#
+# dbounce is a CGO binary (pg_query_go wraps libpg_query / C); the CI build
+# uses CGO_ENABLED=1 with -extldflags '-static' so the binary is statically
+# linked against musl and runs on distroless/static without a libc dependency.
+#
+# Unlike Dockerfile, this does NOT have a builder stage — goreleaser owns
+# the build step. Only the runtime stage lives here.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# OCI labels are injected via --label flags in .goreleaser.yaml build_flag_templates.
+COPY dbounce /usr/local/bin/dbounce
+
+EXPOSE 5433
+EXPOSE 8768
+
+HEALTHCHECK NONE
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/dbounce"]
+CMD ["--help"]
