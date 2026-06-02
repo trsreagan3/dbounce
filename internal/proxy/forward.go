@@ -829,7 +829,27 @@ func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload
 		TaskID:           dec.TaskID,
 	}
 
-	if dec.Verdict == VerdictDeny && f.srv.cfg.Mode == ModeTransparent {
+	// #59 — Phase H PRE-DECISION anomaly enforcement. On a non-deny floor
+	// verdict, SCORE the statement BEFORE forwarding so a block-mode
+	// anomaly can actually DENY. Tighten-only: a deterministic deny is
+	// never consulted (never loosened). A tighten flips the verdict to
+	// deny + routes through the enforced-deny path below regardless of
+	// mode (mode=block is an explicit enforce opt-in). Fail-soft + no-op
+	// in alert / detection-only / disabled. The baseline OBSERVE stays
+	// post-decision in recordDecision -> exportDecisionRowWithAgent.
+	anomalyTightened := false
+	if dec.Verdict != VerdictDeny &&
+		f.srv.decideAnomalyTighten(row, sqlAnomalyAgent(f.srv, f.sessionID)) {
+		dec.Verdict = VerdictDeny
+		dec.Reason = "anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
+		dec.Source = anomalyDenySource
+		row.DecisionVerdict = string(VerdictDeny)
+		row.DecisionReason = dec.Reason
+		row.DecisionSource = dec.Source
+		anomalyTightened = true
+	}
+
+	if dec.Verdict == VerdictDeny && (f.srv.cfg.Mode == ModeTransparent || anomalyTightened) {
 		// #203 sync-prompt-on-deny: BLOCK this goroutine waiting for
 		// the operator's answer BEFORE we commit to denying. If the
 		// operator answers allow (kind=always or kind=profile), we

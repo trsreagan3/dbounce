@@ -158,43 +158,148 @@ func TestDefaultModeAlertsNotBlocks(t *testing.T) {
 	}
 }
 
-// TestBlockModeIsNotEnforcing asserts the HONEST block behavior for
-// this release (#718 finding HIGH-1 + iam-jit#59): the behavioral tap
-// is post-decision, so mode=block does NOT deny — it passes the floor
-// decision through and behaves as alert+flag (the anomaly is flagged +
-// a high-severity OCSF event is emitted for operator action). Block
-// must NOT be advertised as enforcing until pre-decision wiring lands.
-func TestBlockModeIsNotEnforcing(t *testing.T) {
+// primeSpike establishes a baseline + a recent burst on the store so a
+// subsequent Decide/scoreLive call scores the (agent, action, resource)
+// as an anomalous volume spike. Returns the detector ready to Decide.
+func primeSpike(t *testing.T, cfg Config, agent string) *Detector {
+	t.Helper()
+	d := NewDetector(cfg, func(map[string]any) {}, false)
+	base := int64(1_700_000_000)
+	d.Store().withClock(fixedClock(base))
+	// Establish a baseline of steady same-hour traffic.
+	for i := 0; i < 40; i++ {
+		d.Store().Observe(agent, "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i*60))
+	}
+	// A sharp recent burst so the recent-window rate spikes far above the
+	// learned per-hour mean (scoreLive derives this rate from the store).
+	for i := 0; i < 300; i++ {
+		d.Store().Observe(agent, "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i))
+	}
+	return d
+}
+
+// TestBlockModeEnforcesViaPreDecision asserts block-mode ENFORCEMENT
+// through the core Decide path (iam-jit#59): an anomalous request on an
+// allow floor is TIGHTENED to deny + a high-severity event is emitted.
+// (The full live-decision-path proof lives in the per-repo proxy wire
+// test; this exercises the shared tighten logic.)
+func TestBlockModeEnforcesViaPreDecision(t *testing.T) {
 	cfg := mediumEnabledConfig()
 	cfg.Mode = "block"
 	var captured map[string]any
 	d := NewDetector(cfg, func(ev map[string]any) { captured = ev }, false)
-	d.Store().withClock(fixedClock(1_700_000_000))
+	base := int64(1_700_000_000)
+	d.Store().withClock(fixedClock(base))
 	for i := 0; i < 40; i++ {
-		d.Store().Observe("agent-f", "GET", "arn:aws:s3:::prod-bucket/obj", 1_700_000_000-int64(i*60))
+		d.Store().Observe("agent-f", "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i*60))
 	}
-	out := d.Run(RunInput{
-		Action:              "GET",
-		AgentIdentity:       "agent-f",
-		Resource:            "arn:aws:s3:::prod-bucket/obj",
-		ObservedHour:        (time.Unix(1_700_000_000, 0).UTC().Hour() + 12) % 24,
-		ObservedActionCount: 10000,
-		FloorDecision:       "allow",
-		RecordObservation:   true,
+	for i := 0; i < 300; i++ {
+		d.Store().Observe("agent-f", "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i))
+	}
+	out := d.Decide(DecideInput{
+		Action:        "GET",
+		AgentIdentity: "agent-f",
+		Resource:      "arn:aws:s3:::prod-bucket/obj",
+		FloorDecision: "allow",
 	})
-	// Block is NOT enforcing: the floor decision passes through unchanged.
-	if out.Decision != "allow" {
-		t.Fatalf("block mode must NOT deny in this release (post-decision tap); got %q", out.Decision)
+	// Block ENFORCES: allow is tightened to deny.
+	if out.Decision != "deny" || !out.Tightened {
+		t.Fatalf("block mode must TIGHTEN allow->deny on an anomalous request; got decision=%q tightened=%v", out.Decision, out.Tightened)
 	}
-	// ...but the anomaly is still flagged + a high-severity event emitted.
 	if !out.EmittedAlert || captured == nil {
-		t.Fatalf("block mode must still flag + emit a high-severity event for operator action")
+		t.Fatalf("a block-mode deny must emit a high-severity event for the operator")
 	}
 	if out.Anomaly == nil || out.Anomaly.Verdict != VerdictAnomalous {
 		t.Fatalf("expected an anomalous verdict; got %+v", out.Anomaly)
 	}
 	if sev, _ := captured["severity_id"].(int); sev != 4 {
 		t.Fatalf("expected High (4) severity on the emitted event; got %v", captured["severity_id"])
+	}
+}
+
+// TestDecideNeverLoosensDenyFloor is the TIGHTEN-ONLY proof: even with a
+// wildly anomalous request, Decide must NEVER turn a deterministic deny
+// floor into an allow. A deny stays a deny.
+func TestDecideNeverLoosensDenyFloor(t *testing.T) {
+	cfg := mediumEnabledConfig()
+	cfg.Mode = "block"
+	d := primeSpike(t, cfg, "agent-deny")
+	out := d.Decide(DecideInput{
+		Action:        "GET",
+		AgentIdentity: "agent-deny",
+		Resource:      "arn:aws:s3:::prod-bucket/obj",
+		FloorDecision: "deny",
+	})
+	if out.Decision != "deny" {
+		t.Fatalf("Decide must NEVER loosen a deny floor; got %q", out.Decision)
+	}
+	if out.Tightened {
+		t.Fatalf("a deny floor cannot be 'tightened' (it is already maximally restrictive); got tightened=true")
+	}
+}
+
+// TestDecideAlertModeNeverTightens asserts that in alert mode (the
+// default) Decide is a pure pass-through even on an anomalous request:
+// no allow->deny, no emit. Tightening is block-only.
+func TestDecideAlertModeNeverTightens(t *testing.T) {
+	cfg := mediumEnabledConfig() // mode=alert
+	emitted := 0
+	d := NewDetector(cfg, func(map[string]any) { emitted++ }, false)
+	base := int64(1_700_000_000)
+	d.Store().withClock(fixedClock(base))
+	for i := 0; i < 40; i++ {
+		d.Store().Observe("agent-al", "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i*60))
+	}
+	for i := 0; i < 300; i++ {
+		d.Store().Observe("agent-al", "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i))
+	}
+	out := d.Decide(DecideInput{
+		Action:        "GET",
+		AgentIdentity: "agent-al",
+		Resource:      "arn:aws:s3:::prod-bucket/obj",
+		FloorDecision: "allow",
+	})
+	if out.Decision != "allow" || out.Tightened {
+		t.Fatalf("alert mode Decide must pass allow through untouched; got decision=%q tightened=%v", out.Decision, out.Tightened)
+	}
+	if emitted != 0 {
+		t.Fatalf("alert-mode Decide must not emit (alerting is the observe path's job); emitted=%d", emitted)
+	}
+}
+
+// TestDecideDetectionOnlyNeverTightens asserts detection-only forces a
+// pass-through in Decide even when cfg.Mode == block.
+func TestDecideDetectionOnlyNeverTightens(t *testing.T) {
+	cfg := mediumEnabledConfig()
+	cfg.Mode = "block"
+	d := NewDetector(cfg, func(map[string]any) {}, true) // detectionOnly
+	base := int64(1_700_000_000)
+	d.Store().withClock(fixedClock(base))
+	for i := 0; i < 40; i++ {
+		d.Store().Observe("agent-do", "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i*60))
+	}
+	for i := 0; i < 300; i++ {
+		d.Store().Observe("agent-do", "GET", "arn:aws:s3:::prod-bucket/obj", base-int64(i))
+	}
+	out := d.Decide(DecideInput{
+		Action:        "GET",
+		AgentIdentity: "agent-do",
+		Resource:      "arn:aws:s3:::prod-bucket/obj",
+		FloorDecision: "allow",
+	})
+	if out.Decision != "allow" || out.Tightened {
+		t.Fatalf("detection-only must never tighten; got decision=%q tightened=%v", out.Decision, out.Tightened)
+	}
+}
+
+// TestDecideDisabledNoOp asserts a disabled detector's Decide is a
+// pass-through (default-off preserved).
+func TestDecideDisabledNoOp(t *testing.T) {
+	cfg := DefaultConfig() // disabled
+	d := NewDetector(cfg, func(map[string]any) { t.Fatal("disabled detector emitted from Decide") }, false)
+	out := d.Decide(DecideInput{Action: "GET", AgentIdentity: "x", FloorDecision: "allow"})
+	if out.Decision != "allow" || out.Tightened {
+		t.Fatalf("disabled Decide must pass allow through; got decision=%q tightened=%v", out.Decision, out.Tightened)
 	}
 }
 

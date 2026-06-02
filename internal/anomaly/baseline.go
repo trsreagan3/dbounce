@@ -308,6 +308,15 @@ func (s *BaselineStore) RecentRate(agentIdentity, action, resource string, nowUn
 // nowUnixLocked is nowUnix for callers already holding s.mu.
 func (s *BaselineStore) nowUnixLocked() int64 { return s.clock().UTC().Unix() }
 
+// NowUTC returns the store clock's current time in UTC. Exported so the
+// pre-decision Decide path can derive hour-of-day from the same clock
+// the baseline uses (honoring an injected test clock). Thread-safe.
+func (s *BaselineStore) NowUTC() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clock().UTC()
+}
+
 // SummaryFor computes the per-dimension summary the detector consumes.
 // Ports BaselineStore.summary_for: a rolling-window exact view +
 // decay-weighted aggregates (suffixed "_decayed"). nowUnix<=0 uses the

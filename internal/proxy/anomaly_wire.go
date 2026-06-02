@@ -125,6 +125,57 @@ func leadingSQLVerb(statement string) string {
 	return ""
 }
 
+// anomalyDenySource is the canonical DecisionSource stamped on a
+// decision when mode=block tightens an anomalous statement (iam-jit#59).
+const anomalyDenySource = "anomaly_block"
+
+// anomalyDetectorWired reports whether an enabled detector is installed.
+func (s *Server) anomalyDetectorWired() bool {
+	return s.anomalyDetector != nil && s.anomalyDetector.Enabled()
+}
+
+// decideAnomalyTighten is the PRE-DECISION enforcement check (iam-jit#59)
+// for dbounce. Consulted in the live forwarder ONLY on a non-deny floor
+// verdict, BEFORE the statement is forwarded to the upstream DB. In
+// mode=block an anomalous statement-shape / table / volume deviation
+// TIGHTENS allow->deny: it returns true (the high-severity OCSF event
+// having already been emitted by the core Decide via the bound emitter),
+// and the caller routes the statement through the enforced-deny path.
+//
+// The signals are extracted IDENTICALLY to observeAnomaly's
+// sqlAnomalySignals (statement-type + mutating-node + leading verb shape;
+// first table touched) so the pre-decision score + the post-decision
+// observe share the same per-agent baseline key. Privacy preserved: only
+// structural verb shapes + table name, never statement text/literals.
+//
+// TIGHTEN-ONLY: the core Detector.Decide refuses to loosen a deny floor
+// and only mode=block (not detection-only) tightens. FAIL-SOFT: a
+// nil/disabled detector returns false; the core never panics; a scoring
+// hiccup degrades to the floor (allow) so this can never spuriously deny
+// or break the connection.
+func (s *Server) decideAnomalyTighten(row store.DecisionRow, agentIdentity string) (tightened bool) {
+	if !s.anomalyDetectorWired() {
+		return false
+	}
+	// DEFENSIVE RECOVER: if the core scoring path panics, degrade to the
+	// FLOOR decision (allow stays allow). A panic must never crash the
+	// hot path or spuriously deny a SQL statement. tightened is false by
+	// default; the named return ensures the caller sees "not tightened".
+	defer func() {
+		if recover() != nil {
+			tightened = false
+		}
+	}()
+	action, resource := sqlAnomalySignals(row)
+	out := s.anomalyDetector.Decide(anomaly.DecideInput{
+		Action:        action,
+		AgentIdentity: agentIdentity,
+		Resource:      resource,
+		FloorDecision: "allow", // only consulted on the non-deny branch
+	})
+	return out.Tightened && out.Decision == "deny"
+}
+
 // observeAnomaly observes one decision into the behavioral baseline +
 // scores it. Fail-soft + no-op when the detector is unwired/disabled.
 func (s *Server) observeAnomaly(agentIdentity string, row store.DecisionRow) {
