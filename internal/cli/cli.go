@@ -521,6 +521,7 @@ func newRunCmd() *cobra.Command {
 		// auditLogPath enables the FREE-tier JSONL transport.
 		auditLogPath  string
 		auditLogFsync bool
+		noAuditChain  bool
 		// #311 / §A10 — rotation thresholds. Sentinel -1 = "operator
 		// didn't pass the flag → use the audit-package default
 		// (matches iam-roles/docs/LOG-RETENTION.md)." 0 = "explicitly
@@ -1171,6 +1172,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				auditObjectStorageRotationMinutes,
 				auditObjectStorageMaxSizeMB,
 				auditObjectStorageInstanceID,
+				noAuditChain,
 			)
 			if exporterErr != nil {
 				return exporterErr
@@ -1551,6 +1553,10 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"flushes per-line for compliance-grade durability at ~hundreds "+
 			"of microseconds of additional latency per decision. Has no "+
 			"effect when --audit-log-path is unset.")
+	cmd.Flags().BoolVar(&noAuditChain, "no-audit-chain", false,
+		"Disable the tamper-evident hash-chain + Ed25519-signed manifests on "+
+			"the audit-log JSONL (ADOPT-10/#734; on by default when "+
+			"--audit-log-path is set).")
 	// #311 / §A10 — rotation thresholds. Sentinel -1 = "use audit-pkg
 	// default (matches LOG-RETENTION.md)." 0 = "operator explicitly
 	// disabled this trigger." Same names across all four Bounce
@@ -1902,6 +1908,7 @@ func buildAuditExporter(
 	auditObjectStorageRotationMinutes int,
 	auditObjectStorageMaxSizeMB int,
 	auditObjectStorageInstanceID string,
+	noAuditChain bool,
 ) (*audit.Exporter, error) {
 	// #258 — Security Lake parse-time validation. Bucket without
 	// region (or vice versa) is a misconfiguration; fail-fast so the
@@ -1980,11 +1987,45 @@ func buildAuditExporter(
 		// itself. Surfaced at the run-cmd layer so the operator sees
 		// the resolved value on startup.
 		_ = dbRetentionDays
+		// ADOPT-10 / #734 — tamper-evident hash-chain + signed manifests,
+		// ON BY DEFAULT when audit logging is on (cheap + safe per
+		// [[v1-scope-bar]]). --no-audit-chain disables. Chain state lives
+		// alongside the JSONL; the Ed25519 keypair lives in
+		// ~/.dbounce/audit-keys (override via DBOUNCE_AUDIT_KEYS_DIR).
+		// The private key is never logged or committed.
+		var chain *audit.ChainState
+		var signer *audit.ManifestSigner
+		logDir := audit.ResolveLogDir(logPath)
+		if !noAuditChain && logDir != "" {
+			chain = audit.LoadChainState(logDir, 0)
+			keysDir := os.Getenv("DBOUNCE_AUDIT_KEYS_DIR")
+			if keysDir == "" {
+				if home, herr := os.UserHomeDir(); herr == nil {
+					keysDir = filepath.Join(home, ".dbounce", "audit-keys")
+				}
+			}
+			if keysDir != "" {
+				sg, serr := audit.NewManifestSigner(
+					logDir, "dbounce",
+					audit.DefaultManifestIntervalEvents,
+					keysDir, audit.DefaultKeypairName,
+				)
+				if serr != nil {
+					fmt.Fprintf(os.Stderr,
+						"dbounce: warn: audit-manifest keypair init failed: %v "+
+							"(hash-chain still active; no signed manifests)\n", serr)
+				} else {
+					signer = sg
+				}
+			}
+		}
 		w, err := audit.NewLogWriter(audit.LogOptions{
 			Path:       logPath,
 			Fsync:      logFsync,
 			MaxSizeMB:  effSize,
 			MaxAgeDays: effAge,
+			Chain:      chain,
+			Signer:     signer,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("audit-log writer: %w", err)

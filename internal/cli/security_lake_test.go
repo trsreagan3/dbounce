@@ -18,6 +18,7 @@ func TestSecurityLakeBucketRequiresRegion(t *testing.T) {
 		"127.0.0.1:5433", "", "",
 		"my-bucket", "", "", 0,
 		"", "", "", "", "", 0, 0, "",
+		false,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--security-lake-region")
@@ -32,6 +33,7 @@ func TestSecurityLakeRegionRequiresBucket(t *testing.T) {
 		"127.0.0.1:5433", "", "",
 		"", "us-east-1", "", 0,
 		"", "", "", "", "", 0, 0, "",
+		false,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--security-lake-bucket")
