@@ -37,17 +37,44 @@ func TestMCPCmd_RegistersSubcommands(t *testing.T) {
 }
 
 func TestMCPInstallDevin_PrintsRecipe(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
 	cmd := newMCPCmd()
-	out := &bytes.Buffer{}
-	cmd.SetOut(out)
-	cmd.SetErr(out)
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
 	cmd.SetArgs([]string{"install-devin"})
 	require.NoError(t, cmd.Execute())
-	body := out.String()
+	body := stdout.String()
 	// Cloud-agent recipe: HOST address (not loopback) + :5433 connect.
 	assert.Contains(t, body, "NOT 127.0.0.1")
 	assert.Contains(t, body, ":5433")
+	// PATH A = MCP show-config must come BEFORE PATH B = SQL connect mode.
 	assert.Contains(t, body, "dbounce mcp show-config")
+	pathAIdx := strings.Index(body, "PATH A")
+	pathBIdx := strings.Index(body, "PATH B")
+	assert.True(t, pathAIdx >= 0 && pathBIdx > pathAIdx,
+		"PATH A (MCP) must precede PATH B (SQL) in the output")
+	// Substitute note on stderr when no --devin-host supplied.
+	assert.Contains(t, stderr.String(), "--devin-host")
+}
+
+// TestMCPInstallDevin_DevinHostFlag verifies --devin-host is wired at the
+// cobra level + bakes the concrete host into the DATABASE_URL.
+func TestMCPInstallDevin_DevinHostFlag(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := newMCPCmd()
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.SetArgs([]string{"install-devin", "--devin-host", "10.0.2.5"})
+	require.NoError(t, cmd.Execute())
+	body := stdout.String()
+	assert.Contains(t, body, "10.0.2.5:5433",
+		"--devin-host value must appear in DATABASE_URL")
+	assert.NotContains(t, body, "<bouncer-host>",
+		"placeholder must not appear when --devin-host is given")
+	assert.NotContains(t, stderr.String(), "--devin-host",
+		"no substitute note when a concrete host is given")
 }
 
 func TestMCPShowConfig_JSON(t *testing.T) {

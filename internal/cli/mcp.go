@@ -323,6 +323,7 @@ the same way it does for Claude Code / Cursor.`,
 
 // newMCPInstallDevinCmd implements `dbounce mcp install-devin`.
 func newMCPInstallDevinCmd() *cobra.Command {
+	var devinHost string
 	cmd := &cobra.Command{
 		Use:   "install-devin",
 		Short: "Print the Devin cloud-agent recipe (no local config file)",
@@ -333,22 +334,30 @@ is NOT reachable from the sandbox.
 Per [[ibounce-honest-positioning]] this command does not pretend to
 wire a loopback config — it prints a recipe instead:
 
-  PATH A (connect mode, supported today): run dbounce on a routable
+  PATH A (MCP server, when Devin supports MCP): add the
+          ` + "`dbounce mcp show-config`" + ` snippet via the Devin UI,
+          pointed at a dbounce mcp serve on a routable HOST (not loopback).
+  PATH B (connect mode, supported today): run dbounce on a routable
           HOST address (--host 0.0.0.0 + --i-know-this-binds-externally)
           and point Devin's DB client at <bouncer-host>:5433.
-  PATH B (MCP server, when Devin supports MCP): add the
-          ` + "`dbounce mcp show-config`" + ` snippet via the Devin UI.
 
-This mirrors ` + "`ibounce mcp install-devin`" + ` per [[cross-product-agent-parity]].`,
+Pass --devin-host HOST to bake a concrete reachable address into the
+recipe's DATABASE_URL line (default: <bouncer-host> placeholder).
+
+This mirrors ` + "`ibounce mcp install-devin`" + ` + ` + "`gbounce mcp install-devin`" + ` per [[cross-product-agent-parity]].`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := mcpinstall.InstallDevin(mcpinstall.Options{
-				Out:    cmd.OutOrStdout(),
-				Stderr: cmd.ErrOrStderr(),
+				DevinHost: devinHost,
+				Out:       cmd.OutOrStdout(),
+				Stderr:    cmd.ErrOrStderr(),
 			})
 			return err
 		},
 	}
+	cmd.Flags().StringVar(&devinHost, "devin-host", "",
+		"Reachable dbounce HOST to bake into the recipe's DATABASE_URL / "+
+			"MCP-server address (default: <bouncer-host> placeholder).")
 	return cmd
 }
 
