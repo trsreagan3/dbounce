@@ -355,5 +355,168 @@ func baseToolDescriptors() []map[string]any {
 				"properties": map[string]any{},
 			},
 		},
+		// ------------------------------------------------------------------
+		// Agent-parity tools (#7): scope_self_for_task / end_task /
+		// task_review / list_presets / apply_preset / recommend_rules.
+		// Mirrors kbounce_* equivalents adapted to the SQL domain:
+		// statement-types + table globs instead of K8s verbs + resources.
+		// Per [[cross-product-agent-parity]].
+		// ------------------------------------------------------------------
+		{
+			"name": "dbounce_scope_self_for_task",
+			"description": "Declare an agent task scope. The agent passes a " +
+				"description + the SQL statement-types + the tables it will " +
+				"need; dbounce opens a task that narrows decisions to that " +
+				"declaration. Composes with the task-allow flow in the proxy's " +
+				"decision composition order. Returns the task_id so the agent " +
+				"can end the task later via dbounce_end_task. Per " +
+				"[[creates-never-mutates]]: dbounce CREATES NEW task scopes; " +
+				"it never modifies pre-existing agent identities. Per " +
+				"[[agent-friendly-not-bypassable]]: the task scope is enforced " +
+				"for its duration; the agent cannot bypass it via an alternative " +
+				"client. Per [[cross-product-agent-parity]]: mirrors " +
+				"kbounce_scope_self_for_task adapted to the SQL domain " +
+				"(statement-types + table globs instead of K8s verbs + resources).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"description": map[string]any{
+						"type":        "string",
+						"description": "Human-readable task description (recorded in audit log).",
+					},
+					"statement_types": map[string]any{
+						"type":  "array",
+						"items": map[string]any{"type": "string"},
+						"description": "SQL statement types the task will issue " +
+							"(SELECT, INSERT, UPDATE, DELETE, DML, MUTATING, …). " +
+							"Use `*` for any statement type.",
+					},
+					"tables": map[string]any{
+						"type":  "array",
+						"items": map[string]any{"type": "string"},
+						"description": "Tables (or table globs) the task will touch " +
+							"(e.g. 'public.users', 'public.*', '*'). " +
+							"Each entry is combined with each statement_type " +
+							"to form a rule pattern (e.g. 'SELECT:public.users').",
+					},
+					"schemas": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Optional single schema scope applied to all rules. " +
+							"When one schema is given, every allow rule's schema_scope is " +
+							"set to that value.",
+					},
+					"deny_statement_types": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Statement types the agent KNOWS it should never use " +
+							"during this task (e.g. ['DELETE', 'DROP']). " +
+							"Enforced even if global rules would allow them.",
+					},
+					"duration_minutes": map[string]any{
+						"type":    "integer",
+						"default": 30,
+					},
+				},
+				"required": []string{"description", "statement_types", "tables"},
+			},
+		},
+		{
+			"name": "dbounce_end_task",
+			"description": "End the currently-active task. Records `reason` " +
+				"in the audit log. Mirrors kbounce_end_task adapted to the " +
+				"SQL domain. Per [[cross-product-agent-parity]].",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"reason": map[string]any{
+						"type":    "string",
+						"default": "ended via mcp",
+					},
+				},
+			},
+		},
+		{
+			"name": "dbounce_task_review",
+			"description": "Post-task review summary: total decisions, " +
+				"allow/deny/pause-demoted breakdown, denied-calls list. " +
+				"Mirrors kbounce_task_review adapted to the SQL domain: " +
+				"denied_calls carry (at, statement_type, tables, reason) " +
+				"instead of K8s (verb, resource, namespace). Per " +
+				"[[cross-product-agent-parity]]. Read-only.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"task_id"},
+			},
+		},
+		{
+			"name": "dbounce_list_presets",
+			"description": "List the built-in SQL preset names + descriptions. " +
+				"Read-only. Use to discover what `dbounce_apply_preset` can " +
+				"target. Per [[cross-product-agent-parity]]: mirrors " +
+				"kbounce_list_presets adapted to SQL-shaped rule packs.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			"name": "dbounce_apply_preset",
+			"description": "Apply a curated SQL preset rule pack to the global " +
+				"rules table. Use `dbounce_list_presets` first to see available " +
+				"names. The preset's rules are ADDED (not overwritten) so " +
+				"reapplying produces duplicates — let the operator confirm via " +
+				"`dbounce_list_rules`. Per [[cross-product-agent-parity]]: " +
+				"mirrors kbounce_apply_preset adapted to the SQL domain.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Preset id from `dbounce_list_presets`.",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name": "dbounce_recommend_rules",
+			"description": "Synthesize draft rules from observed audit-log " +
+				"traffic. Returns the rules an operator would get from " +
+				"`dbounce rules recommend --since {since}` WITHOUT applying " +
+				"them. Read-only tool — useful for an agent at the end of " +
+				"a session to suggest 'here are the rules that would narrow " +
+				"your future SQL calls.' Per [[cross-product-agent-parity]]: " +
+				"mirrors kbounce_recommend_rules adapted to the SQL domain: " +
+				"groups by (statement_type, table) instead of (resource, verb). " +
+				"Per [[scorer-is-ground-truth]] + [[no-nl-synthesis]]: " +
+				"deterministic algorithm; no LLM in the synthesis path.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"since": map[string]any{
+						"type": "string",
+						"description": "Window start. Relative ('1h', '24h', '7d') " +
+							"or absolute ISO-8601 ('2026-05-17T00:00:00Z'). " +
+							"Default: whole log.",
+					},
+					"min_support": map[string]any{
+						"type":    "integer",
+						"default": 3,
+						"minimum": 1,
+					},
+					"include_task_scoped": map[string]any{
+						"type":    "boolean",
+						"default": false,
+						"description": "Include task-scoped decisions in the analysis. Off " +
+							"by default: task-scoped decisions are one-off declared " +
+							"sessions and shouldn't auto-promote to permanent rules.",
+					},
+				},
+			},
+		},
 	}
 }
