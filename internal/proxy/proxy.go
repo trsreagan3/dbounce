@@ -33,6 +33,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/trsreagan3/dbounce/internal/anomaly"
 	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/decision"
 	"github.com/trsreagan3/dbounce/internal/dynamicdeny"
@@ -434,6 +435,16 @@ type Server struct {
 	// verdict.
 	alertEngine *audit.RuleEngine
 
+	// #718 ADOPT-4 — Phase H behavioral-deviation / anomaly detector.
+	// Nil disables the channel. When wired (anomaly_detection.enabled),
+	// every decision is observed into a per-agent behavioral baseline +
+	// scored for deviation; an anomalous verdict surfaces a NEUTRAL OCSF
+	// anomaly_detected event. ALERT by default (never blocks) per
+	// [[safety-mode-lean-permissive]].
+	anomalyDetector *anomaly.Detector
+	anomalyMu       sync.Mutex
+	anomalyRecent   []map[string]any
+
 	// agentRegistry is the per-process registry of live agent-session
 	// fingerprints per [[agent-identity-in-audit]]. Each incoming PG /
 	// MySQL TCP connection mints a session id at handshake time + binds
@@ -731,6 +742,14 @@ func (s *Server) exportDecisionRow(row store.DecisionRow, decisionID int64) {
 // the decision — it ONLY decorates the audit-export event for post-hoc
 // SIEM review.
 func (s *Server) exportDecisionRowWithAgent(row store.DecisionRow, decisionID int64, sessionID string) {
+	// #718 ADOPT-4 — Phase H behavioral-deviation tap. Runs INDEPENDENT
+	// of the audit-export / alert engines (it's a separate channel), so
+	// it sits ahead of the exporter/alerts early-return below. Observes
+	// the decision into the per-agent baseline + scores it; an anomalous
+	// verdict surfaces a NEUTRAL signal. Fail-soft + no-op when unwired.
+	// ALERT by default; never blocks per [[safety-mode-lean-permissive]].
+	s.observeAnomaly(sqlAnomalyAgent(s, sessionID), row)
+
 	exporterOn := s.auditExporter != nil && s.auditExporter.Enabled()
 	alertsOn := s.alertEngine != nil && s.alertEngine.Enabled()
 	if !exporterOn && !alertsOn {
@@ -2415,6 +2434,12 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		ChainInitialized bool             `json:"chain_initialized"`
 		AuditChain       map[string]any   `json:"audit_chain"`
 		LlmBudget        HealthzLlmBudget `json:"llm_budget"`
+		// #718 ADOPT-4 — Phase H behavioral-deviation / anomaly detector
+		// status. Always present (enabled:false when unwired) so the
+		// composite monitor key set stays stable per
+		// [[cross-product-agent-parity]]. Visibility surface only; ALERT
+		// by default, never an enforcement signal.
+		Anomaly map[string]any `json:"anomaly"`
 	}{
 		Status:                              "ok",
 		Mode:                                string(s.cfg.Mode),
@@ -2433,6 +2458,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyParseErrors:         denyParseErrs,
 		TotalProfileScopeRefused:            s.ProfileScopeRefusedCount(),
 		LlmBudget:                           HealthzLlmBudget{Enabled: false},
+		Anomaly:                             s.anomalyHealthz(),
 	}
 	// ADOPT-10 / #734 — chain_initialized now reports whether the
 	// tamper-evident hash-chain is ACTUALLY stamping rows (honest
