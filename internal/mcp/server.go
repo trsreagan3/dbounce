@@ -36,14 +36,17 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/parser"
 	"github.com/trsreagan3/dbounce/internal/posture"
+	"github.com/trsreagan3/dbounce/internal/presets"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 	"github.com/trsreagan3/dbounce/internal/rules"
 	"github.com/trsreagan3/dbounce/internal/store"
+	"github.com/trsreagan3/dbounce/internal/tasks"
 )
 
 // ProtocolVersion is the MCP protocol version we advertise. Tracks
@@ -408,6 +411,18 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolProfileAllow(args)
 	case "dbounce_denies_recent":
 		return s.toolDeniesRecent(args)
+	case "dbounce_scope_self_for_task":
+		return s.toolScopeSelfForTask(args)
+	case "dbounce_end_task":
+		return s.toolEndTask(args)
+	case "dbounce_task_review":
+		return s.toolTaskReview(args)
+	case "dbounce_list_presets":
+		return s.toolListPresets(args)
+	case "dbounce_apply_preset":
+		return s.toolApplyPreset(args)
+	case "dbounce_recommend_rules":
+		return s.toolRecommendRules(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
@@ -1119,4 +1134,523 @@ func jsonRawOrNull(raw json.RawMessage) any {
 		return nil
 	}
 	return raw
+}
+
+// ---------------------------------------------------------------------
+// dbounce_scope_self_for_task — agent declares a SQL task scope.
+//
+// Mirrors kbounce_scope_self_for_task (kbouncer/internal/mcp/server.go)
+// adapted to the SQL domain: verbs → SQL statement-types (SELECT,
+// DELETE, DML, MUTATING, …), resources → table / schema globs,
+// namespaces → schema_scope. Per [[creates-never-mutates]]: dbounce
+// CREATES a new task scope; it never mutates an existing one.
+// Per [[cross-product-agent-parity]]: tool name + arg shapes parallel
+// the kbounce surface so a cross-product agent re-uses learned idioms.
+// ---------------------------------------------------------------------
+
+func (s *Server) toolScopeSelfForTask(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	desc := stringArg(args, "description", "")
+	stmtTypes := stringSliceArg(args, "statement_types")
+	tables := stringSliceArg(args, "tables")
+	schemas := stringSliceArg(args, "schemas") // optional: becomes schema_scope on each rule
+	denyTypes := stringSliceArg(args, "deny_statement_types")
+	durationMin := intArg(args, "duration_minutes", 30)
+
+	if len(stmtTypes) == 0 || len(tables) == 0 {
+		return nil, errors.New(
+			"dbounce_scope_self_for_task: at least one statement_type + one table required " +
+				"(use `*` for any statement / any table within the task)")
+	}
+
+	allowRules := make([]rules.ProxyRule, 0, len(stmtTypes)*len(tables))
+	for _, st := range stmtTypes {
+		for _, tbl := range tables {
+			r := rules.ProxyRule{
+				Pattern: st + ":" + tbl,
+				Effect:  rules.EffectAllow,
+				Origin:  rules.OriginTask,
+			}
+			if len(schemas) == 1 {
+				r.SchemaScope = schemas[0]
+			}
+			allowRules = append(allowRules, r)
+		}
+	}
+
+	denyRules := make([]rules.ProxyRule, 0, len(denyTypes))
+	for _, dt := range denyTypes {
+		denyRules = append(denyRules, rules.ProxyRule{
+			Pattern: dt + ":*",
+			Effect:  rules.EffectDeny,
+			Origin:  rules.OriginTask,
+		})
+	}
+
+	scope, err := tasks.BuildScope(desc, allowRules, denyRules, durationMin, s.cfg.Actor, s.cfg.TaskOwner)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cfg.Store.AddTask(scope); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"task_id":      scope.TaskID,
+		"description":  scope.Description,
+		"expires_at":   scope.ExpiresAt,
+		"allow_rule_n": len(scope.AllowRules),
+		"deny_rule_n":  len(scope.DenyRules),
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_end_task — close the currently-active task.
+// Mirrors kbounce_end_task. Part of the task lifecycle exposed by
+// [[cross-product-agent-parity]].
+// ---------------------------------------------------------------------
+
+func (s *Server) toolEndTask(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	reason := stringArg(args, "reason", "ended via mcp")
+	t, err := s.cfg.Store.GetActiveTask(s.cfg.TaskOwner)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return map[string]any{"ended": false, "message": "no active task"}, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ok, err := s.cfg.Store.EndTask(t.TaskID, s.cfg.Actor, reason, tasks.StatusCompleted)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ended": ok, "task_id": t.TaskID}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_task_review — post-task review summary.
+//
+// Mirrors kbounce_task_review adapted to the SQL domain:
+// denied_calls carries (at, statement_type, tables, reason) rather
+// than (verb, resource, namespace). Returns the same top-level shape
+// so a cross-product agent that learned the kbounce surface uses the
+// same field names for the scalar counts.
+// Per [[cross-product-agent-parity]].
+// ---------------------------------------------------------------------
+
+func (s *Server) toolTaskReview(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	taskID := stringArg(args, "task_id", "")
+	if taskID == "" {
+		return nil, errors.New("dbounce_task_review: task_id required")
+	}
+	rev, err := s.cfg.Store.TaskReviewSummary(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if rev == nil {
+		return nil, fmt.Errorf("no task with id %q", taskID)
+	}
+	out := map[string]any{
+		"task_id":              rev.TaskID,
+		"status":               rev.Status,
+		"description":          rev.Description,
+		"started_at":           rev.StartedAt,
+		"ended_at":             rev.EndedAt,
+		"decision_count":       rev.DecisionCount,
+		"allow_count":          rev.AllowCount,
+		"deny_count":           rev.DenyCount,
+		"pause_demoted_count":  rev.PauseDemotedCount,
+		"denied_calls_n":       len(rev.DeniedCalls),
+		"pause_demoted_calls_n": len(rev.PauseDemotedCalls),
+	}
+	if rev.FirstDecisionAt != "" {
+		out["first_decision_at"] = rev.FirstDecisionAt
+	}
+	if rev.LastDecisionAt != "" {
+		out["last_decision_at"] = rev.LastDecisionAt
+	}
+	// Include the first 50 denied calls so the agent can immediately
+	// surface "here are the statements that were blocked during this task"
+	// without requiring a follow-up query. Cap at 50 for the MCP envelope
+	// (the full list is in the store for CLI review).
+	if len(rev.DeniedCalls) > 0 {
+		cap := 50
+		if len(rev.DeniedCalls) < cap {
+			cap = len(rev.DeniedCalls)
+		}
+		calls := make([]map[string]any, 0, cap)
+		for _, c := range rev.DeniedCalls[:cap] {
+			calls = append(calls, map[string]any{
+				"at":             c.At,
+				"statement_type": c.StatementType,
+				"tables":         c.Tables,
+				"reason":         c.Reason,
+			})
+		}
+		out["denied_calls"] = calls
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_list_presets / dbounce_apply_preset — curated SQL rule packs.
+//
+// Mirrors kbounce_list_presets / kbounce_apply_preset adapted to the
+// SQL domain: presets define SQL-shaped patterns (SELECT:*, DML:*,
+// MUTATING:*) rather than K8s verb:resource pairs. apply_preset ADDS
+// rules (never overwrites) per [[creates-never-mutates]] +
+// [[cross-product-agent-parity]].
+// ---------------------------------------------------------------------
+
+func (s *Server) toolListPresets(_ map[string]any) (map[string]any, error) {
+	cat := presets.List()
+	out := make([]map[string]any, 0, len(cat))
+	for _, p := range cat {
+		allow, deny := p.ToProxyRules()
+		out = append(out, map[string]any{
+			"id":          p.ID,
+			"title":       p.Title,
+			"description": p.Description,
+			"rule_count":  len(allow) + len(deny),
+		})
+	}
+	return map[string]any{
+		"presets": out,
+		"count":   len(out),
+	}, nil
+}
+
+func (s *Server) toolApplyPreset(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	id := stringArg(args, "name", "")
+	if id == "" {
+		return nil, errors.New("dbounce_apply_preset: `name` required")
+	}
+	p, ok := presets.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("dbounce_apply_preset: preset %q not found; use dbounce_list_presets to see available names", id)
+	}
+	allow, deny := p.ToProxyRules()
+	all := append(allow, deny...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ruleIDs := make([]int64, 0, len(all))
+	for _, r := range all {
+		rid, err := s.cfg.Store.AddRule(r)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"apply preset %q: failed on rule %q after %d applied: %w",
+				id, r.Pattern, len(ruleIDs), err)
+		}
+		ruleIDs = append(ruleIDs, int64(rid))
+	}
+	return map[string]any{
+		"preset":   id,
+		"applied":  len(ruleIDs),
+		"rule_ids": ruleIDs,
+	}, nil
+}
+
+// ---------------------------------------------------------------------
+// dbounce_recommend_rules — synthesize draft rules from observed
+// audit-log traffic.
+//
+// Mirrors kbounce_recommend_rules adapted to the SQL domain:
+// groups by (statement_type, table) rather than (resource, verb).
+// Per [[cross-product-agent-parity]] + [[scorer-is-ground-truth]]:
+// deterministic algorithm; no LLM in the synthesis path. Read-only
+// at the MCP surface — returns recommendations without applying them.
+// Per audit-cadence (c): operators apply via `dbounce rules apply`
+// CLI or dbounce_apply_preset for curated packs.
+// ---------------------------------------------------------------------
+
+// parseSinceArg accepts a relative ("1h", "24h", "7d") or absolute
+// ISO-8601 timestamp. Returns zero time on empty / unparseable input.
+// Mirrors kbouncer's parseSinceArg.
+func parseSinceArg(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t
+	}
+	if strings.HasSuffix(raw, "d") {
+		num := strings.TrimSuffix(raw, "d")
+		if d, err := time.ParseDuration(num + "h"); err == nil {
+			return time.Now().UTC().Add(-d * 24)
+		}
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		return time.Now().UTC().Add(-d)
+	}
+	return time.Time{}
+}
+
+// recommendWindowSummary is the SQL-domain equivalent of
+// kbouncer's recommender.WindowSummary — reported at the top of the
+// recommend_rules response so the agent has context on the window.
+type recommendWindowSummary struct {
+	TotalCalls     int
+	DistinctTypes  int
+	DistinctTables int
+	AllowCount     int
+	DenyCount      int
+	WindowStart    time.Time
+	WindowEnd      time.Time
+}
+
+func (w recommendWindowSummary) toMap() map[string]any {
+	out := map[string]any{
+		"total_calls":     w.TotalCalls,
+		"distinct_types":  w.DistinctTypes,
+		"distinct_tables": w.DistinctTables,
+		"allow_count":     w.AllowCount,
+		"deny_count":      w.DenyCount,
+	}
+	if !w.WindowStart.IsZero() {
+		out["window_start"] = w.WindowStart.UTC().Format(time.RFC3339)
+	}
+	if !w.WindowEnd.IsZero() {
+		out["window_end"] = w.WindowEnd.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+// sqlRecommendation is one draft rule derived from observed audit traffic.
+type sqlRecommendation struct {
+	Pattern      string
+	Effect       rules.Effect
+	SchemaScope  string
+	SupportCount int
+	HitRate      float64
+	Note         string
+	SkippedReason string
+}
+
+func (r sqlRecommendation) toMap() map[string]any {
+	out := map[string]any{
+		"proposed_rule": map[string]any{
+			"pattern":      r.Pattern,
+			"effect":       string(r.Effect),
+			"schema_scope": r.SchemaScope,
+			"note":         r.Note,
+			"origin":       "recommendation",
+		},
+		"support_count": r.SupportCount,
+		"hit_rate":      sqlRound4(r.HitRate),
+	}
+	if r.SkippedReason != "" {
+		out["skipped_reason"] = r.SkippedReason
+	}
+	return out
+}
+
+func sqlRound4(f float64) float64 {
+	if f >= 0 {
+		return float64(int(f*10000+0.5)) / 10000
+	}
+	return float64(int(f*10000-0.5)) / 10000
+}
+
+func (s *Server) toolRecommendRules(args map[string]any) (map[string]any, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, err
+	}
+	since := stringArg(args, "since", "")
+	minSupport := intArg(args, "min_support", 3)
+	if minSupport <= 0 {
+		minSupport = 3
+	}
+	includeTaskScoped := boolArg(args, "include_task_scoped", false)
+
+	decisions, err := s.cfg.Store.RecentDecisions(1000)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply time window filter.
+	sinceT := parseSinceArg(since)
+	if !sinceT.IsZero() {
+		filtered := make([]store.DecisionRow, 0, len(decisions))
+		for _, d := range decisions {
+			if !d.At.IsZero() && d.At.Before(sinceT) {
+				continue
+			}
+			filtered = append(filtered, d)
+		}
+		decisions = filtered
+	}
+
+	// Build window summary.
+	summary := recommendWindowSummary{TotalCalls: len(decisions)}
+	types := map[string]struct{}{}
+	tables := map[string]struct{}{}
+	for _, d := range decisions {
+		if d.StatementType != "" {
+			types[strings.ToLower(d.StatementType)] = struct{}{}
+		}
+		for _, tbl := range d.TablesTouched {
+			if tbl != "" {
+				tables[tbl] = struct{}{}
+			}
+		}
+		switch strings.ToUpper(d.DecisionVerdict) {
+		case "ALLOW":
+			summary.AllowCount++
+		case "DENY":
+			summary.DenyCount++
+		}
+		if !d.At.IsZero() {
+			if summary.WindowStart.IsZero() || d.At.Before(summary.WindowStart) {
+				summary.WindowStart = d.At
+			}
+			if d.At.After(summary.WindowEnd) {
+				summary.WindowEnd = d.At
+			}
+		}
+	}
+	summary.DistinctTypes = len(types)
+	summary.DistinctTables = len(tables)
+
+	// Load existing rules for dedup.
+	existing, err := s.cfg.Store.ListRules()
+	if err != nil {
+		return nil, err
+	}
+	existingRules := make([]rules.ProxyRule, 0, len(existing))
+	for _, sr := range existing {
+		existingRules = append(existingRules, sr.Rule)
+	}
+
+	// Group ALLOW decisions by (statement_type, first table touched).
+	// Cross-product CRIT-28-01: only ALLOW decisions drive recommendations;
+	// DENY/prompt decisions are not endorsements.
+	type groupKey struct {
+		stmtType string
+		table    string
+	}
+	type groupVal struct {
+		count   int
+		schemas map[string]int
+	}
+	groups := map[groupKey]*groupVal{}
+	totalAllow := 0
+	for _, d := range decisions {
+		if strings.ToUpper(d.DecisionVerdict) != "ALLOW" {
+			continue
+		}
+		if !includeTaskScoped && d.TaskID != "" {
+			continue
+		}
+		st := strings.ToUpper(strings.TrimSpace(d.StatementType))
+		if st == "" {
+			continue
+		}
+		// Use first table or "*" for table-less statements.
+		tbl := "*"
+		if len(d.TablesTouched) > 0 && d.TablesTouched[0] != "" {
+			tbl = d.TablesTouched[0]
+		}
+		k := groupKey{stmtType: st, table: tbl}
+		if groups[k] == nil {
+			groups[k] = &groupVal{schemas: map[string]int{}}
+		}
+		groups[k].count++
+		totalAllow++
+		// Track schema (everything before the last dot in the table name).
+		if dot := strings.LastIndex(tbl, "."); dot > 0 {
+			schema := tbl[:dot]
+			groups[k].schemas[schema]++
+		}
+	}
+
+	recs := make([]sqlRecommendation, 0, len(groups))
+	for k, gv := range groups {
+		if gv.count < minSupport {
+			continue
+		}
+		// Derive the table glob: if all observations share the same schema,
+		// scope to schema.*; otherwise use the literal table name.
+		tableGlob := k.table
+		var schemaScope string
+		if dot := strings.LastIndex(k.table, "."); dot > 0 {
+			schemaScope = k.table[:dot]
+		}
+		// If the most-frequent schema accounts for >= 50% of this group's
+		// observations, emit a schema-scoped * glob instead of a literal.
+		if k.table != "*" {
+			if dot := strings.LastIndex(k.table, "."); dot > 0 {
+				sc := k.table[:dot]
+				if float64(gv.schemas[sc]) >= 0.5*float64(gv.count) {
+					tableGlob = sc + ".*"
+					schemaScope = sc
+				}
+			}
+		}
+		pattern := k.stmtType + ":" + tableGlob
+		note := fmt.Sprintf("recommended from %d observed calls", gv.count)
+		if !summary.WindowStart.IsZero() && !summary.WindowEnd.IsZero() {
+			note += fmt.Sprintf(" in window %s → %s",
+				summary.WindowStart.UTC().Format(time.RFC3339),
+				summary.WindowEnd.UTC().Format(time.RFC3339))
+		}
+		rec := sqlRecommendation{
+			Pattern:      pattern,
+			Effect:       rules.EffectAllow,
+			SchemaScope:  schemaScope,
+			SupportCount: gv.count,
+			HitRate:      float64(gv.count) / float64(max1(totalAllow)),
+			Note:         note,
+		}
+		// Dedup against existing rules (audit-cadence (b): never
+		// auto-restore a rule the operator previously removed).
+		for _, e := range existingRules {
+			if e.Pattern == rec.Pattern && e.SchemaScope == rec.SchemaScope &&
+				e.Effect == rec.Effect {
+				rec.SkippedReason = "rule with this pattern + schema_scope already in store"
+				break
+			}
+		}
+		recs = append(recs, rec)
+	}
+
+	// Sort by support DESC then by pattern for stable output.
+	for i := 0; i < len(recs); i++ {
+		for j := i + 1; j < len(recs); j++ {
+			if recs[j].SupportCount > recs[i].SupportCount ||
+				(recs[j].SupportCount == recs[i].SupportCount && recs[j].Pattern < recs[i].Pattern) {
+				recs[i], recs[j] = recs[j], recs[i]
+			}
+		}
+	}
+
+	out := make([]map[string]any, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.toMap())
+	}
+	return map[string]any{
+		"summary":         summary.toMap(),
+		"recommendations": out,
+		"count":           len(out),
+	}, nil
+}
+
+func max1(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
 }
