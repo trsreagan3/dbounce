@@ -35,11 +35,5 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # NOTE: -race is intentionally deferred. Enabling it surfaced a
-      # pre-existing CI-only flake (TestExportHealth_DegradedAlert_Fires…
-      # debouncer counter reads 0 instead of 1 under race instrumentation
-      # — see follow-up issue) that passes locally. Ship deterministic CI
-      # now; re-enable -race once that test is hardened, to reach full
-      # parity with gbounce's validate.yml.
       - name: go test
-        run: go test ./... -count=1
+        run: go test ./... -race -count=1
