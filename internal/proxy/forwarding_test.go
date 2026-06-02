@@ -163,6 +163,13 @@ func (f *fakePGUpstream) handleConn(conn net.Conn) {
 // startForwardingServer spins up a dbounce Server pointed at the
 // given fake upstream.
 func startForwardingServer(t *testing.T, fake *fakePGUpstream, mode Mode) (*Server, string, *store.Store) {
+	return startForwardingServerOpts(t, fake, mode)
+}
+
+// startForwardingServerOpts is the variadic-option form. Each opt
+// mutates the Config before Normalize(); existing callers use the
+// thin wrapper above with no opts so their behavior is unchanged.
+func startForwardingServerOpts(t *testing.T, fake *fakePGUpstream, mode Mode, opts ...func(*Config)) (*Server, string, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "state.db"))
@@ -198,7 +205,11 @@ func startForwardingServer(t *testing.T, fake *fakePGUpstream, mode Mode) (*Serv
 		Upstream:     up,
 		IdleTimeout:  5 * time.Second,
 		ReadTimeout:  5 * time.Second,
-	}.Normalize()
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	cfg = cfg.Normalize()
 	srv := NewServer(cfg, st)
 	go func() { _ = srv.Serve() }()
 	t.Cleanup(func() {
@@ -916,4 +927,103 @@ func TestNoPasswordCapture_InvariantPin(t *testing.T) {
 		// it runs (and you should reconsider the design).
 		_ = allowed
 	})
+}
+
+// TestForward_RedactLiteralsAppliedOnForwardPath is the regression
+// lock for the HIGH PII bug: with --redact-literals set AND a real
+// upstream, the FORWARDING path (handleGatedMessage -> recordDecision)
+// historically persisted the raw SQL verbatim, so quoted string
+// literals (emails, SSN-shaped values) landed in the audit store in
+// the clear and statement_redacted stayed false. The fix applies the
+// SAME parser.RedactLiterals used on the observation path BEFORE the
+// row is persisted, while leaving the bytes actually forwarded
+// upstream untouched (the real query must still execute correctly).
+//
+// Asserts BOTH halves:
+//  1. The PERSISTED audit row has the literals redacted +
+//     StatementRedacted=true.
+//  2. The bytes the fake UPSTREAM received are the ORIGINAL,
+//     UNREDACTED query — redaction is audit-only and must not corrupt
+//     the forwarded statement.
+func TestForward_RedactLiteralsAppliedOnForwardPath(t *testing.T) {
+	fake := newFakePGUpstream(t)
+	fake.respond = func(t *testing.T, conn net.Conn, msgType byte, payload []byte) {
+		if msgType == msgQuery {
+			_ = writeMessage(conn, 'C', append([]byte("SELECT 0"), 0))
+			_ = writeMessage(conn, 'Z', []byte{'I'})
+		}
+	}
+	_, addr, st := startForwardingServerOpts(t, fake, ModeCooperative,
+		func(c *Config) { c.RedactLiterals = true })
+
+	// Sentinel literals: an email-shaped + an SSN-shaped quoted string.
+	// Both are single-quoted string literals → within the redactor's
+	// documented coverage (numeric / comment / quoted-identifier forms
+	// are known gaps per [[dbounce-sql-redaction-gaps]]).
+	const email = "secret@private.example"
+	const ssn = "999-88-7777"
+	rawSQL := "SELECT * FROM users WHERE email = '" + email + "' AND ssn = '" + ssn + "'"
+
+	_ = clientSession(t, addr, rawSQL)
+
+	// (2) The fake upstream MUST have received the ORIGINAL bytes,
+	// literals intact — redaction is for the audit record only.
+	var sawQuery bool
+	for _, r := range fake.received {
+		if r.Type == msgQuery {
+			sawQuery = true
+			got := string(r.Payload)
+			assert.Contains(t, got, email,
+				"forwarded query must carry the real email literal (redaction is audit-only)")
+			assert.Contains(t, got, ssn,
+				"forwarded query must carry the real SSN literal (redaction is audit-only)")
+		}
+	}
+	assert.True(t, sawQuery, "fake upstream must have received the Query")
+
+	// (1) The PERSISTED audit row must be redacted.
+	waitForDecisions(t, st, 1)
+	rows, err := st.RecentDecisions(10)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	r := rows[0]
+	assert.True(t, r.Forwarded, "cooperative ALLOW forwards")
+	assert.True(t, r.StatementRedacted,
+		"forward-path row must record statement_redacted=true when --redact-literals set")
+	assert.NotContains(t, r.Statement, email,
+		"persisted statement MUST NOT contain the email literal")
+	assert.NotContains(t, r.Statement, ssn,
+		"persisted statement MUST NOT contain the SSN literal")
+	assert.Contains(t, r.Statement, "[REDACTED]",
+		"persisted statement must carry the [REDACTED] marker")
+	// Statement SHAPE is preserved (table + columns visible).
+	assert.Contains(t, r.Statement, "users", "table name preserved for audit review")
+	assert.Equal(t, "SELECT", r.StatementType)
+}
+
+// TestForward_RedactLiteralsOffPersistsVerbatim pins the negative: with
+// --redact-literals NOT set, the forward path persists the raw SQL +
+// statement_redacted=false (operator-faithful default).
+func TestForward_RedactLiteralsOffPersistsVerbatim(t *testing.T) {
+	fake := newFakePGUpstream(t)
+	fake.respond = func(t *testing.T, conn net.Conn, msgType byte, payload []byte) {
+		if msgType == msgQuery {
+			_ = writeMessage(conn, 'C', append([]byte("SELECT 0"), 0))
+			_ = writeMessage(conn, 'Z', []byte{'I'})
+		}
+	}
+	_, addr, st := startForwardingServer(t, fake, ModeCooperative)
+
+	rawSQL := "SELECT * FROM users WHERE email = 'plain@example.test'"
+	_ = clientSession(t, addr, rawSQL)
+
+	waitForDecisions(t, st, 1)
+	rows, err := st.RecentDecisions(10)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	r := rows[0]
+	assert.False(t, r.StatementRedacted,
+		"without --redact-literals the row must record statement_redacted=false")
+	assert.Equal(t, rawSQL, r.Statement,
+		"without --redact-literals the persisted statement is verbatim")
 }

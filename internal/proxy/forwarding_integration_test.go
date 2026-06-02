@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/trsreagan3/dbounce/internal/audit"
 	dbstore "github.com/trsreagan3/dbounce/internal/store"
 	"github.com/trsreagan3/dbounce/internal/upstream"
 )
@@ -44,6 +46,14 @@ func dbounceURL(port int) string {
 
 // startProxyAgainstRealPG spins dbounce up in front of the real PG.
 func startProxyAgainstRealPG(t *testing.T, mode Mode) (int, *dbstore.Store) {
+	port, st, _ := startProxyAgainstRealPGOpts(t, mode)
+	return port, st
+}
+
+// startProxyAgainstRealPGOpts is the variadic-option form; each opt
+// mutates the Config before Normalize(). Returns the started Server so
+// tests can wire an audit exporter onto it.
+func startProxyAgainstRealPGOpts(t *testing.T, mode Mode, opts ...func(*Config)) (int, *dbstore.Store, *Server) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := dbstore.Open(filepath.Join(dir, "state.db"))
@@ -73,7 +83,11 @@ func startProxyAgainstRealPG(t *testing.T, mode Mode) (int, *dbstore.Store) {
 		Upstream:    up,
 		IdleTimeout: 10 * time.Second,
 		ReadTimeout: 10 * time.Second,
-	}.Normalize()
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	cfg = cfg.Normalize()
 	srv := NewServer(cfg, st)
 	go func() { _ = srv.Serve() }()
 	t.Cleanup(func() {
@@ -92,7 +106,7 @@ func startProxyAgainstRealPG(t *testing.T, mode Mode) (int, *dbstore.Store) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return wirePort, st
+	return wirePort, st, srv
 }
 
 // requirePGReachable skips the test when the upstream PG isn't up.
@@ -182,4 +196,90 @@ func TestIntegration_MultipleQueriesOnSameSession(t *testing.T) {
 		require.NoError(t, db.QueryRow("SELECT $1::int", i).Scan(&n))
 		assert.Equal(t, i, n)
 	}
+}
+
+// TestIntegration_RedactLiteralsForwardPath is the REAL-Postgres
+// verification for the HIGH PII fix: with --redact-literals + a real
+// upstream, a SELECT carrying an email + an SSN-shaped quoted literal
+// must (a) still execute correctly against PG (correct rows returned),
+// while (b) BOTH the persisted SQLite audit row AND the JSONL export
+// have the literals REDACTED + statement_redacted=true.
+func TestIntegration_RedactLiteralsForwardPath(t *testing.T) {
+	requirePGReachable(t)
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	logWriter, err := audit.NewLogWriter(audit.LogOptions{Path: logPath})
+	require.NoError(t, err)
+	exporter := audit.NewExporter(logWriter, nil, "127.0.0.1:0", "")
+
+	port, st, srv := startProxyAgainstRealPGOpts(t, ModeCooperative,
+		func(c *Config) { c.RedactLiterals = true })
+	// Wire the exporter onto the already-running server BEFORE the first
+	// client query so the SELECT fans out to the JSONL log.
+	srv.SetAuditExporter(exporter)
+
+	db, err := sql.Open("postgres", dbounceURL(port))
+	require.NoError(t, err)
+
+	const email = "secret@private.example"
+	const ssn = "999-88-7777"
+	// (a) The query must EXECUTE correctly. We compute a value PG returns
+	// so we can assert the real result round-trips. The literals appear in
+	// a comparison that PG evaluates to a known boolean.
+	rawSQL := fmt.Sprintf(
+		"SELECT ('%s' = '%s')::int AS email_match, ('%s' = '%s')::int AS ssn_match",
+		email, email, ssn, "000-00-0000")
+	var emailMatch, ssnMatch int
+	require.NoError(t, db.QueryRow(rawSQL).Scan(&emailMatch, &ssnMatch),
+		"redacted-audit query must still execute correctly against real PG")
+	assert.Equal(t, 1, emailMatch, "PG must evaluate the email literal comparison (forwarded query is NOT redacted)")
+	assert.Equal(t, 0, ssnMatch, "PG must evaluate the ssn literal comparison")
+
+	// Close the client BEFORE draining the exporter so the connection
+	// handler isn't mid-emit when the exporter's channel closes. The
+	// short settle lets the SESSION_ENDED emit (fired on conn close)
+	// complete before Shutdown closes the exporter channel — a benign
+	// teardown race the proxy recovers from, but we avoid the noise.
+	require.NoError(t, db.Close())
+	time.Sleep(100 * time.Millisecond)
+
+	// Drain the exporter so the JSONL file is fully written.
+	require.NoError(t, exporter.Shutdown(context.Background()))
+
+	// (b1) SQLite row: redacted + statement_redacted=true.
+	deadline := time.Now().Add(3 * time.Second)
+	var found *dbstore.DecisionRow
+	for time.Now().Before(deadline) {
+		rows, rerr := st.RecentDecisions(20)
+		require.NoError(t, rerr)
+		for i := range rows {
+			if rows[i].StatementType == "SELECT" {
+				r := rows[i]
+				found = &r
+				break
+			}
+		}
+		if found != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NotNil(t, found, "expected a persisted SELECT decision row")
+	assert.True(t, found.StatementRedacted, "SQLite row must record statement_redacted=true")
+	assert.NotContains(t, found.Statement, email, "SQLite statement MUST NOT leak the email literal")
+	assert.NotContains(t, found.Statement, ssn, "SQLite statement MUST NOT leak the SSN literal")
+	assert.Contains(t, found.Statement, "[REDACTED]", "SQLite statement must carry the [REDACTED] marker")
+
+	// (b2) JSONL export: redacted + statement_redacted=true.
+	f, err := os.Open(logPath)
+	require.NoError(t, err)
+	defer f.Close()
+	raw, err := io.ReadAll(f)
+	require.NoError(t, err)
+	jsonl := string(raw)
+	assert.NotContains(t, jsonl, email, "JSONL export MUST NOT leak the email literal")
+	assert.NotContains(t, jsonl, ssn, "JSONL export MUST NOT leak the SSN literal")
+	assert.Contains(t, jsonl, "[REDACTED]", "JSONL export must carry the [REDACTED] marker")
+	assert.Contains(t, jsonl, `"statement_redacted":true`, "JSONL export must mark statement_redacted=true")
 }

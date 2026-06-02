@@ -380,9 +380,13 @@ dbounce audit tail [--limit N] [--json]
 | summary   | `--summary` | count-summary by event_type / severity / actor / op      |
 | export    | `--export`  | jsonl / csv / ocsf-bundle to `--out PATH`                |
 
-CSV and ocsf-bundle exports ALWAYS redact SQL string literals
-(MED-D8-09 redactor applied defensively on read) so a bulk SIEM
-shipment cannot leak PII embedded in raw statements.
+CSV and ocsf-bundle exports ALWAYS redact single-quoted SQL string
+literals (MED-D8-09 redactor applied defensively on read) so a bulk
+SIEM shipment doesn't carry PII embedded in quoted-string statement
+values. Coverage is limited to single-quoted string literals: numeric
+literals (`WHERE id = 999887777`), comment contents (`-- token=...`),
+and quoted/backtick identifiers are NOT scrubbed. Use parameterised
+queries / quoted literals for anything sensitive.
 
 For the full "where do my audit logs go in production" decision tree
 (JSONL / webhook + presets / Security Lake / Lambda → S3 / GCP / Azure
