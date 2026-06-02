@@ -1,0 +1,150 @@
+# .goreleaser.yml — dbounce pre-built binary release pipeline
+#
+# Triggered by: push of a v* tag (see .github/workflows/release.yml)
+# Produces: .deb + .rpm + .tar.gz + .zip for linux/amd64 + linux/arm64 + darwin + windows
+# Artifacts uploaded to the GitHub Release created by the tag push.
+#
+# NOTE: "published to public APT/RPM registries" is follow-up work (post-v1.0).
+# This config: builds artifacts + attaches them to GitHub Releases.
+# Users install via `curl | dpkg -i` or `curl | rpm -i` per docs/INSTALL-APT.md
+# and docs/INSTALL-RPM.md.
+#
+# Per [[vendor-integration-claim-qualifier]]: artifacts are built + smoke-tested
+# in CI containers; NOT published to public deb/rpm package registry.
+
+version: 2
+
+project_name: dbounce
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: dbounce
+    binary: dbounce
+    main: ./cmd/dbounce
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/trsreagan3/dbounce/internal/cli.version={{.Version}}
+      - -X github.com/trsreagan3/dbounce/internal/cli.commit={{.Commit}}
+      - -X github.com/trsreagan3/dbounce/internal/cli.buildTime={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: dbounce-archive
+    builds:
+      - dbounce
+    name_template: "dbounce_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+nfpms:
+  - id: dbounce-deb-rpm
+    package_name: dbounce
+    builds:
+      - dbounce
+    vendor: trsreagan3
+    homepage: https://github.com/trsreagan3/dbounce
+    maintainer: trsreagan3
+    description: |
+      SQL-wire-protocol safety proxy for AI agents and dev workflows.
+      dbounce sits between your application and PostgreSQL/MySQL, auditing
+      every query and (optionally) denying out-of-profile SQL operations.
+    license: Apache-2.0
+    section: net
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/local/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/dbounce/copyright
+      - src: README.md
+        dst: /usr/share/doc/dbounce/README.md
+    scripts:
+      postinstall: scripts/nfpm/postinstall.sh
+
+brews:
+  - name: dbounce
+    repository:
+      owner: trsreagan3
+      name: homebrew-tap
+      branch: "bump-dbounce-{{.Version}}"
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: trsreagan3
+          name: homebrew-tap
+          branch: main
+    homepage: https://github.com/trsreagan3/dbounce
+    description: "SQL-wire-protocol safety proxy for AI agents and dev workflows"
+    license: Apache-2.0
+    install: |
+      ldflags = %W[
+        -s -w
+        -X github.com/trsreagan3/dbounce/internal/cli.version=#{version}
+        -X github.com/trsreagan3/dbounce/internal/cli.commit=homebrew
+        -X github.com/trsreagan3/dbounce/internal/cli.buildTime=#{time.iso8601}
+      ]
+      system "go", "build", "-trimpath", "-ldflags", ldflags.join(" "), "-o", bin/"dbounce", "./cmd/dbounce"
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/dbounce --version")
+      assert_match "dbounce", shell_output("#{bin}/dbounce --help")
+
+scoops:
+  - repository:
+      owner: trsreagan3
+      name: scoop-bucket
+      branch: "bump-dbounce-{{.Version}}"
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: trsreagan3
+          name: scoop-bucket
+          branch: main
+    name: dbounce
+    homepage: https://github.com/trsreagan3/dbounce
+    description: "SQL-wire-protocol safety proxy for AI agents and dev workflows"
+    license: Apache-2.0
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: trsreagan3
+    name: dbounce
+  name_template: "v{{.Version}}"
+  draft: false
+  prerelease: auto
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
