@@ -1106,6 +1106,21 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			// the swap loads from the SAME source.
 			s.SetProfilesPath(resolvedProfilesPath)
 
+			// #718 ADOPT-4 — wire the Phase H behavioral-deviation /
+			// anomaly detector when the operator opted in via env
+			// (IAM_JIT_ANOMALY_DETECTION=1 / mode / sensitivity).
+			// Frictionless per [[lightweight-frictionless-principle]];
+			// DISABLED by default + ALERT (never block) when enabled per
+			// [[safety-mode-lean-permissive]].
+			if acfg, aerr := proxy.AnomalyConfigFromEnv(); aerr != nil {
+				return fmt.Errorf("anomaly_detection config: %w", aerr)
+			} else if acfg.Enabled {
+				s.SetAnomalyDetector(s.NewAnomalyDetector(acfg))
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — surfaces a neutral signal for review, does not block by default\n",
+					acfg.Mode, acfg.Sensitivity)
+			}
+
 			// #252 Slice 1: build the audit-export fan-out from the
 			// transport flags. License gate fires BEFORE any IO so the
 			// operator's license-rejected case never opens a webhook
