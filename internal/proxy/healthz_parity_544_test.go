@@ -68,7 +68,13 @@ func startTestServerWithExporter(t *testing.T, withExporter bool) string {
 		// when Log is non-nil per audit/exporter.go:109. No webhook so
 		// the test doesn't need a fake HTTP server.
 		logPath := filepath.Join(dir, "audit.jsonl")
-		lw, err := audit.NewLogWriter(audit.LogOptions{Path: logPath, Fsync: false})
+		// ADOPT-10 / #734 — chain is on by default when audit logging is
+		// on; wire it so chain_initialized reflects honest forensic
+		// posture (chain actually stamps), not merely "exporter wired".
+		chain := audit.LoadChainState(dir, 0)
+		signer, serr := audit.NewManifestSigner(dir, "dbounce", audit.DefaultManifestIntervalEvents, filepath.Join(dir, "keys"), audit.DefaultKeypairName)
+		require.NoError(t, serr)
+		lw, err := audit.NewLogWriter(audit.LogOptions{Path: logPath, Fsync: false, Chain: chain, Signer: signer})
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)

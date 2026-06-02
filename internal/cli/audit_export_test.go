@@ -23,7 +23,7 @@ import (
 // TestBuildAuditExporter_NoFlags_ReturnsNilNil verifies the FREE-tier
 // default — no audit-export wired.
 func TestBuildAuditExporter_NoFlags_ReturnsNilNil(t *testing.T) {
-	e, err := buildAuditExporter("", false, -1, -1, -1, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+	e, err := buildAuditExporter("", false, -1, -1, -1, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	require.NoError(t, err)
 	assert.Nil(t, e, "no audit-export flags = no exporter (FREE-tier default)")
 }
@@ -33,7 +33,7 @@ func TestBuildAuditExporter_NoFlags_ReturnsNilNil(t *testing.T) {
 func TestBuildAuditExporter_LogOnly_FreeTier(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.jsonl")
-	e, err := buildAuditExporter(path, false, -1, -1, -1, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+	e, err := buildAuditExporter(path, false, -1, -1, -1, "", "", 0, false, "", "", "", "", 0, 0, 0, "127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	require.NoError(t, err, "log-only transport must work without a license (FREE tier)")
 	require.NotNil(t, e)
 	require.True(t, e.Enabled())
@@ -63,7 +63,7 @@ func TestBuildAuditExporter_WebhookGateReinstateableForV1_1(t *testing.T) {
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Enterprise license",
 		"reinstate path: the rejecting closure's error must propagate")
@@ -85,7 +85,7 @@ func TestBuildAuditExporter_WebhookNoLicenseShipsFree(t *testing.T) {
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	if err != nil {
 		// Downstream IO failures are acceptable (the SSRF / DNS / TLS
 		// guards are orthogonal to licensing). The calibration
@@ -115,7 +115,7 @@ func TestBuildAuditExporter_WebhookWithLicenseOverride(t *testing.T) {
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	require.NoError(t, err)
 	require.NotNil(t, e)
 	require.True(t, e.Enabled())
@@ -145,7 +145,7 @@ func TestBuildAuditExporter_AlertRoutesNoLicenseShipsFree(t *testing.T) {
 		"", "", "",
 		routesPath,
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	require.NoError(t, err,
 		"--alert-routes ships FREE at v1.0 per [[oss-only-launch-decision]]")
 	require.NotNil(t, exp)
@@ -177,7 +177,7 @@ func TestBuildAuditExporter_TokenWithoutURL_Rejected(t *testing.T) {
 		"", "", "",
 		"", // alertRoutesPath
 		0, 0, 0,
-		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "")
+		"127.0.0.1:5433", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", false, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--audit-webhook-token")
 }
@@ -202,7 +202,7 @@ func TestStartupBanner_TokenNeverPresent(t *testing.T) {
 		"", // alertRoutesPath
 		0, 0, 0,
 		"127.0.0.1:5433", "", "", "", "", "", 0,
-		"", "", "", "", "", 0, 0, "")
+		"", "", "", "", "", 0, 0, "", false, 0)
 	require.NoError(t, err)
 	require.NotNil(t, e)
 	t.Cleanup(func() { _ = e.Shutdown(context.Background()) })

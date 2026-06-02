@@ -286,9 +286,9 @@ type profileWriterAdapter struct {
 	// Empty means "use profile.DefaultProfilesPath() on first call."
 	configuredPath string
 
-	mu             sync.Mutex
-	loaded         *profile.Profiles
-	resolvedPath   string
+	mu           sync.Mutex
+	loaded       *profile.Profiles
+	resolvedPath string
 }
 
 func newCLIProfileWriter(path string) *profileWriterAdapter {
@@ -466,16 +466,16 @@ the gate.`
 
 func newRunCmd() *cobra.Command {
 	var (
-		port              int
-		host              string
-		mgmtHost          string
-		mgmtPort          int
-		modeStr           string
-		defaultPolStr     string
-		dialectStr        string
-		upstreamURL         string
-		upstreamCACert      string
-		upstreamTLSStr      string
+		port                  int
+		host                  string
+		mgmtHost              string
+		mgmtPort              int
+		modeStr               string
+		defaultPolStr         string
+		dialectStr            string
+		upstreamURL           string
+		upstreamCACert        string
+		upstreamTLSStr        string
 		allowInternalUpstream bool
 		dbPath                string
 		forceExternalBind     bool
@@ -519,8 +519,10 @@ func newRunCmd() *cobra.Command {
 		// #252 Slice 1 audit-export transport flags. See
 		// [[security-team-audit-export]] memo for the full design.
 		// auditLogPath enables the FREE-tier JSONL transport.
-		auditLogPath  string
-		auditLogFsync bool
+		auditLogPath     string
+		auditLogFsync    bool
+		noAuditChain     bool
+		manifestInterval int64
 		// #311 / §A10 — rotation thresholds. Sentinel -1 = "operator
 		// didn't pass the flag → use the audit-package default
 		// (matches iam-roles/docs/LOG-RETENTION.md)." 0 = "explicitly
@@ -1171,6 +1173,8 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				auditObjectStorageRotationMinutes,
 				auditObjectStorageMaxSizeMB,
 				auditObjectStorageInstanceID,
+				noAuditChain,
+				manifestInterval,
 			)
 			if exporterErr != nil {
 				return exporterErr
@@ -1551,6 +1555,14 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			"flushes per-line for compliance-grade durability at ~hundreds "+
 			"of microseconds of additional latency per decision. Has no "+
 			"effect when --audit-log-path is unset.")
+	cmd.Flags().BoolVar(&noAuditChain, "no-audit-chain", false,
+		"Disable the tamper-evident hash-chain + Ed25519-signed manifests on "+
+			"the audit-log JSONL (ADOPT-10/#734; on by default when "+
+			"--audit-log-path is set).")
+	cmd.Flags().Int64Var(&manifestInterval, "manifest-interval", 0,
+		"Emit a signed chain-checkpoint manifest every N events (ADOPT-10/#734; "+
+			"0 = default 1000). Lower it on low-traffic deployments so a signed "+
+			"checkpoint lands without waiting for 1000 events.")
 	// #311 / §A10 — rotation thresholds. Sentinel -1 = "use audit-pkg
 	// default (matches LOG-RETENTION.md)." 0 = "operator explicitly
 	// disabled this trigger." Same names across all four Bounce
@@ -1672,9 +1684,9 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 	cmd.Flags().StringVar(&auditAlertRoutesPath, "alert-routes", "",
 		"#280 — YAML file describing "+
 			"per-org notification routing. Ships in the v1.0 free + open-source "+
-				"release (license-file plumbing #235 retained for any future "+
-				"paid tier per project_oss_only_launch_decision.md but does "+
-				"NOT gate this flag at v1.0). When set, the multi-destination "+
+			"release (license-file plumbing #235 retained for any future "+
+			"paid tier per project_oss_only_launch_decision.md but does "+
+			"NOT gate this flag at v1.0). When set, the multi-destination "+
 			"routing engine activates: each event is matched against the "+
 			"configured routes' match blocks + dispatched to the route's "+
 			"destinations (webhook / pagerduty / slack). When unset, the "+
@@ -1902,6 +1914,8 @@ func buildAuditExporter(
 	auditObjectStorageRotationMinutes int,
 	auditObjectStorageMaxSizeMB int,
 	auditObjectStorageInstanceID string,
+	noAuditChain bool,
+	manifestInterval int64,
 ) (*audit.Exporter, error) {
 	// #258 — Security Lake parse-time validation. Bucket without
 	// region (or vice versa) is a misconfiguration; fail-fast so the
@@ -1980,11 +1994,49 @@ func buildAuditExporter(
 		// itself. Surfaced at the run-cmd layer so the operator sees
 		// the resolved value on startup.
 		_ = dbRetentionDays
+		// ADOPT-10 / #734 — tamper-evident hash-chain + signed manifests,
+		// ON BY DEFAULT when audit logging is on (cheap + safe per
+		// [[v1-scope-bar]]). --no-audit-chain disables. Chain state lives
+		// alongside the JSONL; the Ed25519 keypair lives in
+		// ~/.dbounce/audit-keys (override via DBOUNCE_AUDIT_KEYS_DIR).
+		// The private key is never logged or committed.
+		var chain *audit.ChainState
+		var signer *audit.ManifestSigner
+		logDir := audit.ResolveLogDir(logPath)
+		if !noAuditChain && logDir != "" {
+			chain = audit.LoadChainState(logDir, 0)
+			keysDir := os.Getenv("DBOUNCE_AUDIT_KEYS_DIR")
+			if keysDir == "" {
+				if home, herr := os.UserHomeDir(); herr == nil {
+					keysDir = filepath.Join(home, ".dbounce", "audit-keys")
+				}
+			}
+			if keysDir != "" {
+				interval := int64(audit.DefaultManifestIntervalEvents)
+				if manifestInterval > 0 {
+					interval = manifestInterval
+				}
+				sg, serr := audit.NewManifestSigner(
+					logDir, "dbounce",
+					interval,
+					keysDir, audit.DefaultKeypairName,
+				)
+				if serr != nil {
+					fmt.Fprintf(os.Stderr,
+						"dbounce: warn: audit-manifest keypair init failed: %v "+
+							"(hash-chain still active; no signed manifests)\n", serr)
+				} else {
+					signer = sg
+				}
+			}
+		}
 		w, err := audit.NewLogWriter(audit.LogOptions{
 			Path:       logPath,
 			Fsync:      logFsync,
 			MaxSizeMB:  effSize,
 			MaxAgeDays: effAge,
+			Chain:      chain,
+			Signer:     signer,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("audit-log writer: %w", err)

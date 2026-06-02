@@ -2413,6 +2413,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		// [[cross-product-agent-parity]] all four bouncers surface the
 		// same field for SRE composite monitors.
 		ChainInitialized bool             `json:"chain_initialized"`
+		AuditChain       map[string]any   `json:"audit_chain"`
 		LlmBudget        HealthzLlmBudget `json:"llm_budget"`
 	}{
 		Status:                              "ok",
@@ -2431,8 +2432,30 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		TotalDynamicDenyReloads:             denyReloads,
 		TotalDynamicDenyParseErrors:         denyParseErrs,
 		TotalProfileScopeRefused:            s.ProfileScopeRefusedCount(),
-		ChainInitialized:                    s.auditExporter != nil && s.auditExporter.Enabled(),
 		LlmBudget:                           HealthzLlmBudget{Enabled: false},
+	}
+	// ADOPT-10 / #734 — chain_initialized now reports whether the
+	// tamper-evident hash-chain is ACTUALLY stamping rows (honest
+	// forensic posture), not merely that an exporter is wired+enabled.
+	// The audit_chain block surfaces the real head seq/hash + manifest
+	// signature presence for SOC analysts / composite monitors.
+	if s.auditExporter != nil && s.auditExporter.Log != nil && s.auditExporter.Log.ChainEnabled() {
+		lw := s.auditExporter.Log
+		payload.ChainInitialized = true
+		chainBody := map[string]any{
+			"enabled":   true,
+			"head_seq":  lw.ChainHeadSeq(),
+			"head_hash": lw.ChainHeadHash(),
+		}
+		if ms := lw.ManifestStatus(); ms != nil {
+			chainBody["manifest"] = ms
+		} else {
+			chainBody["manifest"] = map[string]any{"configured": false}
+		}
+		payload.AuditChain = chainBody
+	} else {
+		payload.ChainInitialized = false
+		payload.AuditChain = map[string]any{"enabled": false}
 	}
 	if s.store != nil {
 		if n, err := s.store.CountDecisions(); err == nil {
