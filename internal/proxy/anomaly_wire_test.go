@@ -100,6 +100,43 @@ func TestObserveAnomalyEmitsThroughWire(t *testing.T) {
 	}
 }
 
+// TestDecideAnomalyTightenPanicDegradesToFloor verifies the defensive
+// recover in decideAnomalyTighten: a panicking emitter in the core Decide
+// path must not crash the hot path and must degrade to the FLOOR decision
+// (allow stays allow, i.e. returns false/"not tightened").
+//
+// Mechanism: install a block-mode detector with a panicking emitter, then
+// trigger the cold-start adversarial backstop via a DROP TABLE statement.
+// Decide flags it as anomalous, calls the emitter (panic), and the
+// defer/recover catches it — returning false (floor=allow).
+func TestDecideAnomalyTightenPanicDegradesToFloor(t *testing.T) {
+	cfg := anomaly.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = "block"
+	cfg.MinActionsForBaseline = 50 // force cold-start so backstop fires
+	panicEmitter := func(_ map[string]any) {
+		panic("simulated scorer panic for recover test")
+	}
+	anomaly.SetProduct("dbounce")
+	d := anomaly.NewDetector(cfg, panicEmitter, false)
+	s := &Server{}
+	s.SetAnomalyDetector(d)
+
+	// DDL DROP — the leading verb "DROP" surfaces to the backstop.
+	row := store.DecisionRow{
+		StatementType:   "DDL",
+		Statement:       "DROP TABLE prod_orders",
+		IsDDL:           true,
+		TablesTouched:   []string{"prod_orders"},
+		Dialect:         "postgres",
+		DecisionVerdict: "ALLOW",
+	}
+	got := s.decideAnomalyTighten(row, "agent-test")
+	if got {
+		t.Fatalf("decideAnomalyTighten must return false (floor=allow) on a scorer panic, got true")
+	}
+}
+
 // TestObserveAnomalyDropReachesBackstopThroughWire asserts the #718
 // finding MEDIUM fix: a DROP statement (bucketed StatementType="DDL")
 // reaches the cold-start adversarial backstop and is flagged THROUGH

@@ -455,8 +455,10 @@ func buildOCSFAnomalyEvent(action, resource, agentIdentity string, res AnomalyRe
 // never accusatory.
 func friendlySummary(action string, res AnomalyResult, mode string) string {
 	// NOTE: even under mode=block the head stays "noticed", never
-	// "blocked" — block is NOT enforcing in this release (post-decision
-	// tap; see iam-jit#59), so claiming a block would be dishonest.
+	// "blocked" — block DOES enforce (allow->deny on anomalous via the
+	// pre-decision Decide path, iam-jit#59); the neutral phrasing is
+	// deliberate per [[ibounce-honest-positioning]]: accusatory language
+	// would be dishonest if the signal is a false positive.
 	head := "Your bouncer noticed something unusual"
 	var contributing []string
 	for _, e := range res.Explanations {

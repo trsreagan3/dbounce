@@ -153,10 +153,19 @@ func (s *Server) anomalyDetectorWired() bool {
 // nil/disabled detector returns false; the core never panics; a scoring
 // hiccup degrades to the floor (allow) so this can never spuriously deny
 // or break the connection.
-func (s *Server) decideAnomalyTighten(row store.DecisionRow, agentIdentity string) bool {
+func (s *Server) decideAnomalyTighten(row store.DecisionRow, agentIdentity string) (tightened bool) {
 	if !s.anomalyDetectorWired() {
 		return false
 	}
+	// DEFENSIVE RECOVER: if the core scoring path panics, degrade to the
+	// FLOOR decision (allow stays allow). A panic must never crash the
+	// hot path or spuriously deny a SQL statement. tightened is false by
+	// default; the named return ensures the caller sees "not tightened".
+	defer func() {
+		if recover() != nil {
+			tightened = false
+		}
+	}()
 	action, resource := sqlAnomalySignals(row)
 	out := s.anomalyDetector.Decide(anomaly.DecideInput{
 		Action:        action,
