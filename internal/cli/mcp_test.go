@@ -28,11 +28,26 @@ func TestMCPCmd_RegistersSubcommands(t *testing.T) {
 		"install-claude-code",
 		"install-cursor",
 		"install-codex",
+		"install-devin",
 		"show-config",
 		"list-tools",
 	} {
 		assert.True(t, names[want], "mcp subcommand %q must be wired", want)
 	}
+}
+
+func TestMCPInstallDevin_PrintsRecipe(t *testing.T) {
+	cmd := newMCPCmd()
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{"install-devin"})
+	require.NoError(t, cmd.Execute())
+	body := out.String()
+	// Cloud-agent recipe: HOST address (not loopback) + :5433 connect.
+	assert.Contains(t, body, "NOT 127.0.0.1")
+	assert.Contains(t, body, ":5433")
+	assert.Contains(t, body, "dbounce mcp show-config")
 }
 
 func TestMCPShowConfig_JSON(t *testing.T) {

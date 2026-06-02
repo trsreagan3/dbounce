@@ -150,7 +150,7 @@ func newMCPCmd() *cobra.Command {
 		Use:   "mcp",
 		Short: "MCP-over-stdio server + agent-client install helpers",
 		Long: `MCP-over-stdio server + install helpers for the common agent
-clients (Claude Code, Cursor, Codex).
+clients (Claude Code, Cursor, Codex, Devin).
 
 Subcommands:
 
@@ -158,6 +158,7 @@ Subcommands:
   dbounce mcp install-claude-code   wire dbounce into Claude Code / Desktop
   dbounce mcp install-cursor        wire dbounce into Cursor
   dbounce mcp install-codex         print Codex TOML snippet (manual install)
+  dbounce mcp install-devin         print the Devin cloud-agent recipe
   dbounce mcp show-config           print the canonical JSON / YAML snippet
   dbounce mcp list-tools            print the dbounce_* tool list
 
@@ -194,6 +195,7 @@ on stdin/stdout.`,
 	parent.AddCommand(newMCPInstallClaudeCodeCmd())
 	parent.AddCommand(newMCPInstallCursorCmd())
 	parent.AddCommand(newMCPInstallCodexCmd())
+	parent.AddCommand(newMCPInstallDevinCmd())
 	parent.AddCommand(newMCPShowConfigCmd())
 	parent.AddCommand(newMCPListToolsCmd())
 	return parent
@@ -316,6 +318,37 @@ the same way it does for Claude Code / Cursor.`,
 			"are not edited in place.")
 	cmd.Flags().BoolVar(&force, "force", false,
 		"Overwrite malformed existing JSON config without prompting.")
+	return cmd
+}
+
+// newMCPInstallDevinCmd implements `dbounce mcp install-devin`.
+func newMCPInstallDevinCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "install-devin",
+		Short: "Print the Devin cloud-agent recipe (no local config file)",
+		Long: `Devin is a cloud-hosted agent (Cognition's sandbox). There is no
+local config file dbounce can write into, and a bouncer on 127.0.0.1
+is NOT reachable from the sandbox.
+
+Per [[ibounce-honest-positioning]] this command does not pretend to
+wire a loopback config — it prints a recipe instead:
+
+  PATH A (connect mode, supported today): run dbounce on a routable
+          HOST address (--host 0.0.0.0 + --i-know-this-binds-externally)
+          and point Devin's DB client at <bouncer-host>:5433.
+  PATH B (MCP server, when Devin supports MCP): add the
+          ` + "`dbounce mcp show-config`" + ` snippet via the Devin UI.
+
+This mirrors ` + "`ibounce mcp install-devin`" + ` per [[cross-product-agent-parity]].`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mcpinstall.InstallDevin(mcpinstall.Options{
+				Out:    cmd.OutOrStdout(),
+				Stderr: cmd.ErrOrStderr(),
+			})
+			return err
+		},
+	}
 	return cmd
 }
 

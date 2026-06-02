@@ -89,10 +89,10 @@ func TestWriteStartupBanner_Quiet_SuppressesFingerprintFields(t *testing.T) {
 	for _, leaky := range []string{
 		"mode=cooperative",
 		"default-policy=deny",
-		"safe-default",                  // active profile name
-		"/tmp/state.db",                 // audit db path
-		"/etc/dbounce/profiles.yaml",    // profiles path
-		"D-Slice 1 is OBSERVATION-ONLY", // read-vs-write framing
+		"safe-default",               // active profile name
+		"/tmp/state.db",              // audit db path
+		"/etc/dbounce/profiles.yaml", // profiles path
+		"read vs write",              // read-vs-write framing block
 		"audit db",
 	} {
 		assert.NotContains(t, got, leaky,

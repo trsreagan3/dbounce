@@ -626,15 +626,19 @@ func newRunCmd() *cobra.Command {
 		Long: `Start the dbounce SQL wire-protocol listener.
 
 The wire-protocol listener binds to 127.0.0.1:5433 by default
-(loopback only — dbounce will hold SCRAM challenges + bearer tokens
-once D-Slice 2's real forwarding lands; binding externally exposes
-that surface). The management HTTP listener for /healthz binds to
-127.0.0.1:8768 (distinct from kbounce's 8766 and ibounce's 8767).
+(loopback only — dbounce holds SCRAM challenges + bearer tokens while
+proxying, so binding externally exposes that surface and requires
+--i-know-this-binds-externally). The management HTTP listener for
+/healthz binds to 127.0.0.1:8768 (distinct from kbounce's 8766 and
+ibounce's 8767).
 
-D-Slice 1 is OBSERVATION-ONLY: each inbound statement is parsed +
-audit-logged, then a synthetic ReadyForQuery is sent to the client.
-NOTHING ACTUALLY EXECUTES against any upstream. D-Slice 2 lands real
-forwarding.
+With --upstream set, dbounce is a real wire-protocol proxy: each
+inbound statement is parsed + audit-logged, then ALLOW verdicts are
+forwarded verbatim to the upstream and the real reply is streamed back
+to the client. In transparent mode, out-of-profile statements are
+denied with SQLSTATE 42501 and the upstream is never contacted. With
+NO --upstream, dbounce runs observation-only (parse + audit, synthetic
+ReadyForQuery, nothing executes).
 
 Ctrl+C exits cleanly (graceful shutdown).`,
 		Args: cobra.NoArgs,
