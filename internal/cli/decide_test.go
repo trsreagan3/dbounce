@@ -668,6 +668,151 @@ func TestDecideResult_IndicatorsInJSONEncoding(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// fix/16-decide-path-redaction — PII-consistency: at-rest SQLite row +
+// JSONL for the sync-prompt path must have redacted statement, matching
+// the `run` path's MED-D8-09 behaviour.
+//
+// decideSyncPromptStoredStatement is the unit under test; the integration
+// test confirms the store row reflects [REDACTED] + StatementRedacted=true,
+// and that the verdict decision is not affected by the stored form.
+// ---------------------------------------------------------------------------
+
+// TestDecideSyncPromptStoredStatement_RedactsLiterals pins the unit
+// contract: a statement with single-quoted literals is redacted, the
+// boolean indicates the change.
+func TestDecideSyncPromptStoredStatement_RedactsLiterals(t *testing.T) {
+	secretSQL := "INSERT INTO users (email, password) VALUES ('alice@example.com', 'super_secret_password_123')"
+	stored, redacted := decideSyncPromptStoredStatement(secretSQL)
+	assert.True(t, redacted,
+		"statement containing string literals MUST be marked as redacted")
+	assert.NotContains(t, stored, "alice@example.com",
+		"PII email MUST NOT appear in the stored statement")
+	assert.NotContains(t, stored, "super_secret_password_123",
+		"secret password MUST NOT appear in the stored statement")
+	assert.Contains(t, stored, "[REDACTED]",
+		"stored statement MUST contain the redaction placeholder")
+	// The SQL structure (INSERT INTO users) is preserved — audit reviewers
+	// still see the shape.
+	assert.Contains(t, stored, "INSERT INTO users")
+}
+
+// TestDecideSyncPromptStoredStatement_NoLiterals_NotRedacted pins the
+// non-regression: a statement without string literals reports
+// redacted=false and returns the original string unchanged.
+func TestDecideSyncPromptStoredStatement_NoLiterals_NotRedacted(t *testing.T) {
+	sql := "SELECT COUNT(*) FROM users WHERE id = 42"
+	stored, redacted := decideSyncPromptStoredStatement(sql)
+	assert.False(t, redacted,
+		"statement without string literals MUST NOT be marked as redacted")
+	assert.Equal(t, sql, stored,
+		"statement without string literals MUST pass through unchanged")
+}
+
+// TestDecideSyncPromptStoredStatement_EmptySQL_NotRedacted pins the
+// empty-input path: empty string passes through unchanged.
+func TestDecideSyncPromptStoredStatement_EmptySQL_NotRedacted(t *testing.T) {
+	stored, redacted := decideSyncPromptStoredStatement("")
+	assert.False(t, redacted)
+	assert.Equal(t, "", stored)
+}
+
+// TestDecideSyncPromptStoredStatement_AtRestRowHasRedactedStatement is the
+// integration-level test: persist a sync-prompt decision row (as decide.go's
+// sync-prompt branch does) and read it back from the store to confirm
+// (a) the at-rest SQLite row has [REDACTED] instead of the secret literal,
+// (b) StatementRedacted = true,
+// (c) the verdict/reason/type columns are unaffected by the redaction.
+//
+// This is the reproduce-then-confirm test for the PII-consistency gap:
+// prior to fix/16-decide-path-redaction, strings(state.db) surfaced the
+// raw secret. After the fix, the at-rest row contains only [REDACTED].
+func TestDecideSyncPromptStoredStatement_AtRestRowHasRedactedStatement(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	secretSQL := "INSERT INTO sessions (token, user_id) VALUES ('tok_s3cr3t_b34r3r', 99)"
+	storedStmt, wasRedacted := decideSyncPromptStoredStatement(secretSQL)
+
+	// Write the row exactly as the decide.go sync-prompt branch does
+	// after the fix.
+	id, err := st.RecordDecision(store.DecisionRow{
+		Dialect:           "postgres",
+		Statement:         storedStmt,
+		StatementRedacted: wasRedacted,
+		StatementType:     "INSERT",
+		IsDML:             true,
+		HasMutatingNode:   true,
+		DecisionVerdict:   "DENY",
+		DecisionReason:    "decide-path sync-prompt block (reason: default policy deny)",
+		ModeAtDecision:    "transparent",
+		DecisionSource:    "default",
+	})
+	require.NoError(t, err)
+	require.NotZero(t, id)
+
+	// Read it back from the store.
+	rows, err := st.RecentDecisions(5)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "exactly one decision row must be present")
+	row := rows[0]
+
+	// (a) Secret literal must not appear in the at-rest row.
+	assert.NotContains(t, row.Statement, "tok_s3cr3t_b34r3r",
+		"secret bearer token MUST NOT appear in the at-rest SQLite row "+
+			"(reproduce-then-confirm: this was the pre-fix leak)")
+	assert.Contains(t, row.Statement, "[REDACTED]",
+		"at-rest row MUST contain [REDACTED] placeholder")
+
+	// (b) StatementRedacted flag must be set.
+	assert.True(t, row.StatementRedacted,
+		"StatementRedacted MUST be true so audit consumers know the SQL is not replayable")
+
+	// (c) Verdict columns are unaffected — the decision is still DENY.
+	assert.Equal(t, "DENY", row.DecisionVerdict,
+		"verdict MUST be unaffected by statement redaction")
+	assert.Equal(t, "INSERT", row.StatementType,
+		"statement_type MUST be unaffected by statement redaction")
+	assert.Equal(t, "default", row.DecisionSource,
+		"decision_source MUST be unaffected by statement redaction")
+}
+
+// TestDecideSyncPromptStoredStatement_DecisionCorrectness confirms that
+// the eval decision returned by evalDecide (the verdict returned to the
+// caller, i.e. the JDBC shim) is based on the ORIGINAL sql, not the
+// redacted form. Redaction applies only to the stored record.
+//
+// The verdict path flows through evalDecide which never sees the stored
+// form; this test pins that a secret-bearing INSERT gets the same verdict
+// with or without literals.
+func TestDecideSyncPromptStoredStatement_DecisionCorrectness(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStoreForTest(t, dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+
+	// A secret-bearing INSERT under default-allow with no deny rules
+	// MUST still report allow — the presence of a secret literal in the
+	// SQL must not change the verdict.
+	secretSQL := "INSERT INTO sessions (token) VALUES ('tok_abc123')"
+	res, err := evalDecideForTest(t, st, nil, "postgres", "allow", secretSQL)
+	require.NoError(t, err)
+	assert.Equal(t, "allow", res.Verdict,
+		"verdict MUST be based on the SQL semantics (INSERT), not the literal values: "+
+			"redaction is for the stored record only and MUST NOT influence the verdict")
+	assert.Equal(t, "INSERT", res.StatementType,
+		"statement_type MUST reflect the original SQL correctly")
+
+	// Also confirm a statement without literals gets the same verdict.
+	plainSQL := "INSERT INTO sessions (user_id) VALUES (42)"
+	resPlain, err := evalDecideForTest(t, st, nil, "postgres", "allow", plainSQL)
+	require.NoError(t, err)
+	assert.Equal(t, res.Verdict, resPlain.Verdict,
+		"verdict MUST be identical for equivalent INSERT regardless of whether literals are present")
+}
+
+// ---------------------------------------------------------------------------
 // #559 test helpers — keep the evalDecide-direct call shape small so
 // the BB tests above stay readable.
 // ---------------------------------------------------------------------------
