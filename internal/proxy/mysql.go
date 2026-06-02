@@ -694,7 +694,25 @@ func (f *mysqlForwarder) handleGatedQuery(sql string, seq byte, payload []byte) 
 		TaskID:           dec.TaskID,
 	}
 
-	if dec.Verdict == VerdictDeny && f.srv.cfg.Mode == ModeTransparent {
+	// #59 — Phase H PRE-DECISION anomaly enforcement (MySQL path; mirrors
+	// forward.go's PG path). On a non-deny floor verdict, score the
+	// statement BEFORE forwarding so a block-mode anomaly DENIES.
+	// Tighten-only + fail-soft; routes through the enforced-deny path
+	// below regardless of mode. Baseline OBSERVE stays post-decision in
+	// recordMySQLDecision -> exportDecisionRowWithAgent.
+	anomalyTightened := false
+	if dec.Verdict != VerdictDeny &&
+		f.srv.decideAnomalyTighten(row, sqlAnomalyAgent(f.srv, f.sessionID)) {
+		dec.Verdict = VerdictDeny
+		dec.Reason = "anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
+		dec.Source = anomalyDenySource
+		row.DecisionVerdict = string(VerdictDeny)
+		row.DecisionReason = dec.Reason
+		row.DecisionSource = dec.Source
+		anomalyTightened = true
+	}
+
+	if dec.Verdict == VerdictDeny && (f.srv.cfg.Mode == ModeTransparent || anomalyTightened) {
 		// #203 sync-prompt-on-deny — parallel to forward.go's PG path.
 		// See that file's commentary for the audit-row double-record
 		// pattern + the syncPromptActive gate.

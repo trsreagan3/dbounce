@@ -7,14 +7,25 @@
 // lets the request through + surfaces an anomaly event; it never
 // blocks.
 //
-// BLOCK MODE IS NOT ENFORCING IN THIS RELEASE. The behavioral tap runs
-// POST-decision (the proxy has already let the request proceed by the
-// time the anomaly is scored), so mode=block cannot actually deny the
-// request here. Pre-decision wiring is tracked in iam-jit#59. Until
-// then mode=block behaves as alert+flag: the anomaly is flagged and a
-// high-severity OCSF event is emitted for operator action, and we log a
-// one-time WARNING so the operator is never misled into thinking block
-// is enforcing. Do NOT advertise mode=block as denying.
+// BLOCK MODE ENFORCES via the PRE-DECISION path (iam-jit#59). Two
+// distinct entry points share this core:
+//
+//   - Decide (PRE-decision): consulted on a non-deny floor verdict
+//     BEFORE the proxy serves the response. In mode=block an anomalous
+//     verdict TIGHTENS allow->deny + emits a high-severity OCSF event.
+//     TIGHTEN-ONLY: Decide may only make a decision MORE restrictive
+//     (allow->deny); it never turns a deny into allow and never widens.
+//     In alert / detection-only / disabled mode Decide is a pass-through
+//     no-op (no score, no emit) — alerting stays on the observe path.
+//   - Run (POST-decision): observes the (possibly tightened) decision
+//     into the per-agent baseline for learning AND, in alert mode, scores
+//     + emits the neutral alert. When the floor already denied (including
+//     a deny that Decide just tightened to) Run short-circuits, so block
+//     never double-counts or double-emits.
+//
+// This split keeps OBSERVE post-decision (learning is fine after the
+// fact) while moving the SCORING that gates a block to a pre-decision
+// point so the deny can actually be returned.
 //
 // Per [[ibounce-honest-positioning]] every operator-facing string uses
 // NEUTRAL language — "your bouncer noticed something unusual", never
@@ -58,13 +69,16 @@ func productName() string {
 
 // HookResult is the per-request outcome. Ports hook.py HookResult.
 type HookResult struct {
-	// Decision is the floor verdict passed through ("allow"/"deny").
-	// NOTE: the anomaly tap does NOT override the floor decision in this
-	// release — even under mode=block it returns the floor verdict
-	// (block enforcement is post-decision and not wired; see iam-jit#59
-	// and the package doc). An anomalous verdict surfaces a flag + event
-	// for operator action; it does not deny.
+	// Decision is the effective verdict ("allow"/"deny"). On the Run
+	// (post-decision) path this is the floor verdict passed through. On
+	// the Decide (pre-decision) path mode=block may TIGHTEN it from
+	// "allow" to "deny" on an anomalous verdict — never the reverse (see
+	// the package doc + iam-jit#59).
 	Decision string
+	// Tightened is true only when the Decide (pre-decision) path flipped
+	// a non-deny floor verdict to "deny" under mode=block. Lets the wire
+	// distinguish an anomaly-driven block from a pass-through.
+	Tightened bool
 	// Anomaly is the full scoring result; nil when the detector is
 	// disabled.
 	Anomaly *AnomalyResult
@@ -100,10 +114,11 @@ type Detector struct {
 	flagged atomic.Int64
 	emitted atomic.Int64
 
-	// blockWarnOnce logs a single honest WARNING the first time a
-	// block-configured detector runs, so an operator is never misled
-	// into thinking mode=block enforces a deny in this release.
-	blockWarnOnce sync.Once
+	// blockArmedOnce logs a single honest INFO the first time a
+	// block-configured detector runs, confirming pre-decision
+	// enforcement is armed (block now tightens allow->deny via Decide,
+	// iam-jit#59).
+	blockArmedOnce sync.Once
 }
 
 // NewDetector builds a Detector. A disabled config yields a no-op
@@ -170,12 +185,26 @@ func (d *Detector) Run(in RunInput) HookResult {
 	}
 
 	// When the floor already denied, the deny path owns the surface.
+	// This is also the path a block-mode tighten takes: Decide flipped
+	// the verdict to "deny" PRE-decision (emitting the high-severity
+	// event itself), so Run only records the observation here and does
+	// NOT re-score or re-emit — no double-count, no double-emit.
 	if floor == "deny" && !d.detectionOnly {
 		return HookResult{
 			Decision:        "deny",
 			OperatorMessage: in.FloorDenyReason,
 			Mode:            mode,
 		}
+	}
+
+	// BLOCK: scoring + emission on a non-deny floor belong to the
+	// PRE-decision Decide path (so the deny can actually be returned).
+	// On this POST-decision observe path we only LEARN in block mode —
+	// scoring/emitting here would be both too late to deny and a
+	// duplicate of what Decide already surfaced. (Run still scores+emits
+	// in alert / detection-only mode, where there is no Decide step.)
+	if mode == "block" && !d.detectionOnly {
+		return HookResult{Decision: floor, Mode: mode}
 	}
 
 	summary := d.store.SummaryFor(in.AgentIdentity, in.Action, in.Resource, 0)
@@ -199,7 +228,6 @@ func (d *Detector) Run(in RunInput) HookResult {
 	}
 	d.flagged.Add(1)
 
-	mode = d.effectiveMode()
 	event := buildOCSFAnomalyEvent(in.Action, in.Resource, in.AgentIdentity, res, mode, d.detectionOnly)
 	emitted := false
 	if d.emitter != nil {
@@ -208,20 +236,9 @@ func (d *Detector) Run(in RunInput) HookResult {
 		d.emitted.Add(1)
 	}
 
-	// HONEST BLOCK: the behavioral tap is post-decision, so it cannot
-	// actually deny here (the request already proceeded). mode=block is
-	// therefore NOT enforcing in this release — it behaves as alert+flag
-	// with a high-severity event for operator action. We pass the floor
-	// decision through unchanged and warn ONCE so the operator is never
-	// misled. Pre-decision enforcement is tracked in iam-jit#59.
-	if mode == "block" && !d.detectionOnly {
-		d.blockWarnOnce.Do(func() {
-			log.Printf("[anomaly] WARNING: anomaly_detection.mode=block is NOT enforcing in this release: " +
-				"the behavioral tap runs after the decision, so anomalies are flagged + a high-severity " +
-				"event is emitted for operator action, but the request is NOT denied (behaves as alert+flag). " +
-				"Pre-decision block enforcement is tracked in iam-jit#59.")
-		})
-	}
+	// Reached only in alert / detection-only effective mode (block
+	// returned above). Surface the neutral alert; never change the
+	// decision here.
 	return HookResult{
 		Decision:        floor,
 		Anomaly:         &res,
@@ -230,6 +247,123 @@ func (d *Detector) Run(in RunInput) HookResult {
 		OperatorMessage: friendlySummary(in.Action, res, mode),
 		Mode:            mode,
 	}
+}
+
+// DecideInput is the PRE-decision input to Decide. The detector derives
+// the deviation signals (hour-of-day from the store clock + the recent-
+// window action rate from the baseline) itself so the wire passes only
+// the structural shapes + the floor verdict — privacy preserved.
+type DecideInput struct {
+	Action        string
+	AgentIdentity string
+	Resource      string
+	// FloorDecision is the deterministic scorer's verdict so far:
+	// "allow" or "deny". Decide is TIGHTEN-ONLY — it is consulted ONLY
+	// to make a non-deny verdict more restrictive.
+	FloorDecision string
+}
+
+// Decide is the PRE-DECISION enforcement check (iam-jit#59). It runs in
+// the LIVE decision path BEFORE the response is served and is the ONLY
+// place the anomaly signal can change a verdict.
+//
+// TIGHTEN-ONLY INVARIANT (the security contract): Decide may only make a
+// decision MORE restrictive. Concretely:
+//
+//   - floor == "deny"            -> returned UNCHANGED (never loosened).
+//   - mode != block (alert /
+//     detection-only / disabled)  -> floor returned UNCHANGED, no score,
+//     no emit (alerting is the observe path's job, post-decision).
+//   - mode == block, floor allow,
+//     verdict anomalous           -> TIGHTEN allow->deny + emit event.
+//   - mode == block, floor allow,
+//     verdict not anomalous       -> floor (allow) returned UNCHANGED.
+//
+// The only mutation Decide ever performs is allow->deny; there is no
+// code path that returns a verdict less restrictive than the floor.
+//
+// Decide does NOT record an observation: learning stays on the Run
+// (post-decision) path so the baseline reflects what actually happened.
+// FAIL-SOFT: Decide never panics out; any internal scoring weirdness
+// degrades to the floor decision (allow stays allow) rather than denying
+// spuriously or breaking the request path. The per-repo wire wraps the
+// call so a detector error also falls through to the floor.
+func (d *Detector) Decide(in DecideInput) HookResult {
+	floor := in.FloorDecision
+	if floor == "" {
+		floor = "allow"
+	}
+	// Disabled / unwired: pass through.
+	if d == nil || !d.cfg.Enabled {
+		return HookResult{Decision: floor, Mode: "disabled"}
+	}
+	mode := d.effectiveMode()
+
+	// TIGHTEN-ONLY GUARD #1: never consult the signal on a deny floor.
+	// A deny stays a deny — Decide cannot loosen it.
+	if floor == "deny" {
+		return HookResult{Decision: "deny", Mode: mode}
+	}
+	// TIGHTEN-ONLY GUARD #2: only mode=block (and not detection-only)
+	// may tighten. Everything else passes the floor through untouched;
+	// the alert/observe surface stays on the Run path so we neither
+	// double-score nor double-emit.
+	if mode != "block" || d.detectionOnly {
+		return HookResult{Decision: floor, Mode: mode}
+	}
+
+	// mode == block, floor is non-deny (allow). Score WITHOUT observing
+	// (learning happens post-decision in Run). Derive the live deviation
+	// signals from the store the same way the observe path does.
+	res := d.scoreLive(in.Action, in.AgentIdentity, in.Resource)
+	d.scored.Add(1)
+	if res.Verdict != VerdictAnomalous {
+		// Not anomalous: floor (allow) passes through UNCHANGED.
+		return HookResult{Decision: floor, Anomaly: &res, Mode: mode}
+	}
+	d.flagged.Add(1)
+
+	event := buildOCSFAnomalyEvent(in.Action, in.Resource, in.AgentIdentity, res, mode, d.detectionOnly)
+	emitted := false
+	if d.emitter != nil {
+		d.emitter(event)
+		emitted = true
+		d.emitted.Add(1)
+	}
+	d.blockArmedOnce.Do(func() {
+		log.Printf("[anomaly] anomaly_detection.mode=block is ARMED: anomalous requests are " +
+			"DENIED pre-decision (allow->deny) and a high-severity event is emitted. " +
+			"Tighten-only: a deny is never loosened. (iam-jit#59)")
+	})
+	// TIGHTEN: allow -> deny. This is the ONLY mutation Decide performs.
+	return HookResult{
+		Decision:        "deny",
+		Tightened:       true,
+		Anomaly:         &res,
+		EmittedAlert:    emitted,
+		Event:           event,
+		OperatorMessage: friendlySummary(in.Action, res, mode),
+		Mode:            mode,
+	}
+}
+
+// scoreLive derives the live deviation signals (hour-of-day from the
+// store clock + recent-window action rate from the baseline) and scores
+// the sample WITHOUT recording an observation. Shared by Decide so the
+// pre-decision verdict uses the same signals the observe path feeds.
+func (d *Detector) scoreLive(action, agentIdentity, resource string) AnomalyResult {
+	now := d.store.NowUTC()
+	observedHour := now.Hour()
+	observedRate := d.store.RecentRate(agentIdentity, action, resource, 0)
+	summary := d.store.SummaryFor(agentIdentity, action, resource, 0)
+	si := ScoreInput{
+		Action:              action,
+		AgentIdentity:       agentIdentity,
+		Resource:            resource,
+		ObservedHour:        observedHour,
+		ObservedActionCount: observedRate,
+	}
+	return ScoreAnomaly(si, summary, d.cfg)
 }
 
 // Status returns a diagnostics snapshot for /healthz + the query

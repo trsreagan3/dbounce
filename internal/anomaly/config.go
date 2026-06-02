@@ -130,11 +130,12 @@ func parseDurationToSeconds(raw any, field string) (int, error) {
 // the Python dataclass defaults.
 type Config struct {
 	Enabled bool
-	// Mode is "alert" | "block". NOTE: block is NOT enforcing in this
-	// release — the behavioral tap is post-decision, so mode=block
-	// behaves as alert+flag (anomaly flagged + a high-severity event
-	// emitted for operator action) and does NOT deny the request.
-	// Pre-decision block enforcement is tracked in iam-jit#59.
+	// Mode is "alert" | "block". alert (default) flags + emits a neutral
+	// high-severity event but never denies. block ENFORCES: an anomalous
+	// request is DENIED pre-decision (allow->deny) via Detector.Decide in
+	// the live decision path, and the same high-severity event is
+	// emitted. Tighten-only — a deterministic deny is never loosened
+	// (iam-jit#59). detection-only deployments force alert regardless.
 	Mode                  string
 	Sensitivity           string // "low" | "medium" | "high"
 	BaselineWindowSeconds int
