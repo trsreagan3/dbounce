@@ -396,11 +396,29 @@ func TestExportHealth_F8_LicenseExpiryDeferred(t *testing.T) {
 // TestExportHealth_DegradedAlert_FiresViaCheckExportHealthAndAlert
 // confirms the SECURITY_ALERT lands via the exporter best-effort +
 // the stderr line.
+//
+// Race-hardening note (issue #5): the LogWriter's runWorker goroutine
+// updates lastWriteAtUnixNano after every successful encode. If a
+// successful write lands BETWEEN the first and second
+// CheckExportHealthAndAlert calls, WritesOK() can flip back to true
+// and the second call sees health.Degraded=false — it short-circuits
+// before calling debouncer.ShouldFire, leaving suppressedTotal==0.
+// Fix: close the underlying file before recording the error so every
+// encode attempt fails and lastWriteAtUnixNano is never bumped. This
+// is the same pattern as F4 (TestExportHealth_F4_LogWriteFailure).
 func TestExportHealth_DegradedAlert_FiresViaCheckExportHealthAndAlert(t *testing.T) {
 	dir := t.TempDir()
 	w, err := NewLogWriter(LogOptions{Path: filepath.Join(dir, "audit.jsonl")})
 	require.NoError(t, err)
-	// Force degradation via direct recordErr (the F4 pattern).
+	// Close the file under the worker so every subsequent encode fails
+	// (ErrClosed) — WritesOK stays false for the entire test even if the
+	// worker goroutine is scheduled between the two Check calls.
+	osF, ok := w.f.(*os.File)
+	require.True(t, ok)
+	require.NoError(t, osF.Close())
+	// Record the simulated error AFTER closing the fd so lastErrAtUnixNano
+	// is set. The worker's failed encode will also call recordErr, keeping
+	// lastErrAtUnixNano fresh; either way WritesOK stays false.
 	w.recordErr(errOf("simulated perm-denied"))
 	exp := NewExporter(w, nil, "127.0.0.1:5433", "")
 	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
@@ -413,7 +431,10 @@ func TestExportHealth_DegradedAlert_FiresViaCheckExportHealthAndAlert(t *testing
 		"stderr MUST carry the audit_export_degraded line")
 	assert.Contains(t, stderr.String(), "log writes failing",
 		"stderr MUST carry the reason for triage")
-	// Second call within the debounce window MUST suppress.
+	// Second call within the debounce window MUST suppress. Because the
+	// file fd is closed, the worker can never bump lastWriteAtUnixNano
+	// past lastErrAtUnixNano, so health.Degraded stays true and the
+	// debouncer's ShouldFire is guaranteed to be reached (and suppress).
 	fired2 := exp.CheckExportHealthAndAlert(
 		context.Background(), debouncer, stderr, "127.0.0.1:5433")
 	assert.False(t, fired2, "second call within debounce window MUST suppress")
