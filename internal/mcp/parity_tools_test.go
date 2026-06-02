@@ -156,9 +156,12 @@ func TestMCP_ListPresets_ReturnsSQLCatalog(t *testing.T) {
 	presets, ok := sc["presets"].([]any)
 	require.True(t, ok)
 	require.NotEmpty(t, presets)
-	// Each entry must have id, title, description, rule_count.
+	// Each entry must have id, name, title, description, rule_count.
+	// name == id so agents can pass list_presets → apply_preset(name=...) without mapping.
 	first := presets[0].(map[string]any)
 	assert.NotEmpty(t, first["id"], "preset must have id")
+	assert.NotEmpty(t, first["name"], "preset must have name (kbounce parity for apply_preset arg)")
+	assert.Equal(t, first["id"], first["name"], "name must equal id")
 	assert.NotEmpty(t, first["title"], "preset must have title")
 	rc, _ := first["rule_count"].(float64)
 	assert.Greater(t, int(rc), 0, "preset must have at least one rule")

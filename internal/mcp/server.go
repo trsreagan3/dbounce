@@ -1319,6 +1319,7 @@ func (s *Server) toolListPresets(_ map[string]any) (map[string]any, error) {
 		allow, deny := p.ToProxyRules()
 		out = append(out, map[string]any{
 			"id":          p.ID,
+			"name":        p.ID, // alias for apply_preset parity: agent passes "name" arg
 			"title":       p.Title,
 			"description": p.Description,
 			"rule_count":  len(allow) + len(deny),
