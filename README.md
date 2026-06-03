@@ -87,39 +87,76 @@ wire-protocol path.
 
 ## Install
 
-No Go toolchain required for the paths below — they install a
-prebuilt, signed-by-release binary. `dbounce --version` should print a
-version after any of them.
+### go install (works today — needs Go ≥ 1.25)
 
-### Homebrew (macOS / Linux)
+```sh
+go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
+dbounce --version
+
+# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
+# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by default.
+export PATH="$PATH:$(go env GOPATH)/bin"
+# Persist: echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
+```
+
+**Toolchain note:** `go.mod` specifies `go 1.25.0`. `GOTOOLCHAIN=auto`
+handles this automatically on most machines.
+
+**Version stamp note:** `go install` does not carry ldflags, so
+`dbounce --version` will report `commit none, built unknown`. This is
+expected and does not affect functionality. Stamped binaries come from
+the tagged release artifacts.
+
+> The `go install` PATH note closes #549 (UAT L1 2026-05-24): the
+> unmodified `go install` succeeds silently with the binary at
+> `~/go/bin/dbounce` while the shell reports "command not found", which
+> reads as "install broken" on a fresh machine.
+
+### From source (git clone + go build)
+
+```sh
+git clone https://github.com/trsreagan3/dbounce.git
+cd dbounce
+go build -o bin/dbounce ./cmd/dbounce
+./bin/dbounce --version
+# or: make build   (drops the binary into ./bin/dbounce)
+```
+
+### Available at launch (first tagged release)
+
+> The following paths require a tagged GitHub release with prebuilt
+> artifacts. They are configured but dormant — no tag has been pushed yet.
+> Note: dbounce uses CGO (pg_query_go wraps libpg_query), so prebuilt
+> linux binaries are statically linked with musl; darwin builds use the
+> native macOS toolchain. Windows is not supported in v1.0.
+
+#### Homebrew (macOS / Linux)
 
 ```sh
 brew install trsreagan3/tap/dbounce
 ```
 
-### Prebuilt binary (any OS)
+#### Prebuilt binary (macOS / Linux)
 
 Each [GitHub Release](https://github.com/trsreagan3/dbounce/releases)
-attaches `dbounce_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) for
-`linux`/`darwin`/`windows` × `amd64`/`arm64`. Download, extract, and
+attaches `dbounce_<version>_<os>_<arch>.tar.gz` for
+`linux`/`darwin` × `amd64`/`arm64`. Download, extract, and
 put `dbounce` on your `PATH`:
 
 ```sh
 # Example: macOS arm64. Swap in the os/arch + version for your machine.
 curl -fsSL -o dbounce.tar.gz \
-  https://github.com/trsreagan3/dbounce/releases/latest/download/dbounce_<version>_Darwin_arm64.tar.gz
+  https://github.com/trsreagan3/dbounce/releases/latest/download/dbounce_<version>_darwin_arm64.tar.gz
 tar -xzf dbounce.tar.gz dbounce
 sudo install dbounce /usr/local/bin/dbounce
 ```
 
-### Scoop (Windows)
+#### Scoop (Windows)
 
-```powershell
-scoop bucket add trsreagan3 https://github.com/trsreagan3/scoop-bucket
-scoop install dbounce
-```
+Not available in v1.0 (CGO dependency prevents Windows cross-compilation).
+Use `go install` on Windows with a MinGW toolchain.
 
-### APT / RPM (Debian/Ubuntu, RHEL/Fedora)
+#### APT / RPM (Debian/Ubuntu, RHEL/Fedora)
 
 Releases attach `.deb` + `.rpm` packages. They are **not** published to
 a public APT/RPM registry yet — download the package from the release
@@ -141,29 +178,10 @@ See [docs/INSTALL-APT.md](docs/INSTALL-APT.md) /
 [docs/INSTALL-RPM.md](docs/INSTALL-RPM.md) if present for the full
 package runbooks.
 
-### Docker
+#### Docker
 
 See [Docker](#docker) below for the published `ghcr.io/trsreagan3/dbounce`
 image.
-
-### From source (Go toolchain required)
-
-```sh
-go install github.com/trsreagan3/dbounce/cmd/dbounce@latest
-dbounce --version
-
-# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
-# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by
-# default. Fix once per shell, then persist in your shell rc:
-export PATH="$PATH:$(go env GOPATH)/bin"
-echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc   # bash
-echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc    # zsh
-```
-
-> The `go install` PATH note closes #549 (UAT L1 2026-05-24): the
-> unmodified `go install` succeeds silently with the binary at
-> `~/go/bin/dbounce` while the shell reports "command not found", which
-> reads as "install broken" on a fresh machine.
 
 ## Add to your agent
 

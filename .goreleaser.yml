@@ -1,16 +1,34 @@
-# .goreleaser.yml — dbounce pre-built binary release pipeline
+# .goreleaser.yml — dbounce release pipeline
 #
-# Triggered by: push of a v* tag (see .github/workflows/release.yml)
-# Produces: .deb + .rpm + .tar.gz + .zip for linux/amd64 + linux/arm64 + darwin + windows
-# Artifacts uploaded to the GitHub Release created by the tag push.
+# Triggered on: push of a v* tag (see .github/workflows/release.yml).
+# Snapshot validation: goreleaser release --snapshot --clean (no publish).
+# Config check:       goreleaser check
 #
-# NOTE: "published to public APT/RPM registries" is follow-up work (post-v1.0).
-# This config: builds artifacts + attaches them to GitHub Releases.
-# Users install via `curl | dpkg -i` or `curl | rpm -i` per docs/INSTALL-APT.md
-# and docs/INSTALL-RPM.md.
+# CGO NOTE: dbounce depends on github.com/pganalyze/pg_query_go/v6, which
+# wraps libpg_query (C). CGO_ENABLED=1 is required. The CI workflow installs
+# build-base + musl-dev and passes -extldflags '-static' so the resulting
+# binary runs on distroless/static (no shared libc dependency).
+# windows cross-compile requires MinGW; skipped for v1.0.
 #
-# Per [[vendor-integration-claim-qualifier]]: artifacts are built + smoke-tested
-# in CI containers; NOT published to public deb/rpm package registry.
+# Produces per tagged release:
+#   .tar.gz         → linux/darwin, amd64/arm64  (windows skipped — CGO)
+#   .deb / .rpm     → linux amd64 + arm64
+#   docker          → ghcr.io/trsreagan3/dbounce linux/amd64 + linux/arm64
+#   brew            → trsreagan3/homebrew-tap Formula/dbounce.rb
+#   scoop           → trsreagan3/scoop-bucket bucket/dbounce.json
+#
+# NOTE: deb/rpm artifacts are attached to GitHub Releases; NOT published to a
+# public APT/RPM registry (follow-up post-v1.0 work).
+# Per [[vendor-integration-claim-qualifier]]: built + smoke-tested in CI;
+# NOT published to public deb/rpm package registry.
+#
+# PREREQUISITES before the first real tagged release:
+#   1. Create https://github.com/trsreagan3/homebrew-tap (public repo,
+#      stub Formula/ dir). Secret: HOMEBREW_TAP_TOKEN (repo scope PAT).
+#   2. Create https://github.com/trsreagan3/scoop-bucket (public repo,
+#      stub bucket/ dir). Secret: SCOOP_BUCKET_TOKEN (repo scope PAT).
+#   3. Confirm ghcr.io/trsreagan3/dbounce package visibility on GitHub.
+#   4. DO NOT push a v* tag until launch readiness is confirmed.
 
 version: 2
 
@@ -20,45 +38,64 @@ before:
   hooks:
     - go mod tidy
 
+# ── Builds ────────────────────────────────────────────────────────────────────
 builds:
   - id: dbounce
     binary: dbounce
     main: ./cmd/dbounce
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     flags:
       - -trimpath
     ldflags:
+      # Stamp the three vars in internal/cli/cli.go PLUS audit.BuildVersion
+      # (used directly in internal/audit/event.go for OCSF metadata stamping).
+      # Use .ShortCommit (7-char SHA) to match what the Makefile + Dockerfile emit.
+      # -extldflags '-static' links against musl so the binary runs on
+      # distroless/static without a shared libc dependency.
       - -s -w
+      - -extldflags '-static'
       - -X github.com/trsreagan3/dbounce/internal/cli.version={{.Version}}
-      - -X github.com/trsreagan3/dbounce/internal/cli.commit={{.Commit}}
+      - -X github.com/trsreagan3/dbounce/internal/cli.commit={{.ShortCommit}}
       - -X github.com/trsreagan3/dbounce/internal/cli.buildTime={{.Date}}
+      - -X github.com/trsreagan3/dbounce/internal/audit.BuildVersion={{.Version}}
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
+    # windows: MinGW cross-toolchain needed for CGO; skip for v1.0.
+    # CGO cross-compile note: `goreleaser build --snapshot` fails for linux
+    # targets when run on macOS because CGO can't cross-compile to linux
+    # without musl cross-compilers. This is expected on macOS dev machines.
+    # The CI workflow (ubuntu-latest) has native linux toolchain + musl-dev
+    # installed and produces all 4 targets cleanly. Validate locally by
+    # running: CGO_ENABLED=1 go build ./cmd/dbounce (native only).
 
+# ── Archives ──────────────────────────────────────────────────────────────────
 archives:
   - id: dbounce-archive
-    builds:
+    ids:
       - dbounce
     name_template: "dbounce_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
+    formats:
+      - tar.gz
     files:
       - LICENSE
       - README.md
       - CHANGELOG.md
 
+# ── Checksums ─────────────────────────────────────────────────────────────────
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ── Native packages (deb + rpm) ───────────────────────────────────────────────
 nfpms:
   - id: dbounce-deb-rpm
     package_name: dbounce
-    builds:
+    ids:
       - dbounce
     vendor: trsreagan3
     homepage: https://github.com/trsreagan3/dbounce
@@ -81,13 +118,18 @@ nfpms:
     scripts:
       postinstall: scripts/nfpm/postinstall.sh
 
+# ── Homebrew tap ──────────────────────────────────────────────────────────────
+# Writes Formula/dbounce.rb to trsreagan3/homebrew-tap on release.
+# Requires HOMEBREW_TAP_TOKEN secret. Tap repo must exist first.
+# NOTE: goreleaser free tier uses `brews` (goreleaser Pro uses `homebrew`).
+# `brews` is deprecated upstream but remains the only non-Pro stanza in v2.
 brews:
   - name: dbounce
     repository:
       owner: trsreagan3
       name: homebrew-tap
       branch: "bump-dbounce-{{.Version}}"
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
       pull_request:
         enabled: true
         base:
@@ -103,18 +145,22 @@ brews:
         -X github.com/trsreagan3/dbounce/internal/cli.version=#{version}
         -X github.com/trsreagan3/dbounce/internal/cli.commit=homebrew
         -X github.com/trsreagan3/dbounce/internal/cli.buildTime=#{time.iso8601}
+        -X github.com/trsreagan3/dbounce/internal/audit.BuildVersion=#{version}
       ]
       system "go", "build", "-trimpath", "-ldflags", ldflags.join(" "), "-o", bin/"dbounce", "./cmd/dbounce"
     test: |
       assert_match version.to_s, shell_output("#{bin}/dbounce --version")
       assert_match "dbounce", shell_output("#{bin}/dbounce --help")
 
+# ── Scoop bucket ──────────────────────────────────────────────────────────────
+# Writes bucket/dbounce.json to trsreagan3/scoop-bucket on release.
+# Requires SCOOP_BUCKET_TOKEN secret. Bucket repo must exist first.
 scoops:
   - repository:
       owner: trsreagan3
       name: scoop-bucket
       branch: "bump-dbounce-{{.Version}}"
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      token: "{{ .Env.SCOOP_BUCKET_TOKEN }}"
       pull_request:
         enabled: true
         base:
@@ -126,10 +172,58 @@ scoops:
     description: "SQL-wire-protocol safety proxy for AI agents and dev workflows"
     license: Apache-2.0
 
-checksum:
-  name_template: "checksums.txt"
-  algorithm: sha256
+# ── Docker images ─────────────────────────────────────────────────────────────
+# Uses Dockerfile.goreleaser (distroless; goreleaser copies the binary in).
+# dbounce is a CGO binary; with -extldflags '-static' it runs on distroless/static.
+# KEEP PRIVATE: visibility is controlled on GHCR, not here.
+# Images will NOT be pushed until a real tag triggers the release workflow.
+dockers:
+  - id: dbounce-linux-amd64
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/trsreagan3/dbounce:{{ .Version }}-amd64"
+      - "ghcr.io/trsreagan3/dbounce:latest-amd64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/trsreagan3/dbounce"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--label=org.opencontainers.image.title=dbounce"
+      - "--label=org.opencontainers.image.description=SQL gating proxy for AI agents and dev workflows"
 
+  - id: dbounce-linux-arm64
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/trsreagan3/dbounce:{{ .Version }}-arm64"
+      - "ghcr.io/trsreagan3/dbounce:latest-arm64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.source=https://github.com/trsreagan3/dbounce"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--label=org.opencontainers.image.title=dbounce"
+      - "--label=org.opencontainers.image.description=SQL gating proxy for AI agents and dev workflows"
+
+docker_manifests:
+  - name_template: "ghcr.io/trsreagan3/dbounce:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/trsreagan3/dbounce:{{ .Version }}-amd64"
+      - "ghcr.io/trsreagan3/dbounce:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/trsreagan3/dbounce:latest"
+    image_templates:
+      - "ghcr.io/trsreagan3/dbounce:latest-amd64"
+      - "ghcr.io/trsreagan3/dbounce:latest-arm64"
+
+# ── Release ───────────────────────────────────────────────────────────────────
 release:
   github:
     owner: trsreagan3
@@ -138,6 +232,7 @@ release:
   draft: false
   prerelease: auto
 
+# ── Changelog ─────────────────────────────────────────────────────────────────
 changelog:
   use: github
   sort: asc
