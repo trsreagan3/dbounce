@@ -33,6 +33,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/dbounce/internal/anomaly"
 	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/caveats"
 	"github.com/trsreagan3/dbounce/internal/dynamicdeny"
@@ -1122,14 +1123,19 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 			// (IAM_JIT_ANOMALY_DETECTION=1 / mode / sensitivity).
 			// Frictionless per [[lightweight-frictionless-principle]];
 			// DISABLED by default + ALERT (never block) when enabled per
-			// [[safety-mode-lean-permissive]].
+			// [[safety-mode-lean-permissive]]. enabledAnomalyCfg is
+			// non-nil only when detection is ENABLED; passed to
+			// writeStartupBanner so the mode-aware banner renders
+			// "enforcement ARMED" for block mode (honest per
+			// [[ibounce-honest-positioning]]) instead of the old
+			// "does not block" copy that was wrong for mode=block.
+			var enabledAnomalyCfg *anomaly.Config
 			if acfg, aerr := proxy.AnomalyConfigFromEnv(); aerr != nil {
 				return fmt.Errorf("anomaly_detection config: %w", aerr)
 			} else if acfg.Enabled {
 				s.SetAnomalyDetector(s.NewAnomalyDetector(acfg))
-				fmt.Fprintf(cmd.ErrOrStderr(),
-					"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — surfaces a neutral signal for review, does not block by default\n",
-					acfg.Mode, acfg.Sensitivity)
+				cfgCopy := acfg
+				enabledAnomalyCfg = &cfgCopy
 			}
 
 			// #252 Slice 1: build the audit-export fan-out from the
@@ -1328,6 +1334,7 @@ Ctrl+C exits cleanly (graceful shutdown).`,
 				Quiet:                quietBanner,
 				AuditExporter:        auditExporter,
 				ActiveProfile:        activeProfile,
+				AnomalyCfg:           enabledAnomalyCfg,
 			})
 			// #324c — dynamic-denies banner line. One line (with optional
 			// upstream-denied second line) per [[cross-product-agent-

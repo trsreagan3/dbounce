@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/trsreagan3/dbounce/internal/anomaly"
 	"github.com/trsreagan3/dbounce/internal/audit"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
@@ -57,6 +58,16 @@ type bannerOpts struct {
 	// admin-grant warning fires. nil → warning is skipped (the
 	// banner can't introspect what it doesn't have).
 	ActiveProfile *profile.Profile
+	// AnomalyCfg, when non-nil, indicates that Phase H behavioral-
+	// deviation detection is ENABLED. The Mode field drives the
+	// honest enforcement line:
+	//   mode=block  → "enforcement ARMED — anomalous statements are denied"
+	//   mode=alert  → neutral signal / never blocks
+	// nil = anomaly detection disabled (no banner line emitted).
+	// Per [[ibounce-honest-positioning]]: block mode DOES block live
+	// (confirmed SQLSTATE 42501 denials over the PG wire); saying
+	// "does not block" when mode=block is dishonest.
+	AnomalyCfg *anomaly.Config
 }
 
 // writeStartupBanner writes the post-startup banner to w. Returns no
@@ -310,6 +321,37 @@ func writeStartupBanner(w io.Writer, opts bannerOpts) {
 				"    dbounce rules add 'ALTER_PRIVILEGES:*' --effect allow --note 'role provisioning'")
 			fmt.Fprintln(w,
 				"  REVOKE is unaffected (cleanup direction is always allowed).")
+		}
+	}
+	// #718 ADOPT-4 — Phase H anomaly-detection banner. Prints ONLY when
+	// the detector is ENABLED (AnomalyCfg != nil). Mode=block is the
+	// operative case the original banner lied about: it DOES enforce
+	// (SQLSTATE 42501 denials confirmed over the PG wire per dogfood).
+	// Per [[ibounce-honest-positioning]]: honest, non-accusatory tone —
+	// name what the mode does, not a verdict on the operator's data.
+	// Suppressed by --quiet-banner (fingerprint-suppression posture).
+	if !opts.Quiet && opts.AnomalyCfg != nil {
+		if opts.AnomalyCfg.Mode == "block" {
+			fmt.Fprintf(w,
+				"anomaly detection     : ENABLED — mode=block, sensitivity=%s\n",
+				opts.AnomalyCfg.Sensitivity)
+			fmt.Fprintln(w,
+				"                        enforcement ARMED: anomalous statements are denied (SQLSTATE 42501).")
+			fmt.Fprintln(w,
+				"                        Each statement is scored against the per-agent behavioral baseline;")
+			fmt.Fprintln(w,
+				"                        a high-severity OCSF anomaly_detected event is emitted on every block.")
+		} else {
+			// alert mode (the safe default)
+			fmt.Fprintf(w,
+				"anomaly detection     : ENABLED — mode=alert, sensitivity=%s\n",
+				opts.AnomalyCfg.Sensitivity)
+			fmt.Fprintln(w,
+				"                        observing — anomalous statements surface a neutral OCSF signal;")
+			fmt.Fprintln(w,
+				"                        no statements are denied by the anomaly detector in alert mode.")
+			fmt.Fprintln(w,
+				"                        Set IAM_JIT_ANOMALY_MODE=block to arm enforcement.")
 		}
 	}
 	fmt.Fprintln(w, "Ctrl+C to stop.")

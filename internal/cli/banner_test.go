@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/trsreagan3/dbounce/internal/anomaly"
 	"github.com/trsreagan3/dbounce/internal/profile"
 	"github.com/trsreagan3/dbounce/internal/proxy"
 )
@@ -343,4 +344,103 @@ func TestWriteStartupBanner_Full_UpstreamObservationOnlyNote(t *testing.T) {
 	assert.Contains(t, got, "observation-only mode")
 	assert.Contains(t, got, "no --profile / DBOUNCE_PROFILE set",
 		"non-quiet banner must surface the 'no profile selected' hint when neither flag nor env is set")
+}
+
+// --- Anomaly-detection banner honesty tests (#18) ---
+//
+// Per [[ibounce-honest-positioning]]: block mode DOES block live (confirmed
+// SQLSTATE 42501 denials over the PG wire). The old banner copy said "does
+// not block by default" regardless of mode — that was dishonest when
+// mode=block. These tests assert the corrected per-mode wording.
+
+func anomalyCfg(mode string) *anomaly.Config {
+	cfg := anomaly.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = mode
+	cfg.Sensitivity = "medium"
+	return &cfg
+}
+
+func TestAnomalyBanner_BlockMode_SaysEnforcementArmed(t *testing.T) {
+	// mode=block → the banner MUST state that enforcement is ARMED
+	// and that anomalous statements are denied. "does not block" or
+	// "neutral signal" MUST NOT appear — those imply alert/observe.
+	var buf bytes.Buffer
+	writeStartupBanner(&buf, bannerOpts{
+		Cfg:                  bannerCfg(),
+		StoredAuditDBPath:    "/tmp/state.db",
+		ActiveProfileName:    "safe-default",
+		ResolvedProfilesPath: "/etc/dbounce/profiles.yaml",
+		ProfileFromFlag:      true,
+		Quiet:                false,
+		AnomalyCfg:           anomalyCfg("block"),
+	})
+	got := buf.String()
+	assert.Contains(t, got, "enforcement ARMED",
+		"block-mode anomaly banner MUST say enforcement is ARMED")
+	assert.Contains(t, got, "denied",
+		"block-mode anomaly banner MUST state anomalous statements are denied")
+	assert.Contains(t, got, "mode=block",
+		"block-mode anomaly banner MUST name the mode explicitly")
+	// Guard against regression back to the dishonest copy.
+	assert.NotContains(t, got, "does not block",
+		"block-mode banner MUST NOT claim anomaly detection does not block")
+	assert.NotContains(t, got, "no statements are denied by the anomaly detector",
+		"block-mode banner MUST NOT use alert-mode wording")
+}
+
+func TestAnomalyBanner_AlertMode_KeepsNeutralWording(t *testing.T) {
+	// mode=alert → the banner must say observing / neutral signal /
+	// no statements are denied. "enforcement ARMED" MUST NOT appear.
+	var buf bytes.Buffer
+	writeStartupBanner(&buf, bannerOpts{
+		Cfg:                  bannerCfg(),
+		StoredAuditDBPath:    "/tmp/state.db",
+		ActiveProfileName:    "safe-default",
+		ResolvedProfilesPath: "/etc/dbounce/profiles.yaml",
+		ProfileFromFlag:      true,
+		Quiet:                false,
+		AnomalyCfg:           anomalyCfg("alert"),
+	})
+	got := buf.String()
+	assert.Contains(t, got, "mode=alert",
+		"alert-mode anomaly banner MUST name the mode")
+	assert.Contains(t, got, "no statements are denied by the anomaly detector",
+		"alert-mode banner MUST state the anomaly detector does not deny statements")
+	// Guard against block-mode wording leaking into alert output.
+	assert.NotContains(t, got, "enforcement ARMED",
+		"alert-mode banner MUST NOT claim enforcement is armed")
+}
+
+func TestAnomalyBanner_NilCfg_NoAnomalyLine(t *testing.T) {
+	// AnomalyCfg == nil → detection is disabled; no anomaly line emitted.
+	var buf bytes.Buffer
+	writeStartupBanner(&buf, bannerOpts{
+		Cfg:                  bannerCfg(),
+		StoredAuditDBPath:    "/tmp/state.db",
+		ActiveProfileName:    "safe-default",
+		ResolvedProfilesPath: "/etc/dbounce/profiles.yaml",
+		ProfileFromFlag:      true,
+		Quiet:                false,
+		AnomalyCfg:           nil,
+	})
+	assert.NotContains(t, buf.String(), "anomaly detection",
+		"disabled anomaly detection MUST NOT emit any anomaly banner line")
+}
+
+func TestAnomalyBanner_QuietSuppresses(t *testing.T) {
+	// --quiet-banner suppresses the anomaly line alongside all other
+	// fingerprint fields per LOW-D8-13.
+	var buf bytes.Buffer
+	writeStartupBanner(&buf, bannerOpts{
+		Cfg:                  bannerCfg(),
+		StoredAuditDBPath:    "/tmp/state.db",
+		ActiveProfileName:    "safe-default",
+		ResolvedProfilesPath: "/etc/dbounce/profiles.yaml",
+		ProfileFromFlag:      true,
+		Quiet:                true,
+		AnomalyCfg:           anomalyCfg("block"),
+	})
+	assert.NotContains(t, buf.String(), "anomaly detection",
+		"--quiet-banner MUST suppress the anomaly-detection banner line")
 }
