@@ -65,6 +65,15 @@ type Forwarder struct {
 	upstream     *upstream.Upstream
 	startupBytes []byte
 
+	// skipUntilSync is set when a Parse in an extended-query sequence was
+	// denied (or errored). Per the PG wire protocol, after an ErrorResponse
+	// the backend ignores every subsequent message until it sees Sync, then
+	// replies ReadyForQuery. We emulate that: while this is set the command
+	// loop swallows Bind/Describe/Execute/Close/etc. and answers Sync with
+	// ReadyForQuery (resetting the flag). Without this, a denied prepared
+	// statement would leave the client's transaction state wedged.
+	skipUntilSync bool
+
 	// startupBody is the PG StartupMessage parameter block (everything
 	// after the protocol version), captured during handshakeAndAuth so
 	// the agent-fingerprint helper can pull application_name out of it
@@ -89,9 +98,10 @@ const (
 
 // Upstream-status constants stamped into DecisionRow.UpstreamStatus.
 const (
-	upstreamStatusOk           = "ok"
-	upstreamStatusError        = "error"
-	upstreamStatusNotForwarded = "not_forwarded"
+	upstreamStatusOk                   = "ok"
+	upstreamStatusError                = "error"
+	upstreamStatusNotForwarded         = "not_forwarded"
+	upstreamStatusForwardedPendingSync = "forwarded_pending_sync"
 )
 
 // upstreamForwardingActive reports whether the server was configured
@@ -789,6 +799,19 @@ func (f *Forwarder) commandLoop() error {
 			}
 		case msgBind, msgExecute, msgSync, msgFlush, msgDescribe, msgClose,
 			'd', 'c', 'f':
+			if f.skipUntilSync {
+				// A Parse earlier in this extended-query sequence was denied
+				// (or errored). Swallow everything until Sync, then answer
+				// ReadyForQuery so the client's transaction state resets —
+				// matching how a real PG backend behaves after ErrorResponse.
+				if msgType == msgSync {
+					f.skipUntilSync = false
+					if err := writeReadyForQuery(f.in); err != nil {
+						return fmt.Errorf("write RFQ after extended-protocol deny: %w", err)
+					}
+				}
+				continue
+			}
 			if err := f.forwardRaw(msgType, payload); err != nil {
 				return err
 			}
@@ -941,6 +964,12 @@ func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload
 				if err := writeReadyForQuery(f.in); err != nil {
 					return fmt.Errorf("write RFQ after deny: %w", err)
 				}
+			} else if msgType == msgParse {
+				// Extended protocol: the ErrorResponse is written above, but
+				// ReadyForQuery must wait for the client's Sync. Enter
+				// skip-until-Sync so the follow-on Bind/Execute are swallowed
+				// rather than forwarded to an upstream that never saw a Parse.
+				f.skipUntilSync = true
 			}
 			return nil
 		}
@@ -959,6 +988,19 @@ func (f *Forwarder) handleGatedMessage(sql, source string, msgType byte, payload
 			fmt.Sprintf("dbounce: upstream write failed: %v", err))
 		return err
 	}
+	// Extended-query protocol: Postgres sends no response to a Parse until
+	// the client issues Sync. Draining now would deadlock — we'd block on a
+	// ReadyForQuery that can't arrive while never reading the client's
+	// Bind/Execute/Sync. Forward the Parse and return; the Sync handler in
+	// forwardRaw drains the upstream response. (Simple Query keeps draining
+	// inline below, since PG answers it immediately.)
+	if msgType == msgParse {
+		row.UpstreamStatus = upstreamStatusForwardedPendingSync
+		row.UpstreamResponseSummary = "extended-protocol Parse forwarded; upstream response relayed on Sync"
+		f.recordDecision(row, source)
+		return nil
+	}
+
 	summary, drainErr := f.drainUpstreamUntilRFQ()
 	if drainErr != nil {
 		row.UpstreamStatus = upstreamStatusError

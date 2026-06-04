@@ -198,6 +198,38 @@ func TestIntegration_MultipleQueriesOnSameSession(t *testing.T) {
 	}
 }
 
+// TestIntegration_ExtendedProtocolDenyDoesNotWedge is the deny-path companion
+// to the multi-query test: a DENIED parameterized (extended-protocol) query
+// must return a PG error PROMPTLY — not hang until the idle timeout — because
+// after the ErrorResponse the proxy must swallow the client's Bind/Execute and
+// answer Sync with ReadyForQuery (skip-until-Sync). Regression for the
+// extended-query deadlock fix.
+func TestIntegration_ExtendedProtocolDenyDoesNotWedge(t *testing.T) {
+	requirePGReachable(t)
+	port, st := startProxyAgainstRealPG(t, ModeTransparent)
+
+	_, err := st.AddRule(testRule(t, "SELECT:*", "deny"))
+	require.NoError(t, err)
+
+	db, err := sql.Open("postgres", dbounceURL(port))
+	require.NoError(t, err)
+	defer db.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		var n int
+		done <- db.QueryRow("SELECT $1::int", 7).Scan(&n)
+	}()
+	select {
+	case qErr := <-done:
+		require.Error(t, qErr, "denied parameterized query must return a PG error")
+		assert.Contains(t, qErr.Error(), "denied",
+			"libpq error must carry dbounce's deny message")
+	case <-time.After(5 * time.Second):
+		t.Fatal("denied parameterized query hung — extended-protocol deny deadlock regressed")
+	}
+}
+
 // TestIntegration_RedactLiteralsForwardPath is the REAL-Postgres
 // verification for the HIGH PII fix: with --redact-literals + a real
 // upstream, a SELECT carrying an email + an SSN-shaped quoted literal
